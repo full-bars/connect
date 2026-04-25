@@ -8,6 +8,10 @@ RUN apk add --no-cache git make gcc musl-dev
 WORKDIR /src
 COPY . .
 
+# Remove problematic local replace and fix dependencies
+RUN go mod edit -dropreplace github.com/urnetwork/glog && \
+    go mod tidy
+
 # Build from root using standard Go settings
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/community-provider ./provider
 
