@@ -18,17 +18,23 @@ COPY --from=builder /app/community-provider /app/community-provider
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'echo "Starting Patched UrNetwork Provider..." ' >> /app/entrypoint.sh && \
     echo 'chmod +x /app/community-provider' >> /app/entrypoint.sh && \
-    echo '# Force create the entire config path and an empty proxy file' >> /app/entrypoint.sh && \
+    echo '# Ensure the config directory exists' >> /app/entrypoint.sh && \
     echo 'mkdir -p /root/.urnetwork' >> /app/entrypoint.sh && \
-    echo 'touch /root/.urnetwork/proxy' >> /app/entrypoint.sh && \
+    echo '# Initialize proxy config with empty JSON object to avoid panics' >> /app/entrypoint.sh && \
+    echo 'echo "{}" > /root/.urnetwork/proxy' >> /app/entrypoint.sh && \
     echo 'sync' >> /app/entrypoint.sh && \
-    echo '# If proxy.txt exists, add the proxies first' >> /app/entrypoint.sh && \
+    echo '# If proxy.txt exists, add the proxies first with -f to skip prompts' >> /app/entrypoint.sh && \
     echo 'if [ -f "/app/proxy.txt" ]; then' >> /app/entrypoint.sh && \
     echo '  echo "Loading proxies from proxy.txt..."' >> /app/entrypoint.sh && \
-    echo '  /app/community-provider proxy add --proxy_file=/app/proxy.txt' >> /app/entrypoint.sh && \
+    echo '  /app/community-provider proxy add --proxy_file=/app/proxy.txt -f' >> /app/entrypoint.sh && \
     echo 'fi' >> /app/entrypoint.sh && \
     echo 'echo "Starting Provider Service..."' >> /app/entrypoint.sh && \
-    echo '/app/community-provider "$@"' >> /app/entrypoint.sh && \
+    echo '# Check if the first argument is a command, if so add -f' >> /app/entrypoint.sh && \
+    echo 'if [[ "$1" == "auth-provide" ]]; then' >> /app/entrypoint.sh && \
+    echo '  exec /app/community-provider auth-provide "${@:2}" -f' >> /app/entrypoint.sh && \
+    echo 'else' >> /app/entrypoint.sh && \
+    echo '  exec /app/community-provider "$@"' >> /app/entrypoint.sh && \
+    echo 'fi' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
 ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
