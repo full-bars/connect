@@ -8,11 +8,11 @@ RUN apk add --no-cache git make gcc musl-dev
 WORKDIR /src
 COPY . .
 
-# Remove problematic local replace and fix dependencies
-# We use a specific commit for glog since v0.0.0 is not recognized
+# Force fix the go.mod file:
+# 1. Remove the local replacement
+# 2. Change the v0.0.0 version to a valid commit hash
 RUN go mod edit -dropreplace github.com/urnetwork/glog && \
-    go get github.com/urnetwork/glog@1de77fab89bd3b45c1bea9b178b7114ad480ccc1 && \
-    go get golang.org/x/term && \
+    sed -i 's|github.com/urnetwork/glog v0.0.0|github.com/urnetwork/glog v0.0.0-20240313175133-1de77fab89bd|g' go.mod && \
     go mod tidy
 
 # Build from root using standard Go settings
