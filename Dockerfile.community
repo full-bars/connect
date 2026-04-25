@@ -4,13 +4,13 @@ FROM golang:1.22-alpine AS builder
 # Install build dependencies
 RUN apk add --no-cache git make gcc musl-dev
 
-# Set working directory
+# Set working directory to root to ensure all packages are available
 WORKDIR /src
 COPY . .
 
-# Build the community-provider binary from the root level provider directory
-WORKDIR /src/provider
-RUN go build -o /app/community-provider .
+# Build from root but point to the provider package
+# Using GOEXPERIMENT=greenteagc as found in the Makefile
+RUN env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/community-provider ./provider
 
 # STAGE 2: Create the runner image (Alpine)
 FROM alpine:latest
