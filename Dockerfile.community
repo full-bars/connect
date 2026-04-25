@@ -9,7 +9,10 @@ WORKDIR /src
 COPY . .
 
 # Remove problematic local replace and fix dependencies
+# We use a specific commit for glog since v0.0.0 is not recognized
 RUN go mod edit -dropreplace github.com/urnetwork/glog && \
+    go get github.com/urnetwork/glog@1de77fab89bd3b45c1bea9b178b7114ad480ccc1 && \
+    go get golang.org/x/term && \
     go mod tidy
 
 # Build from root using standard Go settings
