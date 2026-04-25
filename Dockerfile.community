@@ -6,7 +6,7 @@ COPY . .
 RUN go mod edit -dropreplace github.com/urnetwork/glog && \
     sed -i 's|github.com/urnetwork/glog v0.0.0|github.com/urnetwork/glog v0.0.0-20260227220536-1de77fab89bd|g' go.mod && \
     go mod tidy
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/community-provider ./provider
+RUN env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/community-provider ./provider
 
 # STAGE 2: Create the runner image (Alpine)
 FROM alpine:latest
@@ -18,13 +18,16 @@ COPY --from=builder /app/community-provider /app/community-provider
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'echo "Starting Patched UrNetwork Provider..." ' >> /app/entrypoint.sh && \
     echo 'chmod +x /app/community-provider' >> /app/entrypoint.sh && \
-    echo '# Ensure the config directory exists to avoid panics' >> /app/entrypoint.sh && \
+    echo '# Force create the entire config path and an empty proxy file' >> /app/entrypoint.sh && \
     echo 'mkdir -p /root/.urnetwork' >> /app/entrypoint.sh && \
+    echo 'touch /root/.urnetwork/proxy' >> /app/entrypoint.sh && \
+    echo 'sync' >> /app/entrypoint.sh && \
     echo '# If proxy.txt exists, add the proxies first' >> /app/entrypoint.sh && \
     echo 'if [ -f "/app/proxy.txt" ]; then' >> /app/entrypoint.sh && \
     echo '  echo "Loading proxies from proxy.txt..."' >> /app/entrypoint.sh && \
     echo '  /app/community-provider proxy add --proxy_file=/app/proxy.txt' >> /app/entrypoint.sh && \
     echo 'fi' >> /app/entrypoint.sh && \
+    echo 'echo "Starting Provider Service..."' >> /app/entrypoint.sh && \
     echo '/app/community-provider "$@"' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
