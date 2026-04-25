@@ -10,9 +10,9 @@ COPY . .
 
 # Force fix the go.mod file:
 # 1. Remove the local replacement
-# 2. Change the v0.0.0 version to a valid commit hash
+# 2. Use the exact pseudo-version string required by the project
 RUN go mod edit -dropreplace github.com/urnetwork/glog && \
-    sed -i 's|github.com/urnetwork/glog v0.0.0|github.com/urnetwork/glog v0.0.0-20240313175133-1de77fab89bd|g' go.mod && \
+    sed -i 's|github.com/urnetwork/glog v0.0.0|github.com/urnetwork/glog v0.0.0-20260227220536-1de77fab89bd|g' go.mod && \
     go mod tidy
 
 # Build from root using standard Go settings
