@@ -2,20 +2,20 @@
 FROM golang:1.22-alpine AS builder
 
 # Install build dependencies
-RUN apk add --no-cache git make
+RUN apk add --no-cache git make gcc musl-dev
 
 # Set working directory
 WORKDIR /src
 COPY . .
 
-# Build the community-provider binary from your patched source
-WORKDIR /src/connect/provider
+# Build the community-provider binary from the root level provider directory
+WORKDIR /src/provider
 RUN go build -o /app/community-provider .
 
 # STAGE 2: Create the runner image (Alpine)
 FROM alpine:latest
 
-# Install runtime dependencies matching techroy23 setup
+# Install runtime dependencies
 RUN apk add --no-cache \
     curl \
     bash \
@@ -32,9 +32,7 @@ COPY --from=builder /app/community-provider /app/community-provider
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'echo "Starting Patched UrNetwork Provider (JWT Mode)..."' >> /app/entrypoint.sh && \
     echo 'chmod +x /app/community-provider' >> /app/entrypoint.sh && \
-    echo '# Execute the provider with all passed arguments (the JWT)' >> /app/entrypoint.sh && \
     echo '/app/community-provider "$@"' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
-# Run the same way as techroy23: docker run ... <image> <JWT>
 ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
