@@ -1,43 +1,28 @@
 # STAGE 1: Build the patched binary
 FROM golang:1.25-alpine AS builder
-
-# Install build dependencies
 RUN apk add --no-cache git make gcc musl-dev
-
-# Set working directory to root
 WORKDIR /src
 COPY . .
-
-# Force fix the go.mod file:
-# 1. Remove the local replacement
-# 2. Use the exact pseudo-version string required by the project
 RUN go mod edit -dropreplace github.com/urnetwork/glog && \
     sed -i 's|github.com/urnetwork/glog v0.0.0|github.com/urnetwork/glog v0.0.0-20260227220536-1de77fab89bd|g' go.mod && \
     go mod tidy
-
-# Build from root using standard Go settings
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/community-provider ./provider
 
 # STAGE 2: Create the runner image (Alpine)
 FROM alpine:latest
-
-# Install runtime dependencies
-RUN apk add --no-cache \
-    curl \
-    bash \
-    ca-certificates \
-    tzdata \
-    jq
-
+RUN apk add --no-cache curl bash ca-certificates tzdata jq
 WORKDIR /app
-
-# Copy the binary we built in Stage 1
 COPY --from=builder /app/community-provider /app/community-provider
 
-# Create the JWT-compatible entrypoint
+# Create the proxy-aware entrypoint
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
-    echo 'echo "Starting Patched UrNetwork Provider (JWT Mode)..."' >> /app/entrypoint.sh && \
+    echo 'echo "Starting Patched UrNetwork Provider..." ' >> /app/entrypoint.sh && \
     echo 'chmod +x /app/community-provider' >> /app/entrypoint.sh && \
+    echo '# If proxy.txt exists, add the proxies first' >> /app/entrypoint.sh && \
+    echo 'if [ -f "/app/proxy.txt" ]; then' >> /app/entrypoint.sh && \
+    echo '  echo "Loading proxies from proxy.txt..."' >> /app/entrypoint.sh && \
+    echo '  /app/community-provider proxy add --proxy_file=/app/proxy.txt' >> /app/entrypoint.sh && \
+    echo 'fi' >> /app/entrypoint.sh && \
     echo '/app/community-provider "$@"' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
