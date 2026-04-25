@@ -18,6 +18,8 @@ COPY --from=builder /app/community-provider /app/community-provider
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'echo "Starting Patched UrNetwork Provider..." ' >> /app/entrypoint.sh && \
     echo 'chmod +x /app/community-provider' >> /app/entrypoint.sh && \
+    echo '# Ensure the config directory exists to avoid panics' >> /app/entrypoint.sh && \
+    echo 'mkdir -p /root/.urnetwork' >> /app/entrypoint.sh && \
     echo '# If proxy.txt exists, add the proxies first' >> /app/entrypoint.sh && \
     echo 'if [ -f "/app/proxy.txt" ]; then' >> /app/entrypoint.sh && \
     echo '  echo "Loading proxies from proxy.txt..."' >> /app/entrypoint.sh && \
