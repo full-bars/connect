@@ -62,6 +62,13 @@ const defaultTransferBufferSize = 32
 
 var DebugTransferCopyOnWrite = false
 
+// dropErrThrottle rate-limits `[r]drop`. A route that stops accepting writes
+// produces one of these per dropped frame, which under a sustained fault is
+// per-message. See logThrottle in log_throttle.go.
+var dropErrThrottle = newLogThrottle(time.Minute)
+
+func shouldLogDropErr() (bool, int64) { return dropErrThrottle.Allow(time.Now()) }
+
 // AckFunction is invoked inline by the owning send path. Blocking is
 // intentional backpressure: callers can stop completion from outrunning their
 // downstream state. Do not move it to a lossy/coalescing observer worker.
@@ -3234,6 +3241,13 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 		if maxRetryInterval <= 0 {
 			maxRetryInterval = retryInterval
 		}
+		// The fast first retry exists to cover a single dropped control
+		// message. While the backend is unreachable there is nothing to cover:
+		// no contract can be authorized until it returns, so start at the
+		// backed-off interval instead of walking up from 1s on every sequence.
+		if isBackendDegraded() {
+			retryInterval = maxRetryInterval
+		}
 
 		if self.sendContract != nil {
 			// there should be a queued up contract
@@ -3265,11 +3279,20 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 				EncryptionRole:      self.encryptionRole,
 				EncryptionCompanion: self.encryptionCompanion,
 			}
-			self.client.ContractManager().CreateContract(
-				contractKey,
-				self.contractSeqIndex,
-				ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-			)
+			// Skip the request entirely while the backend is unreachable. Each
+			// CreateContract is an OOB control round-trip; with the API down
+			// every one of them fails, and on a provider carrying many
+			// sequences that is a continuous storm of requests that cannot
+			// succeed. The loop still waits out the retry interval, so the
+			// sequence resumes promptly once a successful auth or OOB
+			// round-trip clears the degraded state.
+			if !isBackendDegraded() {
+				self.client.ContractManager().CreateContract(
+					contractKey,
+					self.contractSeqIndex,
+					ByteCount(32+float32(messageByteCount+messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+				)
+			}
 
 			if traceNextContract(min(timeout, retryInterval)) {
 				return true
@@ -4866,7 +4889,15 @@ func (self *ReceiveSequence) Run() {
 			} else {
 				err := c()
 				if err != nil {
-					self.log.Infof("[r]drop = %s", err)
+					if ok, suppressed := shouldLogDropErr(); ok {
+						if suppressed > 0 {
+							self.log.Infof("[r]drop = %s (%d suppressed)", err, suppressed)
+						} else {
+							self.log.Infof("[r]drop = %s", err)
+						}
+					} else if v := self.log.V(1); v.Enabled() {
+						v.Infof("[r]drop = %s", err)
+					}
 				}
 			}
 		}

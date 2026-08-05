@@ -98,6 +98,72 @@ func (self *ClientAuth) ClientId() (Id, error) {
 	return byJwt.ClientId, nil
 }
 
+// Throttles for the log lines that flood during a control-API outage. Each is
+// package-level because the flood is across every transport and sequence at
+// once, not within one of them — a per-instance limiter would still emit once
+// per client per interval, which on a provider with thousands of clients is not
+// a limit at all. See logThrottle in log_throttle.go.
+var (
+	authErrThrottle  = newLogThrottle(time.Minute)
+	writeErrThrottle = newLogThrottle(time.Minute)
+)
+
+func shouldLogAuthErr() (bool, int64)  { return authErrThrottle.Allow(time.Now()) }
+func shouldLogWriteErr() (bool, int64) { return writeErrThrottle.Allow(time.Now()) }
+
+// lastBackendFailNano is the time of the most recent backend failure (auth or
+// contract OOB), in unix nanos. Not throttled — every failure updates it, so
+// isBackendDegraded can tell a live outage from a stale count left by an old
+// blip on an otherwise idle provider.
+var lastBackendFailNano atomic.Int64
+
+// consecutiveBackendFails counts backend failures since the last success. Any
+// successful auth or OOB round-trip resets it to 0. A real platform outage
+// drives this up quickly because every attempt fails with nothing to reset it;
+// isolated transient timeouts never accumulate, because an interleaved success
+// clears the count.
+var consecutiveBackendFails atomic.Int64
+
+// backendDegradedFailThreshold is how many consecutive backend failures (with
+// no intervening success) are required before the backend is treated as
+// degraded. Set above the level of normal transient churn so a stray timeout on
+// a busy provider is never mistaken for an outage.
+const backendDegradedFailThreshold = 3
+
+// backendDegradedWindow is how recent the last failure must be for the counter
+// to be trusted. Comfortably larger than the 60s reconnect-backoff cap, so a
+// real outage's retries always read as recent.
+const backendDegradedWindow = 2 * time.Minute
+
+// isBackendDegraded reports whether backend failures have accumulated past the
+// threshold with no intervening success, and the last one is recent. It
+// distinguishes a sustained outage (every attempt failing) from the isolated
+// single-connection timeouts that are normal churn.
+//
+// Callers use it to avoid queueing and retransmitting work that cannot
+// complete: with the control API unreachable, no client can authorize a
+// contract, so contract creation, contract retries, resend pacing, and window
+// expansion are all spending bandwidth on data that has nowhere to go.
+func isBackendDegraded() bool {
+	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
+		return false
+	}
+	return time.Now().UnixNano()-lastBackendFailNano.Load() < int64(backendDegradedWindow)
+}
+
+// noteBackendFailure records a failed backend round-trip (auth or contract OOB).
+func noteBackendFailure() {
+	lastBackendFailNano.Store(time.Now().UnixNano())
+	consecutiveBackendFails.Add(1)
+}
+
+// noteBackendSuccess clears the degradation state after a backend round-trip
+// succeeds, so recovery is immediate rather than waiting out the window.
+func noteBackendSuccess() {
+	consecutiveBackendFails.Store(0)
+	lastBackendFailNano.Store(0)
+}
+
 // (ctx, network, address)
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
@@ -625,7 +691,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			noteBackendFailure()
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else if v := self.log.V(1); v.Enabled() {
+				// throttled at INFO; -v=1 still shows every attempt
+				v.Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -638,6 +714,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				continue
 			}
 		}
+
+		// auth succeeded: the backend is reachable
+		noteBackendSuccess()
 
 		c := func() {
 			defer ws.Close()
@@ -804,7 +883,15 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					MessagePoolReturn(message)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
-						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+						if ok, suppressed := shouldLogWriteErr(); ok {
+							if suppressed > 0 {
+								self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+							} else {
+								self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
+						} else if v := self.log.V(1); v.Enabled() {
+							v.Infof("[ts]%s-> error = %s\n", clientId, err)
+						}
 						return err
 					}
 					if self.log.V(2).Enabled() {
@@ -1338,7 +1425,17 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			noteBackendFailure()
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			} else if v := self.log.V(1); v.Enabled() {
+				// throttled at INFO; -v=1 still shows every attempt
+				v.Infof("[t]auth error %s = %s\n", clientId, err)
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -1350,6 +1447,10 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+
+		// auth succeeded: the backend is reachable
+		noteBackendSuccess()
+
 		conn := connStream.conn
 		stream := connStream.stream
 
@@ -1488,7 +1589,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						MessagePoolReturn(message)
 						if err != nil {
 							// note that for websocket a dealine timeout cannot be recovered
-							self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							if ok, suppressed := shouldLogWriteErr(); ok {
+								if suppressed > 0 {
+									self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+								} else {
+									self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+								}
+							} else if v := self.log.V(1); v.Enabled() {
+								v.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
 							return
 						}
 						if self.log.V(2).Enabled() {
