@@ -108,6 +108,57 @@ func TestBackendDegraded_InterleavedSuccessNeverAccumulates(t *testing.T) {
 	}
 }
 
+// Regression: a streak that aged out must not be resumed by a later failure.
+// Before the fix, three stale failures plus one fresh one totalled four with a
+// current timestamp, so the backend read as degraded on the strength of a
+// single recent failure.
+func TestBackendDegraded_StaleStreakIsNotResumedByANewFailure(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	for i := 0; i < backendDegradedFailThreshold; i++ {
+		noteBackendFailure()
+	}
+	// Age the whole streak out of the window, as an idle provider that simply
+	// stopped retrying would.
+	lastBackendFailNano.Store(time.Now().Add(-backendDegradedWindow - time.Minute).UnixNano())
+	if isBackendDegraded() {
+		t.Fatal("precondition: an aged-out streak must not read as degraded")
+	}
+
+	// One new failure. This is the first failure of a fresh streak, not the
+	// fourth of the old one.
+	noteBackendFailure()
+
+	if got := consecutiveBackendFails.Load(); got != 1 {
+		t.Fatalf("consecutive failures = %d after a stale streak plus one failure, want 1", got)
+	}
+	if isBackendDegraded() {
+		t.Fatal("degraded after a single recent failure; the stale streak was resumed instead of reset")
+	}
+}
+
+// The reset must not fire on a gap shorter than the window, or a slow but
+// genuine outage would never accumulate.
+func TestBackendDegraded_StreakSurvivesGapInsideWindow(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	noteBackendFailure()
+	noteBackendFailure()
+	// A gap well inside the window: still the same outage.
+	lastBackendFailNano.Store(time.Now().Add(-backendDegradedWindow / 2).UnixNano())
+
+	noteBackendFailure()
+
+	if got := consecutiveBackendFails.Load(); got != backendDegradedFailThreshold {
+		t.Fatalf("consecutive failures = %d, want %d (streak reset inside the window)", got, backendDegradedFailThreshold)
+	}
+	if !isBackendDegraded() {
+		t.Fatal("not degraded after 3 failures spanning a gap inside the window")
+	}
+}
+
 func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
 	resetBackendDegraded()
 	defer resetBackendDegraded()

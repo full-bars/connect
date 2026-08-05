@@ -109,7 +109,8 @@ var (
 )
 
 // shouldLogAuthErr reports whether an authentication error should be logged and returns the throttle state.
-func shouldLogAuthErr() (bool, int64)  { return authErrThrottle.Allow(time.Now()) }
+func shouldLogAuthErr() (bool, int64) { return authErrThrottle.Allow(time.Now()) }
+
 // shouldLogWriteErr reports whether a write error should be logged and returns the associated throttle value.
 func shouldLogWriteErr() (bool, int64) { return writeErrThrottle.Allow(time.Now()) }
 
@@ -153,10 +154,35 @@ func isBackendDegraded() bool {
 	return time.Now().UnixNano()-lastBackendFailNano.Load() < int64(backendDegradedWindow)
 }
 
+// backendFailMu serializes the failure-state transition. Recording a failure is
+// a single logical step made of three stores (age out a dead streak, adjust the
+// counter, refresh the timestamp); interleaving them could half-clear a stale
+// streak and leave it readable as live. Backend failures are rare by definition,
+// so serializing them costs nothing, and isBackendDegraded stays lock-free.
+var backendFailMu sync.Mutex
+
 // noteBackendFailure records a failed backend round-trip (auth or contract OOB).
+//
+// A streak older than backendDegradedWindow is discarded rather than extended.
+// Without that, an idle provider that saw a few failures long ago and simply
+// stopped retrying would carry the old count forward: the next single failure
+// would push the total past the threshold with a fresh timestamp, and the
+// backend would read as degraded on the strength of one recent failure. The
+// threshold means "consecutive failures within the window", so a gap that
+// invalidates the streak for isBackendDegraded must also reset it here.
 func noteBackendFailure() {
-	lastBackendFailNano.Store(time.Now().UnixNano())
-	consecutiveBackendFails.Add(1)
+	now := time.Now().UnixNano()
+
+	backendFailMu.Lock()
+	defer backendFailMu.Unlock()
+
+	last := lastBackendFailNano.Load()
+	if last != 0 && int64(backendDegradedWindow) <= now-last {
+		consecutiveBackendFails.Store(1)
+	} else {
+		consecutiveBackendFails.Add(1)
+	}
+	lastBackendFailNano.Store(now)
 }
 
 // noteBackendSuccess clears the degradation state after a backend round-trip

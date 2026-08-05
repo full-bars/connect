@@ -3212,12 +3212,21 @@ func (self *SendSequence) updateContract(messageByteCount ByteCount) bool {
 			}
 			if contract := self.client.ContractManager().TakeContract(self.ctx, contractKey, timeout); contract != nil && setNextContract(contract) {
 				self.contractSeqIndex += 1
-				// async queue up the next contract
-				self.client.ContractManager().CreateContract(
-					contractKey,
-					self.contractSeqIndex,
-					ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-				)
+				// async queue up the next contract.
+				//
+				// Skipped while the backend is unreachable. A sequence that
+				// still holds queued contracts keeps satisfying TakeContract,
+				// so without this check it would keep prefetching and keep the
+				// OOB storm going for exactly the sequences that still have
+				// work to do. The contract just taken is unaffected: only the
+				// prefetch of the following one waits for the backend.
+				if !isBackendDegraded() {
+					self.client.ContractManager().CreateContract(
+						contractKey,
+						self.contractSeqIndex,
+						ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+					)
+				}
 				return true
 			} else {
 				return false
