@@ -67,6 +67,7 @@ var DebugTransferCopyOnWrite = false
 // per-message. See logThrottle in log_throttle.go.
 var dropErrThrottle = newLogThrottle(time.Minute)
 
+// shouldLogDropErr determines whether a receive-side route drop error should be logged and reports the number of previously suppressed errors.
 func shouldLogDropErr() (bool, int64) { return dropErrThrottle.Allow(time.Now()) }
 
 // AckFunction is invoked inline by the owning send path. Blocking is

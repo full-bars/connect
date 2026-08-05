@@ -31,6 +31,7 @@ import (
 // log_throttle.go.
 var oobErrThrottle = newLogThrottle(time.Minute)
 
+// shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
 func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
 
 type ContractKey struct {

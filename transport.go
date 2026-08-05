@@ -108,7 +108,9 @@ var (
 	writeErrThrottle = newLogThrottle(time.Minute)
 )
 
+// shouldLogAuthErr reports whether an authentication error should be logged and returns the throttle state.
 func shouldLogAuthErr() (bool, int64)  { return authErrThrottle.Allow(time.Now()) }
+// shouldLogWriteErr reports whether a write error should be logged and returns the associated throttle value.
 func shouldLogWriteErr() (bool, int64) { return writeErrThrottle.Allow(time.Now()) }
 
 // lastBackendFailNano is the time of the most recent backend failure (auth or
@@ -143,7 +145,7 @@ const backendDegradedWindow = 2 * time.Minute
 // Callers use it to avoid queueing and retransmitting work that cannot
 // complete: with the control API unreachable, no client can authorize a
 // contract, so contract creation, contract retries, resend pacing, and window
-// expansion are all spending bandwidth on data that has nowhere to go.
+// isBackendDegraded reports whether recent consecutive backend failures indicate degraded service.
 func isBackendDegraded() bool {
 	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
 		return false
@@ -158,7 +160,7 @@ func noteBackendFailure() {
 }
 
 // noteBackendSuccess clears the degradation state after a backend round-trip
-// succeeds, so recovery is immediate rather than waiting out the window.
+// noteBackendSuccess clears the recorded backend failure state after a successful operation.
 func noteBackendSuccess() {
 	consecutiveBackendFails.Store(0)
 	lastBackendFailNano.Store(0)

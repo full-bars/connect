@@ -25,6 +25,7 @@ type logThrottle struct {
 	suppressed    atomic.Int64
 }
 
+// newLogThrottle creates a log throttle configured with the specified interval.
 func newLogThrottle(interval time.Duration) *logThrottle {
 	return &logThrottle{intervalNanos: int64(interval)}
 }
