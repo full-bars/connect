@@ -7638,7 +7638,11 @@ func (self *multiClientWindow) resize() {
 		)
 
 		addedCount := 0
-		if len(clients) < targetWindowSize {
+		// Do not expand while the backend is unreachable. Every added client
+		// needs its own contract, so expanding during an outage multiplies the
+		// contract requests that cannot succeed. The window is restored on the
+		// next resize once a successful round-trip clears the degraded state.
+		if len(clients) < targetWindowSize && !isBackendDegraded() {
 			// expand
 			n := targetWindowSize - len(clients)
 			self.monitor.AddWindowExpandEvent(
