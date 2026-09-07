@@ -107,20 +107,45 @@ func (self *iceInterfaceNet) InterfaceByName(name string) (*transport.Interface,
 // connect()-only UDP dial (no packet is sent; the kernel resolves the route
 // and assigns a local address) and wraps each as a synthetic pion interface
 // carrying a host address. Nil entries (no route for a family) are skipped.
-// egressIPv6Usable reports whether the device can actually send an IPv6 packet
-// to the internet. A connect()-only UDP dial is not enough: on Android the
-// kernel has a native IPv6 route (e.g. from AT&T cellular) so connect()
-// succeeds, but the VPN tunnel swallows outbound v6 traffic, making every STUN
-// and DTLS attempt stall. We send a single zero-byte UDP datagram to Google
-// DNS over IPv6; if sendto returns "network is unreachable" we know the tunnel
-// blackholes v6 and must not gather IPv6 ICE candidates.
+// egressIPv6Usable reports whether the device can actually reach the
+// internet over IPv6. A connect()-only UDP dial or a fire-and-forget
+// sendto is not enough: on Android the kernel has a native IPv6 route (e.g.
+// from AT&T cellular) so connect()/sendto succeeds, but the VPN tunnel
+// swallows outbound v6 traffic. We send a minimal DNS query to Google DNS
+// over IPv6 and require a response within 2 seconds. If no response
+// (i/o timeout) we know the tunnel blackholes v6 and must not gather
+// IPv6 ICE candidates.
 func egressIPv6Usable() bool {
 	pc, err := net.ListenPacket("udp6", "[::]:0")
 	if err != nil {
 		return false
 	}
 	defer pc.Close()
-	_, err = pc.WriteTo([]byte{0}, &net.UDPAddr{IP: net.ParseIP("2001:4860:4860::8888"), Port: 80})
+	// Build a minimal DNS query for "a.gtld-servers.net" (A record) —
+	// 32 bytes, enough to trigger a response from Google DNS.
+	// DNS header: ID=0x0102, flags=0x0100 (standard query, RD=1)
+	// Questions=1, Answers/Authority/Additional=0
+	query := []byte{
+		0x01, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+	// Encode "a.gtld-servers.net" as a DNS query name (labels).
+	labels := [][]byte{[]byte("a"), []byte("gtld-servers"), []byte("net")}
+	for _, lbl := range labels {
+		query = append(query, byte(len(lbl)))
+		query = append(query, lbl...)
+	}
+	query = append(query, 0) // root label
+	query = append(query, 0x00, 0x01, 0x00, 0x01) // type A, class IN
+	dnsServer := &net.UDPAddr{IP: net.ParseIP("2001:4860:4860::8888"), Port: 53}
+	_, err = pc.WriteTo(query, dnsServer)
+	if err != nil {
+		return false
+	}
+	// Wait for DNS response — proves v6 packets actually reach the internet.
+	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 512)
+	_, _, err = pc.ReadFrom(buf)
 	return err == nil
 }
 
