@@ -194,8 +194,15 @@ func localEgressInterfaces() []*transport.Interface {
 	if ip := dialLocalIP("udp4", "8.8.8.8:80"); ip != nil {
 		add("en0", 1, ip, 32)
 	}
-	if ip := dialLocalIP("udp6", "[2001:4860:4860::8888]:80"); ip != nil {
-		add("en1", 2, ip, 128)
+	// Use egressIPv6Usable (actual UDP send probe) instead of dialLocalIP
+	// (connect-only). On Android the kernel has a native v6 route from
+	// cellular so dialLocalIP succeeds, but the VPN tunnel blackholes
+	// outbound v6. egressIPv6Usable sends a real datagram and returns
+	// false when sendto reports "network is unreachable".
+	if egressIPv6Usable() {
+		if ip := dialLocalIP("udp6", "[2001:4860:4860::8888]:80"); ip != nil {
+			add("en1", 2, ip, 128)
+		}
 	}
 	return out
 }
