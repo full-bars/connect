@@ -217,7 +217,21 @@ func localEgressInterfaces() []*transport.Interface {
 		out = append(out, ifc)
 	}
 	if ip := dialLocalIP("udp4", "8.8.8.8:80"); ip != nil {
-		add("en0", 1, ip, 32)
+		// Behind carrier-grade NAT (e.g. AT&T cellular), the kernel's
+		// egress address is a private RFC1918 or CGNAT address (10.x,
+		// 192.168.x, 100.64.x). This address is unreachable from
+		// internet peers — offering it as an ICE host candidate wastes
+		// gather cycles and causes "Failed to ping without candidate
+		// pairs" storms when the remote peer can never route to it.
+		// URNetwork peers are always internet-facing, so srflx
+		// candidates are the only viable path behind NAT. Filtering
+		// private IPs here means localEgressInterfaces() returns
+		// empty, newIceInterfaceNet falls back to Pion's default net,
+		// and STUN gathering still produces srflx candidates via the
+		// kernel's routing table (host candidates are suppressed).
+		if !isPrivateOrCGNAT(ip) {
+			add("en0", 1, ip, 32)
+		}
 	}
 	if egressIPv6Usable() {
 		if ip := dialLocalIP("udp6", "[2001:4860:4860::8888]:80"); ip != nil {
@@ -242,4 +256,18 @@ func dialLocalIP(network, addr string) net.IP {
 		return nil
 	}
 	return ua.IP
+}
+
+// isPrivateOrCGNAT reports whether ip falls in an RFC1918, RFC6598 (CGNAT),
+// link-local, or other non-routable range. These addresses are unreachable
+// from internet peers and should not be offered as ICE host candidates.
+func isPrivateOrCGNAT(ip net.IP) bool {
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// CGNAT (RFC6598): 100.64.0.0/10
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return false
 }
