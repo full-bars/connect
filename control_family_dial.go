@@ -77,6 +77,28 @@ import (
 // whole budget alone and starve the other dialers -- which is the failure this
 // exists to prevent, not to reproduce. A second failure over the second family
 // is also not a family problem, and the original error is returned unwrapped.
+//
+// CONNECT-TIME FALLBACK: dialControlTlsWithFamilyFallback's original retry
+// (redialWithoutAContradictedDemotion, below) only fires when a live demotion
+// is on record AND was itself contradicted -- i.e. when the family was already
+// narrowed by a previous handshake-timeout strike. A hard connect-time failure
+// on the FIRST attempt over a family-agnostic network ("tcp"/"udp") -- the
+// signature of a blackholed path where sendto returns "network is unreachable"
+// before any packet leaves the socket -- leaves no connection and no demotion,
+// so the original code returned the error immediately with no retry over the
+// other family at all. That is the AT&T-tunnel pattern: the kernel has an IPv6
+// route but the tunnel swallows v6 traffic, so the v6 dial is rejected at
+// connect time and the request hangs until the caller's own RequestTimeout
+// (15s) fires, never trying IPv4.
+//
+// The fallback here closes exactly that gap: when the initial connect fails on
+// a family-agnostic network with a timeout OR a network-unreachable-class
+// error, retry ONCE over the explicit other family, then run the normal
+// handshake on whatever that yields -- a connect success returns the conn for
+// the handshake to complete, a second connect failure returns the original
+// error unwrapped. Exactly one retry, gated on the same budget the
+// handshake-timeout retry uses, so this helper cannot starve the caller's
+// own parallel/strided dialer budget.
 func dialControlTlsWithFamilyFallback(
 	ctx context.Context,
 	settings *ConnectSettings,
@@ -89,7 +111,17 @@ func dialControlTlsWithFamilyFallback(
 	if err != nil {
 		conn, err = redialWithoutAContradictedDemotion(ctx, network, addr, dial, err)
 		if err != nil {
-			return nil, err
+			// No connection survived the first connect. If this was a
+			// family-agnostic dial of a name (not a literal IP, not a
+			// forced policy) and the failure is a connect-time blackhole
+			// (sendto: network is unreachable, or a connect timeout), try
+			// the other family once before giving up -- this is the
+			// connect-time blackhole recovery, distinct from the
+			// handshake-timeout demotion below.
+			conn, err = connectTimeFamilyFallback(ctx, settings, network, addr, dial, err)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	// BEFORE the handshake, and before any Close: a closed net.TCPConn is not
@@ -165,10 +197,84 @@ func dialControlTlsWithFamilyFallback(
 	return retryTlsConn, nil
 }
 
-// firstHandshakeContext bounds the first handshake of a control dial to
-// ControlFamilyFirstHandshakeTimeout, so that a retry over the other family
-// fits inside the caller's own budget -- and returns the caller's context
-// unchanged when it does not fit.
+// connectTimeFamilyFallback retries a FAILED CONNECT (no connection ever
+// established) over the other address family, exactly once. It is the
+// connect-time-blackhole recovery: a path where sendto fails at the kernel
+// routing step ("network is unreachable") before any packet is sent, so the
+// failure is reported by the dial itself rather than by a handshake timeout.
+//
+// This is distinct from redialWithoutAContradictedDemotion (which recovers a
+// demotion that narrowed a dial onto a family with no route) and from the
+// handshake-timeout retry in dialControlTlsWithFamilyFallback (which runs only
+// after a connect succeeded and the TLS handshake then stalled). Neither of
+// those covers a clean connect-time failure on the very first attempt: that
+// path returns the error immediately, and on a dual-stack device where v6 is
+// blackholed and v4 works, the request never tries v4 at all.
+//
+// The retry dials explicit tcp4. The design already prefers IPv4 (see
+// pickControlIPAddr), and the field-reported failure is IPv6-blackholed, so
+// the other family is IPv4 in the case this exists to fix. Dialing the
+// explicit family also sidesteps Go's RFC-6724 ordering -- net.Dialer with a
+// family-agnostic "tcp" races/sticks with v6-first on a dual-stack device --
+// so the retry cannot silently win the v6 race again.
+//
+// The gate is intentionally narrow and mirrors the handshake-timeout retry's
+// constraints so it cannot expand its callers' budget consumption:
+//   - network is family-agnostic ("tcp"/"udp"), not a forced literal family
+//   - addr is not an IP literal (a literal fixes its own family)
+//   - the policy is IpFamilyAuto (a force is a developer override and is obeyed)
+//   - the caller still has budget left for one more connect attempt
+//   - firstErr is a connect-time condition: isConnectNetworkUnreachable
+//
+// It returns the connection from the other-family connect (nil err) for the
+// caller to proceed to handshake, or (nil, firstErr) when the guard declines or
+// the retry itself fails -- so the original first-attempt error is always what
+// the caller surfaces.
+func connectTimeFamilyFallback(
+	ctx context.Context,
+	settings *ConnectSettings,
+	network string,
+	addr string,
+	dial DialContextFunction,
+	firstErr error,
+) (net.Conn, error) {
+	if network != "tcp" && network != "udp" {
+		return nil, firstErr
+	}
+	if isIPLiteralDialAddr(addr) {
+		return nil, firstErr
+	}
+	if ControlIpFamilyPolicy() != IpFamilyAuto {
+		return nil, firstErr
+	}
+	if !isConnectNetworkUnreachable(firstErr) {
+		return nil, firstErr
+	}
+	// the caller must still have room for one more connect before its budget
+	// runs out; reuse the dial's own ConnectTimeout as the floor so the retry's
+	// cost is charged against the same budget, not an invented one.
+	budget := defaultConnectTimeout
+	if settings != nil && settings.ConnectTimeout > 0 {
+		budget = settings.ConnectTimeout
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < budget {
+		return nil, firstErr
+	}
+	// probe that the other family is even usable on this device before burning
+	// a connect on it; a v6-only path that has no v4 at all must not be made
+	// to pay for an extra dial that is guaranteed to fail.
+	if !controlFamilyUsable(4) {
+		return nil, firstErr
+	}
+	retryNetwork := network + "4"
+	retryConn, retryErr := dial(ctx, retryNetwork, addr)
+	if retryErr != nil {
+		// the other family failed too: not a family problem. surface the
+		// ORIGINAL first-attempt error, unwrapped.
+		return nil, firstErr
+	}
+	return retryConn, nil
+}
 //
 // A context with NO deadline is bounded: an unbounded caller has room for two
 // attempts by definition, and leaving it unbounded is the one shape where a

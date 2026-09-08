@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/wlynxg/anet"
@@ -593,6 +594,55 @@ func isPathTimeout(err error) bool {
 		return netErr.Timeout()
 	}
 	return false
+}
+
+// isConnectNetworkUnreachable reports whether a connect-time dial failure
+// indicates a blackholed or absent local route for the family that was dialed.
+//
+// These are the shapes the kernel returns from sendto/connect when no usable
+// route exists for that family on this device: "network is unreachable"
+// (ENETUNREACH/EHOSTUNREACH/EHOSTDOWN), "connection refused" (ECONNREFUSED,
+// which on UDP is ICMP port-unreachable -- the route IS there but nothing
+// answers, so it is NOT a family-blackhole signal and must not trigger a
+// family retry on its own), and a hard timeout that the dialer bounded to
+// ConnectTimeout. A refused/unreachable at connect is the connect-time
+// counterpart of the post-connect path-timeout: the packets never got through
+// to a service that could object.
+func isConnectNetworkUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.EHOSTDOWN) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return true
+		}
+	}
+	// a net.OpError from net.Dialer wraps the syscall errno; unwrap to catch
+	// raw syscall errors the dialer lets through (e.g. on some android builds)
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return isConnectNetworkUnreachable(opErr.Err)
+	}
+	return false
+}
+
+// controlFamilyUsable reports whether a given family is usable on the current
+// path, calling the probe under the ledger mutex so it observes the same
+// probe seam the tests swap in. Used by the connect-time fallback to AVOID
+// burning a connect on the other family when the device has no route to it at
+// all (e.g. an IPv6-only phone with no CLAT -- retrying tcp4 there would only
+// add latency to a failure that cannot succeed).
+func controlFamilyUsable(family int) bool {
+	controlFamilyLedger.mu.Lock()
+	probe := controlFamilyLedger.probe
+	controlFamilyLedger.mu.Unlock()
+	return probe(family)
 }
 
 // connFamily is 4, 6, or 0 when the connection has no usable remote address.

@@ -13,6 +13,8 @@ import (
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 
+const defaultConnectTimeout = 15 * time.Second
+
 // withConnWritePhaseDeadline bounds a synchronous connection write phase by
 // the earlier of the caller deadline and its phase budget. Context cancellation
 // alone cannot interrupt a net.Conn.Write already in progress.

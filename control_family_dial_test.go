@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -629,6 +630,189 @@ func TestFamilyFallbackDoesNotWriteTheLedgerUnderAForce(t *testing.T) {
 	}
 	SetControlIpFamilyPolicy(IpFamilyAuto)
 	controlFamilyClear()
+}
+
+// THE POINT OF THE CONNECT-TIME FALLBACK.
+//
+// A family-agnostic "tcp" dial whose connect is rejected at the kernel routing
+// step -- "network is unreachable" from sendto on a blackholed IPv6 path -- is
+// the AT&T-tunnel failure: the phone has an IPv6 route (AT&T cellular) but the
+// tunnel swallows v6, so the dial fails before any handshake. Without the
+// connect-time fallback the request returns the error immediately and never tries
+// IPv4, hanging until the caller's RequestTimeout (15s) instead of recovering in
+// milliseconds.
+//
+// This is exactly the outage: provider list never loads, every API call times
+// out, because the v6 connect fails and v4 is never attempted.
+func TestConnectTimeFallbackRecoversFromANetworkUnreachable(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+	SetControlIpFamilyPolicy(IpFamilyAuto)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	var mutex sync.Mutex
+	var dialed []string
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		mutex.Lock()
+		dialed = append(dialed, network)
+		mutex.Unlock()
+		if network == "tcp4" {
+			return &stubConn{remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}}, nil
+		}
+		return nil, &net.OpError{
+			Op:  "dial",
+			Net: "tcp6",
+			Err: syscall.ENETUNREACH,
+		}
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	conn, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
+	if err != nil {
+		t.Fatalf("%v -- the connect-time fallback should have tried v4", err)
+	}
+	if got := connFamily(conn); got != 4 {
+		t.Fatalf("returned an IPv%d connection, want IPv4", got)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(dialed) != 2 || dialed[0] != "tcp" || dialed[1] != "tcp4" {
+		t.Fatalf("dialed %v, want [tcp tcp4] -- v6 blackhole should retry v4", dialed)
+	}
+}
+
+// The connect-time fallback must NOT fire for non-timeout, non-unreachable connect
+// errors -- a refused connection or a DNS error says nothing about the family
+// and must not be retried across families.
+func TestConnectTimeFallbackDoesNotRetryANonBlackholeError(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	attempts := 0
+	dialErr := errors.New("connect: connection refused")
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return nil, dialErr
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	_, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("got %v, want the original refused error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- a refused error is not a blackhole", attempts)
+	}
+}
+
+// The connect-time fallback must NOT fire when IPv4 is not usable on the device
+// at all (e.g. IPv6-only with no CLAT): the probe guards the retry so a v6-only
+// phone does not pay for an extra tcp4 connect that is guaranteed to fail.
+func TestConnectTimeFallbackDoesNotRetryWhenV4Unavailable(t *testing.T) {
+	// probe answers false for family 4, true for family 6
+	restore := swapControlFamilyProbe(func(family int) bool { return family == 6 })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	attempts := 0
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return nil, &net.OpError{Op: "dial", Net: "tcp6", Err: syscall.ENETUNREACH}
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	_, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
+	if err == nil {
+		t.Fatal("expected the blackholed v6 error back")
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- v4 is unavailable so no retry", attempts)
+	}
+}
+
+// The connect-time fallback must NOT fire under a force: a developer override
+// is obeyed, and retrying across families would contradict it.
+func TestConnectTimeFallbackDoesNotFireUnderAForce(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+	SetControlIpFamilyPolicy(IpFamilyForce6)
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	attempts := 0
+	dialErr := &net.OpError{Op: "dial", Net: "tcp6", Err: syscall.ENETUNREACH}
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return nil, dialErr
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	_, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("got %v, want the forced-family dial error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- a force must not be re-dialed around", attempts)
+	}
+}
+
+// A connect-time fallback to v4 that also fails is not a family problem; the
+// ORIGINAL first-attempt error is surfaced, unwrapped.
+func TestConnectTimeFallbackSurfacesOriginalErrorWhenRetryFails(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	firstErr := &net.OpError{Op: "dial", Net: "tcp6", Err: syscall.ENETUNREACH}
+	retryErr := &net.OpError{Op: "dial", Net: "tcp4", Err: syscall.ECONNREFUSED}
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if network == "tcp4" {
+			return nil, retryErr
+		}
+		return nil, firstErr
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	_, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "api.example:443", dial, handshake)
+	if !errors.Is(err, firstErr) {
+		t.Fatalf("got %v, want the original v6 first-attempt error (not the v4 retry error)", err)
+	}
+}
+
+// An IP literal has no family choice; the fallback must not fire.
+func TestConnectTimeFallbackDoesNotFireOnAnIPLiteral(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+
+	attempts := 0
+	dial := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		attempts += 1
+		return nil, &net.OpError{Op: "dial", Net: "tcp6", Err: syscall.ENETUNREACH}
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) { return conn, nil }
+
+	_, err := dialControlTlsWithFamilyFallback(
+		context.Background(), DefaultConnectSettings(), "tcp", "2600:3c01::1:443", dial, handshake)
+	if err == nil {
+		t.Fatal("expected the literal dial error back")
+	}
+	if attempts != 1 {
+		t.Fatalf("dialed %d times, want 1 -- a literal fixes its own family", attempts)
+	}
 }
 
 // deadlineConn blocks in Read until the connection is closed or a deadline in
