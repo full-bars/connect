@@ -37,26 +37,32 @@ type iceInterfaceNet struct {
 	lastRefresh time.Time
 }
 
-// newIceInterfaceNet builds the synthetic-interface net. Returns (nil, false)
-// when the platform's own net.Interfaces() works and egressOnly is false, so
-// generic desktop/server callers retain all interfaces. Device clients opt
-// into egressOnly to avoid the quadratic candidate-pair explosion caused by
-// virtual/tunnel/bridge interfaces. When enumeration is denied (Android 11+),
-// the synthetic net remains the automatic compatibility fallback.
-func newIceInterfaceNet(log Logger, egressOnly bool) (transport.Net, bool) {
-	if _, err := net.Interfaces(); err == nil && !egressOnly {
-		// enumeration works here; nothing to substitute
-		return nil, false
-	}
+// newIceInterfaceNet builds the synthetic-interface net. The synthetic
+// interface carries only the current egress address (discovered via a
+// connect-only UDP dial trick), avoiding the quadratic candidate-pair
+// explosion caused by virtual/tunnel/bridge interfaces. When
+// enumeration is denied (Android 11+), this is the only way to gather
+// host candidates. When enumeration works (desktop, Android WiFi), we
+// still use the synthetic interface to filter out private/CGNAT
+// addresses that would be offered as unreachable host candidates.
+//
+// When localEgressInterfaces returns empty (all addresses are
+// private/CGNAT and filtered), the synthetic net is still returned
+// with an empty interface list. This prevents Pion from falling back
+// to its default net (which enumerates all system interfaces
+// including private ones). STUN gathering still works through the
+// base stdnet.Net, producing srflx candidates via the kernel routing
+// table — only host candidates are suppressed.
+func newIceInterfaceNet(log Logger, _ bool) (transport.Net, bool) {
 	base, _ := stdnet.NewNet() // usable for sockets even though enumeration failed
 	ifcs := localEgressInterfaces()
-	if len(ifcs) == 0 {
-		return nil, false
-	}
 	if log.V(1).Enabled() {
 		for _, ifc := range ifcs {
 			addrs, _ := ifc.Addrs()
 			log.Infof("[ice-if]synthetic %s addrs=%v\n", ifc.Name, addrs)
+		}
+		if len(ifcs) == 0 {
+			log.Infof("[ice-if]synthetic empty (all egress addrs private/CGNAT filtered)\n")
 		}
 	}
 	return &iceInterfaceNet{
@@ -107,6 +113,54 @@ func (self *iceInterfaceNet) InterfaceByName(name string) (*transport.Interface,
 // connect()-only UDP dial (no packet is sent; the kernel resolves the route
 // and assigns a local address) and wraps each as a synthetic pion interface
 // carrying a host address. Nil entries (no route for a family) are skipped.
+// egressIPv6Usable reports whether the device can actually reach the
+// internet over IPv6. A connect()-only UDP dial or a fire-and-forget
+// sendto is not enough: on Android the kernel has a native IPv6 route (e.g.
+// from AT&T cellular) so connect()/sendto succeeds, but the VPN tunnel
+// swallows outbound v6 traffic. We send a minimal DNS query to Google DNS
+// over IPv6 and require a response within 2 seconds. If no response
+// (i/o timeout) we know the tunnel blackholes v6 and must not gather
+// IPv6 ICE candidates.
+func egressIPv6Usable() bool {
+	pc, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		return false
+	}
+	defer pc.Close()
+	// Build a minimal DNS query for "a.gtld-servers.net" (A record) —
+	// 32 bytes, enough to trigger a response from Google DNS.
+	// DNS header: ID=0x0102, flags=0x0100 (standard query, RD=1)
+	// Questions=1, Answers/Authority/Additional=0
+	query := []byte{
+		0x01, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+	// Encode "a.gtld-servers.net" as a DNS query name (labels).
+	labels := [][]byte{[]byte("a"), []byte("gtld-servers"), []byte("net")}
+	for _, lbl := range labels {
+		query = append(query, byte(len(lbl)))
+		query = append(query, lbl...)
+	}
+	query = append(query, 0) // root label
+	query = append(query, 0x00, 0x01, 0x00, 0x01) // type A, class IN
+	dnsServer := &net.UDPAddr{IP: net.ParseIP("2001:4860:4860::8888"), Port: 53}
+	_, err = pc.WriteTo(query, dnsServer)
+	if err != nil {
+		return false
+	}
+	// Wait for DNS response — proves v6 packets actually reach the internet.
+	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 512)
+	_, _, err = pc.ReadFrom(buf)
+	return err == nil
+}
+
+// egressIPv4Usable reports whether the kernel has a default IPv4 route to the
+// internet, using the connect()-only dial trick.
+func egressIPv4Usable() bool {
+	return dialLocalIP("udp4", "8.8.8.8:80") != nil
+}
+
 func localEgressInterfaces() []*transport.Interface {
 	var out []*transport.Interface
 	nativeInterfaces, nativeInterfacesErr := net.Interfaces()
@@ -169,10 +223,26 @@ func localEgressInterfaces() []*transport.Interface {
 		out = append(out, ifc)
 	}
 	if ip := dialLocalIP("udp4", "8.8.8.8:80"); ip != nil {
-		add("en0", 1, ip, 32)
+		// Behind carrier-grade NAT (e.g. AT&T cellular), the kernel's
+		// egress address is a private RFC1918 or CGNAT address (10.x,
+		// 192.168.x, 100.64.x). This address is unreachable from
+		// internet peers — offering it as an ICE host candidate wastes
+		// gather cycles and causes "Failed to ping without candidate
+		// pairs" storms when the remote peer can never route to it.
+		// URNetwork peers are always internet-facing, so srflx
+		// candidates are the only viable path behind NAT. Filtering
+		// private IPs here means localEgressInterfaces() returns
+		// empty, newIceInterfaceNet falls back to Pion's default net,
+		// and STUN gathering still produces srflx candidates via the
+		// kernel's routing table (host candidates are suppressed).
+		if !isPrivateOrCGNAT(ip) {
+			add("en0", 1, ip, 32)
+		}
 	}
-	if ip := dialLocalIP("udp6", "[2001:4860:4860::8888]:80"); ip != nil {
-		add("en1", 2, ip, 128)
+	if egressIPv6Usable() {
+		if ip := dialLocalIP("udp6", "[2001:4860:4860::8888]:80"); ip != nil {
+			add("en1", 2, ip, 128)
+		}
 	}
 	return out
 }
@@ -192,4 +262,18 @@ func dialLocalIP(network, addr string) net.IP {
 		return nil
 	}
 	return ua.IP
+}
+
+// isPrivateOrCGNAT reports whether ip falls in an RFC1918, RFC6598 (CGNAT),
+// link-local, or other non-routable range. These addresses are unreachable
+// from internet peers and should not be offered as ICE host candidates.
+func isPrivateOrCGNAT(ip net.IP) bool {
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// CGNAT (RFC6598): 100.64.0.0/10
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return false
 }

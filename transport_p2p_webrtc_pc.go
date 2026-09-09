@@ -62,18 +62,42 @@ func newWebRtcPeerConnectionFactory(
 	logIceInterfaces(log)
 	selectedNet := settings.Network
 	callerOwnedNet := selectedNet != nil
-	if selectedNet != nil {
-		// An injected network owns candidate enumeration and socket routing.
+	// Restrict Pion's ICE/STUN gathering to address families that actually
+	// have a route. When the tunnel this process provides (or the device
+	// network) has no IPv6 route, every IPv6 STUN gather fails with
+	// "sendmsg: network is unreachable", Pion waits the full STUN timeout on a
+	// path that can never answer, and the peer connection is torn down before
+	// DTLS establishes. Detect it with the same connect-only dial the egress
+	// interface uses and tell Pion not to gather the dead family.
+	// The full family set is kept when an injected Network owns enumeration or
+	// when the caller explicitly requested loopback-only (tests), where the
+	// synthetic egress probe is not authoritative.
+	if settings.Network == nil && !settings.UseLoopbackOnlyIceInterfaces {
+		networkTypes := make([]webrtc.NetworkType, 0, 4)
+		if egressIPv4Usable() {
+			networkTypes = append(networkTypes, webrtc.NetworkTypeUDP4, webrtc.NetworkTypeTCP4)
+		}
+		if egressIPv6Usable() {
+			networkTypes = append(networkTypes, webrtc.NetworkTypeUDP6, webrtc.NetworkTypeTCP6)
+		}
+		if 0 < len(networkTypes) {
+			s.SetNetworkTypes(networkTypes)
+		}
+	}
+	if settings.Network != nil {
+		log.Infof("[ice-factory]using caller-owned network\n")
 	} else if settings.UseLoopbackOnlyIceInterfaces {
 		// hermetic same-host mode (tests): gather only loopback candidates so
 		// the local connect cost is a couple of pairs, independent of the
 		// host's interface population (see WebRtcSettings)
+		log.Infof("[ice-factory]using loopback-only ice interfaces\n")
 		s.SetIncludeLoopbackCandidate(true)
 		s.SetInterfaceFilter(func(interfaceName string) bool {
 			ifc, err := net.InterfaceByName(interfaceName)
 			return err == nil && ifc.Flags&net.FlagLoopback != 0
 		})
 	} else if index4, index6 := EgressInterfaceIndex(); index4 != 0 || index6 != 0 {
+		log.Infof("[ice-factory]using egress-bound net (index4=%d index6=%d)\n", index4, index6)
 		// bind ICE sockets to the physical egress interface so p2p does not
 		// loop into the tunnel this process provides (R1); a no-op off
 		// Windows and when no egress index is set.
@@ -91,6 +115,7 @@ func newWebRtcPeerConnectionFactory(
 		log,
 		settings.UseEgressOnlyIceInterfaces,
 	); ok {
+		log.Infof("[ice-factory]using iceInterfaceNet (synthetic interfaces)\n")
 		// Android (API 30+) denies netlink, so pion's default net.Interfaces()
 		// gathering yields zero host candidates and p2p never leaves the WAN
 		// relay. Device clients also opt into the same egress-only view on
@@ -100,6 +125,8 @@ func newWebRtcPeerConnectionFactory(
 		// is both the usable path and a bounded setup cost.
 		// See OPTIMIZENETWORKPEER1.md §5.1.
 		selectedNet = iceNet
+	} else {
+		log.Infof("[ice-factory]no network selected, using pion default\n")
 	}
 	if settings.EnableDatagramFastPath &&
 		0 < settings.DatagramFastPathWriteQueueSize &&
