@@ -45,16 +45,24 @@ type iceInterfaceNet struct {
 // host candidates. When enumeration works (desktop, Android WiFi), we
 // still use the synthetic interface to filter out private/CGNAT
 // addresses that would be offered as unreachable host candidates.
+//
+// When localEgressInterfaces returns empty (all addresses are
+// private/CGNAT and filtered), the synthetic net is still returned
+// with an empty interface list. This prevents Pion from falling back
+// to its default net (which enumerates all system interfaces
+// including private ones). STUN gathering still works through the
+// base stdnet.Net, producing srflx candidates via the kernel routing
+// table — only host candidates are suppressed.
 func newIceInterfaceNet(log Logger, _ bool) (transport.Net, bool) {
 	base, _ := stdnet.NewNet() // usable for sockets even though enumeration failed
 	ifcs := localEgressInterfaces()
-	if len(ifcs) == 0 {
-		return nil, false
-	}
 	if log.V(1).Enabled() {
 		for _, ifc := range ifcs {
 			addrs, _ := ifc.Addrs()
 			log.Infof("[ice-if]synthetic %s addrs=%v\n", ifc.Name, addrs)
+		}
+		if len(ifcs) == 0 {
+			log.Infof("[ice-if]synthetic empty (all egress addrs private/CGNAT filtered)\n")
 		}
 	}
 	return &iceInterfaceNet{
