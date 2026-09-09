@@ -83,38 +83,6 @@ func newWebRtcPeerConnectionFactory(
 		if 0 < len(networkTypes) {
 			s.SetNetworkTypes(networkTypes)
 		}
-		// Reject interfaces whose addresses are all RFC1918/CGNAT.
-		// Behind carrier-grade NAT (e.g. AT&T cellular), dialLocalIP
-		// returns a private address that gets offered as a host
-		// candidate unreachable from internet peers. On WiFi where
-		// net.Interfaces() works, the synthetic iceInterfaceNet path
-		// is bypassed and Pion enumerates all system interfaces
-		// including private ones. This filter ensures only interfaces
-		// with at least one public (non-private, non-CGNAT) address
-		// are used for host candidate gathering, in all code paths.
-		s.SetInterfaceFilter(func(interfaceName string) bool {
-			ifc, err := net.InterfaceByName(interfaceName)
-			if err != nil {
-				return false
-			}
-			addrs, err := ifc.Addrs()
-			if err != nil || len(addrs) == 0 {
-				return false
-			}
-			for _, addr := range addrs {
-				var ip net.IP
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				if ip != nil && !isPrivateOrCGNAT(ip) {
-					return true
-				}
-			}
-			return false
-		})
 	}
 	if settings.Network != nil {
 		log.Infof("[ice-factory]using caller-owned network\n")

@@ -37,17 +37,15 @@ type iceInterfaceNet struct {
 	lastRefresh time.Time
 }
 
-// newIceInterfaceNet builds the synthetic-interface net. Returns (nil, false)
-// when the platform's own net.Interfaces() works and egressOnly is false, so
-// generic desktop/server callers retain all interfaces. Device clients opt
-// into egressOnly to avoid the quadratic candidate-pair explosion caused by
-// virtual/tunnel/bridge interfaces. When enumeration is denied (Android 11+),
-// the synthetic net remains the automatic compatibility fallback.
-func newIceInterfaceNet(log Logger, egressOnly bool) (transport.Net, bool) {
-	if _, err := net.Interfaces(); err == nil && !egressOnly {
-		// enumeration works here; nothing to substitute
-		return nil, false
-	}
+// newIceInterfaceNet builds the synthetic-interface net. The synthetic
+// interface carries only the current egress address (discovered via a
+// connect-only UDP dial trick), avoiding the quadratic candidate-pair
+// explosion caused by virtual/tunnel/bridge interfaces. When
+// enumeration is denied (Android 11+), this is the only way to gather
+// host candidates. When enumeration works (desktop, Android WiFi), we
+// still use the synthetic interface to filter out private/CGNAT
+// addresses that would be offered as unreachable host candidates.
+func newIceInterfaceNet(log Logger, _ bool) (transport.Net, bool) {
 	base, _ := stdnet.NewNet() // usable for sockets even though enumeration failed
 	ifcs := localEgressInterfaces()
 	if len(ifcs) == 0 {
