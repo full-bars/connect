@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -21,9 +20,8 @@ const internalDohDialFallbackDelay = 250 * time.Millisecond
 // passes only IP literals to the underlying dialer. TLS remains outside this
 // layer, where it still sees the original hostname.
 type internalDohResolver struct {
-	cache    *DohCache
-	domains  []string
-	nextAddr atomic.Uint64
+	cache   *DohCache
+	domains []string
 }
 
 // clientStrategySettingsWithInternalDoh installs the resolver ahead of every
@@ -343,9 +341,12 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, err
 	}
-	index := int((self.nextAddr.Add(1) - 1) % uint64(len(addrs)))
-	addr := addrs[index]
-	return &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: port, Zone: addr.Zone()}, nil
+	// Pick an address honoring the family policy, same as pickControlIPAddr
+	// does for the TCP resolution path.  The round-robin was interleaving
+	// v6/v4 (orderInternalDohAddrs is v6-first) and the first pick landed
+	// on an IPv6 address that the AF_INET QUIC socket could not send to.
+	pick := pickControlIPAddr(netAddrSliceFromNetip(addrs))
+	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
 }
 
 func (self *internalDohResolver) CloseIdleConnections() {
@@ -370,4 +371,15 @@ func (self *ClientStrategy) resolveControlUDPAddr(ctx context.Context, address s
 		return resolveUDPAddrWithResolver(ctx, address, self.settings.ConnectSettings.Resolver, false)
 	}
 	return resolveEgressUDPAddr(ctx, address)
+}
+
+// netAddrSliceFromNetip converts a slice of netip.Addr to []net.IPAddr so
+// that pickControlIPAddr (which operates on net.IPAddr) can be applied to
+// the DoH resolver's address list.
+func netAddrSliceFromNetip(addrs []netip.Addr) []net.IPAddr {
+	out := make([]net.IPAddr, len(addrs))
+	for i, a := range addrs {
+		out[i] = net.IPAddr{IP: net.IP(a.AsSlice()), Zone: a.Zone()}
+	}
+	return out
 }
