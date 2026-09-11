@@ -129,7 +129,8 @@ type MultiClientGenerator interface {
 }
 
 // MultiClientGeneratorExcluder is an optional generator capability: exclude a
-// provider from further discovery for the life of the generator. Used by
+// provider from near-term discovery. Implementations own the retention policy;
+// the API generator uses a bounded oldest-evicted runtime history. Used by
 // RemoteUserNatMultiClient.RemoveProvider so a removed provider is not handed
 // straight back by the next discovery call.
 type MultiClientGeneratorExcluder interface {
@@ -8459,7 +8460,7 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 
 // RemoveProvider drops the provider with this egress (destination tail) client
 // id from every window and, for a discovery-based connection, excludes it from
-// further discovery for the life of this multi client. Both halves are
+// near-term discovery under the generator's retention policy. Both halves are
 // required: the resize loop wakes as soon as a client dies, so a removal
 // without the exclusion is immediately undone by re-discovering the same
 // provider. Reports whether a window client was actually removed.
@@ -9442,10 +9443,11 @@ type multiClientWindow struct {
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
 	// Nil test seams expose one initial-evaluation callback across the exact
-	// expand-pass terminal boundary. Production leaves all three unset.
+	// expand-pass terminal boundary. Production leaves all four unset.
 	beforeExpandPingResultForTest func()
 	afterExpandPingResultForTest  func()
 	finishExpandPassForTest       <-chan struct{}
+	expireExpandPassForTest       <-chan struct{}
 	// verdictRemovalTimes is the storm breaker's record of recent
 	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
 	// Guarded by stateLock. Only removals a verdict argued for are recorded
@@ -9484,6 +9486,7 @@ type multiClientWindow struct {
 	// shape, on the "(N suppressed)" pattern the egress-dial evidence uses
 	createFailThrottle    *logThrottle
 	pingFailThrottle      *logThrottle
+	budgetFailThrottle    *logThrottle
 	enumerateZeroThrottle *logThrottle
 }
 
@@ -9540,6 +9543,7 @@ func newMultiClientWindow(
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
+		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		enumerateZeroThrottle:        newLogThrottle(evaluationFailureLogInterval),
 	}
 	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
@@ -9901,11 +9905,23 @@ func (self *multiClientWindow) contractStatusFromClient(client *multiClientChann
 	if contractStatusMatchesClient(client, status) &&
 		status.Error != nil &&
 		*status.Error == protocol.ContractError_Reliability {
-		client.setWarning(true, warnUnhealthy)
-		client.addError(errContractReliability)
-		if self.resizeMonitor != nil {
-			self.resizeMonitor.NotifyAll()
-		}
+		client.contractReliabilityOnce.Do(func() {
+			// The exclusion must become visible to discovery before resize is
+			// woken. Otherwise the first replacement pass can immediately hand
+			// the terminal destination back to this window.
+			if self.generator != nil {
+				if _, fixed := self.generator.FixedDestinationSize(); !fixed {
+					if excluder, ok := self.generator.(MultiClientGeneratorExcluder); ok {
+						excluder.ExcludeClientId(client.args.Destination.Tail())
+					}
+				}
+			}
+			client.setWarning(true, warnUnhealthy)
+			client.addError(errContractReliability)
+			if self.resizeMonitor != nil {
+				self.resizeMonitor.NotifyAll()
+			}
+		})
 	}
 
 	self.contractStatus(status)
@@ -10092,6 +10108,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			nil,
 		)
 		if err != nil {
+			select {
+			case <-self.ctx.Done():
+				return
+			default:
+			}
 			self.log.Infof("[multi]window enumerate error timeout = %s\n", err)
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
@@ -10155,6 +10176,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						)
 					}
 					if err != nil {
+						select {
+						case <-self.ctx.Done():
+							return
+						default:
+						}
 						self.log.Infof("[multi]create client args error = %s\n", err)
 						// platform api again: the client mint is a platform
 						// round trip, so its timeout is platform-unreachable
@@ -10870,8 +10896,15 @@ func (self *multiClientWindow) expand(
 
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
-	pendingPingFailures := []func(){}
+	type pendingPingFailure struct {
+		fail            func() bool
+		evaluationCtx   context.Context
+		startedAt       time.Time
+		effectiveBudget time.Duration
+	}
+	pendingPingFailures := []pendingPingFailure{}
 	expandEnded := false
+	passDeadlineExpired := false
 
 	// admitCandidate installs one evaluated candidate into the window, running
 	// the same-clientId replacement gate exactly as the pre-pooling install
@@ -11029,8 +11062,6 @@ func (self *multiClientWindow) expand(
 	// admission completed here still counts in the returned total.
 	defer func() {
 		mutex.Lock()
-		defer mutex.Unlock()
-
 		expandEnded = true
 		admitPending()
 		for _, candidate := range pending {
@@ -11043,9 +11074,34 @@ func (self *multiClientWindow) expand(
 		// each install one candidate and grow a fixed-size-one window to six.
 		// Failing every unresolved evaluation cancels its Client and returns its
 		// generator args before a later resize pass can begin.
-		for _, fail := range pendingPingFailures {
-			fail()
+		deadlineFailureCount := 0
+		var effectiveBudgetMin time.Duration
+		var observedBudgetMax time.Duration
+		for _, pendingFailure := range pendingPingFailures {
+			deadlineOwned := evaluationBudgetDeadlineOwned(
+				passDeadlineExpired,
+				self.ctx,
+				pendingFailure.evaluationCtx,
+			)
+			if !pendingFailure.fail() || !deadlineOwned {
+				continue
+			}
+			deadlineFailureCount += 1
+			if effectiveBudgetMin == 0 || pendingFailure.effectiveBudget < effectiveBudgetMin {
+				effectiveBudgetMin = pendingFailure.effectiveBudget
+			}
+			observedBudget := time.Since(pendingFailure.startedAt)
+			if observedBudgetMax < observedBudget {
+				observedBudgetMax = observedBudget
+			}
 		}
+		mutex.Unlock()
+
+		self.recordEvaluationBudgetExhausted(
+			deadlineFailureCount,
+			effectiveBudgetMin,
+			observedBudgetMax,
+		)
 	}()
 
 	endTime := time.Now().Add(self.settings.WindowExpandTimeout)
@@ -11053,6 +11109,7 @@ func (self *multiClientWindow) expand(
 	for i := 0; i < requestCount; i += 1 {
 		timeout := endTime.Sub(time.Now())
 		if timeout < 0 {
+			passDeadlineExpired = true
 			self.log.V(1).Infof("[multi]expand window timeout\n")
 			return
 		}
@@ -11062,6 +11119,9 @@ func (self *multiClientWindow) expand(
 		case <-self.ctx.Done():
 			return
 		case <-self.finishExpandPassForTest:
+			return
+		case <-self.expireExpandPassForTest:
+			passDeadlineExpired = true
 			return
 		// case <- update:
 		//     // continue
@@ -11140,11 +11200,11 @@ func (self *multiClientWindow) expand(
 				pendingPingDones = append(pendingPingDones, pingDone)
 
 				// must be called with mutex
-				fail := func() {
+				fail := func() bool {
 					select {
 					case <-pingDone.Done():
 						// already done
-						return
+						return false
 					default:
 					}
 
@@ -11153,8 +11213,16 @@ func (self *multiClientWindow) expand(
 					// derived identity through its final contract-close controls.
 					client.Cancel()
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location)
+					return true
 				}
-				pendingPingFailures = append(pendingPingFailures, fail)
+				pingStartedAt := time.Now()
+				effectiveBudget := min(self.settings.PingTimeout, max(time.Duration(0), endTime.Sub(pingStartedAt)))
+				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
+					fail:            fail,
+					evaluationCtx:   evaluationCtx,
+					startedAt:       pingStartedAt,
+					effectiveBudget: effectiveBudget,
+				})
 
 				// EncryptionCapabilityPrefilter: under EncryptionModeRequired
 				// a candidate that has never published a client identity key
@@ -11247,21 +11315,16 @@ func (self *multiClientWindow) expand(
 								}
 								pingCancel()
 							} else {
-								// unconditional (V0), was V(1): a ping-ack
-								// error is an evaluation-failure transition,
-								// and those were invisible in the field
-								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
-									self.log.Infof("[multi]evaluation ping error [%s] = %s%s\n",
-										args.ClientId, err, suppressedSuffix(suppressed))
-								}
-								self.recordEvaluationFailure(windowFailureProvider, err)
+								self.recordEvaluationPingFailure(evaluationCtx, args, err)
 								fail()
 							}
 						},
 					)
 					if err != nil {
-						self.log.Infof("[multi]create client ping error = %s\n", err)
-						self.recordEvaluationFailure(windowFailureProvider, err)
+						if !isEvaluationContextCancellation(evaluationCtx, err) {
+							self.log.Infof("[multi]create client ping error = %s\n", err)
+							self.recordEvaluationFailure(windowFailureProvider, err)
+						}
 						fail()
 					} else if !success {
 						fail()
@@ -11270,18 +11333,28 @@ func (self *multiClientWindow) expand(
 						go HandleError(func() {
 							select {
 							case <-pingDone.Done():
-							case <-time.After(self.settings.PingTimeout):
-								// unconditional (V0), was V(2): the unanswered
-								// evaluation ping is THE dominant transition of
-								// the field hang, and it logged nothing
-								if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
-									self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
-										args.ClientId, suppressedSuffix(suppressed))
-								}
-								self.recordEvaluationFailure(windowFailureProvider, nil)
+							case <-evaluationCtx.Done():
 								func() {
 									mutex.Lock()
 									defer mutex.Unlock()
+									fail()
+								}()
+							case <-time.After(self.settings.PingTimeout):
+								func() {
+									mutex.Lock()
+									defer mutex.Unlock()
+									if evaluationCtx.Err() != nil {
+										fail()
+										return
+									}
+									// unconditional (V0), was V(2): the unanswered
+									// evaluation ping is THE dominant transition of
+									// the field hang, and it logged nothing
+									if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+										self.log.Infof("[multi]evaluation ping timeout [%s]%s\n",
+											args.ClientId, suppressedSuffix(suppressed))
+									}
+									self.recordEvaluationFailure(windowFailureProvider, nil)
 									fail()
 								}()
 							}
@@ -11290,7 +11363,9 @@ func (self *multiClientWindow) expand(
 				})
 			}
 		case <-time.After(timeout):
+			passDeadlineExpired = true
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
+			return
 		}
 	}
 
@@ -11298,7 +11373,8 @@ func (self *multiClientWindow) expand(
 	for _, pingDone := range pendingPingDones {
 		timeout := endTime.Sub(time.Now())
 		if timeout <= 0 {
-			break
+			passDeadlineExpired = true
+			return
 		}
 
 		select {
@@ -11306,12 +11382,94 @@ func (self *multiClientWindow) expand(
 			return
 		case <-self.finishExpandPassForTest:
 			return
+		case <-self.expireExpandPassForTest:
+			passDeadlineExpired = true
+			return
 		case <-pingDone.Done():
 		case <-time.After(timeout):
+			passDeadlineExpired = true
+			return
 		}
 	}
 
 	return
+}
+
+func evaluationBudgetDeadlineOwned(
+	passDeadlineExpired bool,
+	windowCtx context.Context,
+	evaluationCtx context.Context,
+) bool {
+	return passDeadlineExpired &&
+		windowCtx.Err() == nil &&
+		evaluationCtx.Err() == nil
+}
+
+// recordEvaluationBudgetExhausted owns only candidates still unresolved when
+// the expansion pass reaches its natural deadline. Pass cleanup remains the
+// terminal owner, so a delayed ping callback cannot admit into a later pass;
+// this method restores the provider-failure evidence that cleanup previously
+// erased when WindowExpandTimeout was shorter than PingTimeout. Local epoch or
+// window cancellation is filtered by the caller before a candidate is counted.
+func (self *multiClientWindow) recordEvaluationBudgetExhausted(
+	candidateCount int,
+	effectiveBudgetMin time.Duration,
+	observedBudgetMax time.Duration,
+) {
+	if candidateCount <= 0 {
+		return
+	}
+
+	allowLog := true
+	var suppressed int64
+	if self.budgetFailThrottle != nil {
+		allowLog, suppressed = self.budgetFailThrottle.Allow(time.Now())
+	}
+	if allowLog {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"evaluation_budget_exhausted",
+			"window", self.windowName(),
+			"candidates", candidateCount,
+			"effective_min", effectiveBudgetMin,
+			"observed_max", observedBudgetMax,
+			"ping_timeout", self.settings.PingTimeout,
+			"expand_timeout", self.settings.WindowExpandTimeout,
+			"suppressed", suppressed,
+		))
+	}
+	for range candidateCount {
+		self.recordEvaluationFailure(windowFailureProvider, nil)
+	}
+}
+
+// isEvaluationContextCancellation distinguishes an owning evaluation-epoch
+// rebuild or window retirement from an identically worded provider error. The
+// context must be done and the returned error must match that exact context
+// outcome; a live-context context.Canceled remains provider evidence.
+func isEvaluationContextCancellation(evaluationCtx context.Context, err error) bool {
+	contextErr := evaluationCtx.Err()
+	return contextErr != nil && errors.Is(err, contextErr)
+}
+
+// recordEvaluationPingFailure keeps the provider-failure reason free of
+// cancellations caused by rebuildWindow replacing the evaluation epoch. The
+// caller still performs ordinary candidate cleanup on both branches.
+func (self *multiClientWindow) recordEvaluationPingFailure(
+	evaluationCtx context.Context,
+	args *multiClientChannelArgs,
+	err error,
+) bool {
+	if isEvaluationContextCancellation(evaluationCtx, err) {
+		return false
+	}
+	// unconditional (V0), was V(1): a ping-ack error is an
+	// evaluation-failure transition, and those were invisible in the field.
+	if ok, suppressed := self.pingFailThrottle.Allow(time.Now()); ok {
+		self.log.Infof("[multi]evaluation ping error [%s] = %s%s\n",
+			args.ClientId, err, suppressedSuffix(suppressed))
+	}
+	self.recordEvaluationFailure(windowFailureProvider, err)
+	return true
 }
 
 // recordChannelCreationFailure reports whether a failed candidate needs a
@@ -11325,8 +11483,7 @@ func (self *multiClientWindow) recordChannelCreationFailure(
 	args *multiClientChannelArgs,
 	err error,
 ) bool {
-	contextErr := evaluationCtx.Err()
-	if contextErr != nil && errors.Is(err, contextErr) {
+	if isEvaluationContextCancellation(evaluationCtx, err) {
 		return false
 	}
 	// unconditional (V0): this transition was invisible in the field —
@@ -12107,6 +12264,11 @@ type multiClientChannel struct {
 	// sourceFilter map[TransferPath]bool
 
 	client *Client
+	// contractReliabilityOnce makes the platform's terminal destination
+	// verdict one lifecycle transition. Duplicate status frames may be
+	// dispatched concurrently, but they must not schedule unbounded window
+	// replacements or repeat generator mutations.
+	contractReliabilityOnce sync.Once
 
 	stateLock    sync.Mutex
 	eventBuckets []*multiClientEventBucket
