@@ -1,0 +1,38 @@
+name: urnet-tools
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: urnet-tools go test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out connect
+        uses: actions/checkout@v4
+
+      # The windows-latest leg is the compile/test check for the windows
+      # build-tagged paths (toolhelp process enumeration, registry PATH,
+      # shortcut creation) that cannot run on linux runners.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build
+        run: go build ./cmd/urnet-tools ./cmd/urnetwork-updater ./internal/urnettools/...
+
+      - name: Test
+        run: go test -count=1 ./internal/urnettools/...
