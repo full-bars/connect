@@ -5,12 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // Smart dialer: make the measured dial cost a signal in transport choice.
@@ -446,4 +449,30 @@ func (self *dialTiming) observe(dialer *clientDialer, err error) {
 	if fresh, establish := self.sample(); fresh {
 		dialer.observeConnect(establish)
 	}
+}
+
+// wrapDialer returns a copy of the websocket dialer whose TLS dial records how
+// long the connection took to establish (TCP and TLS, the same span the
+// httptrace hook measures for the http and websocket paths). The H1+ dial
+// builds its own connection through this function rather than through
+// gorilla's trace hook, so it has to be timed here. The dialer is copied
+// because strategy dialers are cached and shared by concurrent attempts. The
+// last successful dial wins: when the framed upgrade fails and the dial falls
+// back to a websocket on a new connection, that connection is the one kept.
+func (self *dialTiming) wrapDialer(dialer *websocket.Dialer) *websocket.Dialer {
+	attempt := *dialer
+	if base := dialer.NetDialTLSContext; base != nil {
+		attempt.NetDialTLSContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+			start := time.Now()
+			conn, err := base(ctx, network, address)
+			if err == nil {
+				self.mutex.Lock()
+				self.fresh = true
+				self.establishTime = time.Since(start)
+				self.mutex.Unlock()
+			}
+			return conn, err
+		}
+	}
+	return &attempt
 }
