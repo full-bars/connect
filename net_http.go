@@ -752,6 +752,9 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 				w := dialer.Weight()
 				weights[dialer] = w
 			}
+			if SmartDialerEnabled() {
+				applySmartDialerWeights(weights)
+			}
 		} else {
 			for dialer, _ := range self.dialers {
 				if dialer.IsExtender() {
@@ -1106,6 +1109,9 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 			slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 				return a.priority - b.priority
 			})
+			if SmartDialerEnabled() {
+				serialDialers = orderDialersByMeasuredCost(serialDialers)
+			}
 			for i, dialer := range serialDialers {
 				select {
 				case <-handleCtx.Done():
@@ -1299,6 +1305,9 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 		slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 			return a.priority - b.priority
 		})
+		if SmartDialerEnabled() {
+			serialDialers = orderDialersByMeasuredCost(serialDialers)
+		}
 		for i, dialer := range serialDialers {
 			select {
 			case <-handleCtx.Done():
@@ -1444,7 +1453,9 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 			return &evalResult{err: err}
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		dialStart := time.Now()
+		timing := &dialTiming{}
+		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1454,6 +1465,7 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		}
 
 		dialer.Update(handleCtx, err)
+		timing.observe(dialer, err)
 
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
@@ -1502,7 +1514,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			return &evalResult{err: err}
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		dialStart := time.Now()
+		timing := &dialTiming{}
+		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -1513,6 +1527,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		}
 
 		dialer.Update(handleCtx, err)
+		timing.observe(dialer, err)
 
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
@@ -1522,7 +1537,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			return &evalResult{err: err}
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		dialStart := time.Now()
+		timing := &dialTiming{}
+		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1532,6 +1549,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		}
 
 		dialer.Update(handleCtx, err)
+		timing.observe(dialer, err)
 
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
@@ -1575,7 +1593,9 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		wsDialer := dialer.WsDialer(self.settings)
-		wsConn, response, err := wsDialer.DialContext(handleCtx, url, requestHeader)
+		dialStart := time.Now()
+		timing := &dialTiming{}
+		wsConn, response, err := wsDialer.DialContext(timing.traceCtx(handleCtx, dialStart), url, requestHeader)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]ws dial %s = %s\n", url, err)
@@ -1585,6 +1605,7 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 		}
 
 		dialer.Update(handleCtx, err)
+		timing.observe(dialer, err)
 		// a pinned platform transport classifies the typed error of each
 		// attempt here; a failed parallelEval flattens it to "Timeout."
 		observeDialAttempt(handleCtx, err)
@@ -1992,6 +2013,11 @@ type clientDialer struct {
 	errorCount      uint64
 	lastSuccessTime time.Time
 	lastErrorTime   time.Time
+	// the smart dialer's connect-only measurement (net_http_smart_dialer.go);
+	// the fields live here because they are guarded by this mutex
+	connectLatencyNanos int64
+	connectSamples      int
+	connectObservedAt   time.Time
 	// the extender answered this dialer 429 and is left alone until then
 	// (A12), which is not an error. The directory keeps the same for its
 	// address; this is what a manual extender, which it does not know, has.
