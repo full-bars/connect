@@ -1319,18 +1319,24 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 				handleCtx,
 				len(serialDialers)-i,
 			)
+			startDial := time.Now()
 			result := eval(attemptCtx, dialer)
+			dialDur := time.Since(startDial)
 			if result != nil {
 				result.dialer = dialer
 				if result.Selected().err == nil || result.terminal {
 					attemptCancel()
-					if self.log.V(2).Enabled() {
-						self.log.Infof("[net][s]select: %s\n", dialer.String())
-					}
+					// Always logged: which transport carried the dial is the
+					// one line an operator reads to see the dialer working.
+					self.log.Infof("🌐 [net][s]select: %s dur=%dms\n", dialer.String(), dialDur.Milliseconds())
 					return result
 				}
-				if self.log.V(2).Enabled() {
-					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+				if ok, suppressed := shouldLogSelectErr(); ok {
+					if suppressed > 0 {
+						self.log.Infof("🌐 [net][s]select: %s = %s dur=%dms (%d suppressed)\n", dialer.String(), result.err, dialDur.Milliseconds(), suppressed)
+					} else {
+						self.log.Infof("🌐 [net][s]select: %s = %s dur=%dms\n", dialer.String(), result.err, dialDur.Milliseconds())
+					}
 				}
 				result.releaseAfterUse(attemptCtx)
 			}
@@ -2799,3 +2805,13 @@ func HttpPostWithStreamFunction[R any](
 	callback.Result(result, nil)
 	return result, nil
 }
+
+// selectErrThrottle bounds the failure form of the always-on serial
+// `[net][s]select` line: a failing pool otherwise logs one line per dialer per
+// dial. The success form is never throttled.
+var selectErrThrottle = newLogThrottle(time.Minute)
+
+// shouldLogSelectErr reports whether a `[net][s]select` error line may be
+// emitted now, with the count of lines suppressed since the previous allowed
+// one, for the "(N suppressed)" tail.
+func shouldLogSelectErr() (bool, int64) { return selectErrThrottle.Allow(time.Now()) }
