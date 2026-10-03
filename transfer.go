@@ -9518,20 +9518,20 @@ func (self *SendSequence) updateContractWithAckPromotion(
 				self.contractSeqIndex += 1
 				// async queue up the next contract.
 				//
-				// Skipped while the backend is unreachable. A sequence that
-				// still holds queued contracts keeps satisfying TakeContract,
-				// so without this check it would keep prefetching and keep the
-				// OOB storm going for exactly the sequences that still have
-				// work to do. The contract just taken is unaffected: only the
-				// prefetch of the following one waits for the backend.
-				if !isBackendDegraded() {
-					prefetchMetadata := self.contractMetadata()
-					self.client.ContractManager().CreateContract(
-						prefetchMetadata.key,
-						self.contractSeqIndex,
-						ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-					)
-				}
+				// The degraded gate deliberately does not apply here. This
+				// prefetch is what primes the successor for the boundary
+				// switch: skip it and the queue drains, the announce finds
+				// nothing to take, and exhaustion has no contract to fall back
+				// on, so the sequence stalls for the whole CreateContractTimeout
+				// against the same backend that was too sick to prefetch from.
+				// One request from a sequence that is actually sending costs far
+				// less than that stall.
+				prefetchMetadata := self.contractMetadata()
+				self.client.ContractManager().CreateContract(
+					prefetchMetadata.key,
+					self.contractSeqIndex,
+					ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+				)
 				return true
 			}
 			return false
@@ -9788,15 +9788,17 @@ func (self *SendSequence) announceContractAhead() {
 		aheadContract,
 		self.contractAheadAckCallback(aheadContract),
 	)
-	// queue the one after it, the same prefetch a take makes
-	if !isBackendDegraded() {
-		prefetchMetadata := self.contractMetadata()
-		self.client.ContractManager().CreateContract(
-			prefetchMetadata.key,
-			self.contractSeqIndex,
-			ByteCount(32+float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-		)
-	}
+	// queue the one after it, the same prefetch a take makes. This runs only
+	// when the current contract is already within the announce threshold, so it
+	// is a boundary prefetch rather than a speculative one: the degraded gate
+	// must not apply, or the boundary has nothing queued to switch to and the
+	// sequence stalls for the whole CreateContractTimeout.
+	prefetchMetadata := self.contractMetadata()
+	self.client.ContractManager().CreateContract(
+		prefetchMetadata.key,
+		self.contractSeqIndex,
+		ByteCount(32+float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+	)
 }
 
 // Marks the announced successor acknowledged, which is what the switch reads
