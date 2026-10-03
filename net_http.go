@@ -251,6 +251,9 @@ type ClientStrategy struct {
 	extenderIpSecrets map[netip.Addr]string
 
 	nextConnectTime time.Time
+	// smartProbe is the smart dialer's probe schedule (net_http_smart_dialer.go);
+	// its zero value is valid and guarded by its own mutex
+	smartProbe smartProbeState
 	// reconnectFastPathCount is the number of reconnect fast-path slots
 	// currently held (see NextReconnectTime). Guarded by mutex. The zero value
 	// means all slots free, so a bare test-constructed strategy works
@@ -2026,6 +2029,13 @@ type clientDialer struct {
 	connectLatencyNanos int64
 	connectSamples      int
 	connectObservedAt   time.Time
+	// probe evidence, kept apart from real-dial evidence so a probe can never
+	// make a transport that fails live traffic look healthy
+	probeSuccesses    int
+	probeLastSuccess  time.Time
+	probeFailStreak   int
+	probeBlockedCount int
+	probeBlockedUntil time.Time
 	// the extender answered this dialer 429 and is left alone until then
 	// (A12), which is not an error. The directory keeps the same for its
 	// address; this is what a manual extender, which it does not know, has.
