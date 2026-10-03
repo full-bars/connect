@@ -520,12 +520,37 @@ func (self *PlatformTransport) nextDialTime(hadConnection bool) (connectTime tim
 // evidence about one family on this device, not about the backend, so it only
 // feeds the transport's own backoff; the process-wide degraded gate is left to
 // family-agnostic transports (A5).
-func (self *PlatformTransport) noteDialFailure() {
+//
+// A canceled dial is not evidence about the backend either. Dialers race (the
+// family group races its transports, the smart dialer races carriers) and the
+// losers are canceled, so counting a cancellation trips the process-wide
+// degraded gate while the backend is answering every request. The gate then
+// suppresses contract creation for the whole CreateContractTimeout, which is
+// what turns a local race into dead pages.
+func (self *PlatformTransport) noteDialFailure(err error) {
 	if self.pinned() {
 		self.pinnedBackoff.fail()
 		return
 	}
+	if isCanceledDial(err) {
+		return
+	}
 	noteBackendFailure()
+}
+
+// isCanceledDial reports whether a dial failure was a local cancellation rather
+// than evidence about the backend. Cancellations arrive wrapped and spelled
+// differently by layer (context gives "context canceled", the runtime poller
+// gives "operation was canceled"), so the typed check is not enough on its own.
+func isCanceledDial(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "canceled") || strings.Contains(message, "cancelled")
 }
 
 // noteDialSuccess clears the transport's own backoff and, for a

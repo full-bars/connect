@@ -2140,7 +2140,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// gated. The contract OOB path makes the same carve-out on
 			// client.Done.
 			if self.ctx.Err() == nil {
-				self.noteDialFailure()
+				self.noteDialFailure(err)
 			}
 			// err here is the strategy's flattened "Timeout."; a pinned
 			// transport classified each dialer attempt's typed error through
@@ -3028,7 +3028,7 @@ func (self *PlatformTransport) runH3(
 			// client.Done.
 			if ctx.Err() == nil {
 				if !attemptCanceled {
-					self.noteDialFailure()
+					self.noteDialFailure(err)
 					// the h3 resolve error reaches here typed, unlike the
 					// h1 strategy's flattened "Timeout."
 					self.noteDialError(err)
