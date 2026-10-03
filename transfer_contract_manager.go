@@ -1282,23 +1282,68 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	reason := verifyFailureReason(
+		self.providePaused,
+		self.provideModes,
+		self.provideSecretKeys,
+		provideMode,
+		func(provideSecretKey []byte) bool {
+			return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+		},
+	)
+	if reason != "" {
+		self.logVerifyFailure(provideMode, reason)
+		return false
+	}
+	return true
+}
+
+// verifyFailureReason names why a contract cannot be verified, or "" when it
+// can. A bare "verification failed" cannot separate a missing per-mode secret
+// from an HMAC mismatch, and those have completely different causes: a key the
+// platform is not signing with, versus a signing disagreement. Pure, so every
+// branch is testable without a client.
+func verifyFailureReason(
+	providePaused bool,
+	provideModes map[protocol.ProvideMode]bool,
+	provideSecretKeys map[protocol.ProvideMode][]byte,
+	provideMode protocol.ProvideMode,
+	verifyHmac func(provideSecretKey []byte) bool,
+) string {
 	// when paused, only allow ProvideMode_Stream for return traffic and
 	// ProvideMode_Network for network peers (pause stops public/ff only)
-	if self.providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
-		return false
+	if providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
+		return "paused"
 	}
-
-	if !self.provideModes[provideMode] {
-		return false
+	if !provideModes[provideMode] {
+		return "mode-not-enabled"
 	}
-
-	provideSecretKey, ok := self.provideSecretKeys[provideMode]
+	provideSecretKey, ok := provideSecretKeys[provideMode]
 	if !ok {
-		// provide mode is not enabled
-		return false
+		return "no-secret-key"
 	}
+	if !verifyHmac(provideSecretKey) {
+		return "hmac-mismatch"
+	}
+	return ""
+}
 
-	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+// logVerifyFailure records the reason a contract failed verification. The
+// secret itself is never logged, only its length. V(1), so it costs nothing in
+// normal operation.
+func (self *ContractManager) logVerifyFailure(provideMode protocol.ProvideMode, reason string) {
+	if self.client == nil {
+		return
+	}
+	if v := self.client.log.V(1); v.Enabled() {
+		v.Infof(
+			"[contract]verify failed mode=%s reason=%s mode_enabled=%v secret_len=%d\n",
+			provideMode,
+			reason,
+			self.provideModes[provideMode],
+			len(self.provideSecretKeys[provideMode]),
+		)
+	}
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
