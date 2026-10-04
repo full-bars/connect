@@ -1888,8 +1888,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					MessagePoolReturn(message)
 				}
 				if err == nil {
+					payloadCount := 0
+					for _, message := range messages {
+						if 0 < len(message) {
+							payloadCount += 1
+						}
+					}
 					writeCounter.Add(uint64(len(messages)))
-					writePayloadCounter.Add(uint64(len(messages)))
+					writePayloadCounter.Add(uint64(payloadCount))
 				}
 				return
 			}
