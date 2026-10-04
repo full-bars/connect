@@ -1778,7 +1778,15 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			framer := NewFramer(self.framerSettings)
 
 			var readCounter atomic.Uint64
+			var readPayloadCounter atomic.Uint64
 			var writeCounter atomic.Uint64
+
+			// per-connection frame counts, so the log says what this transport carried
+			connectedAt := time.Now()
+			defer func() {
+				self.log.Infof("[t]h3 closed %s after %s (frames out=%d in=%d)\n",
+					clientId, time.Since(connectedAt).Round(time.Second), writeCounter.Load(), readCounter.Load())
+			}()
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
@@ -1890,14 +1898,14 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				for {
 					mode, notify := self.activeMode()
 					if mode != ptMode {
-						startReadCount := readCounter.Load()
+						startReadCount := readPayloadCounter.Load()
 						startWriteCount := writeCounter.Load()
 						select {
 						case <-handleCtx.Done():
 							return
 						case <-time.After(time.Duration(slowMultiple) * self.settings.InactiveDrainTimeout):
 							// no activity after cool down, shut down this transport
-							if readCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
+							if readPayloadCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
 								handleCancel()
 							}
 						case <-notify:
@@ -2005,6 +2013,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						return
 					}
 
+					readCounter.Add(1)
+
 					if 0 == len(message) {
 						// ping
 						if self.log.V(2).Enabled() {
@@ -2013,6 +2023,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						MessagePoolReturn(message)
 						continue
 					}
+
+					// count payload reads only: pings are keepalive, not use
+					readPayloadCounter.Add(1)
 
 					timeoutChan := resetOrCreateTimer(
 						&receiveTimer,
