@@ -3145,6 +3145,7 @@ func (self *PlatformTransport) runH3(
 			var readCounter atomic.Uint64
 			var readPayloadCounter atomic.Uint64
 			var writeCounter atomic.Uint64
+			var writePayloadCounter atomic.Uint64
 			// The route selector classifies the exact message accepted by this H3
 			// generation. Keep the live QUIC DATAGRAM ceiling atomic because Transfer
 			// reads it on its sender goroutine while the carrier writer lowers it
@@ -3350,6 +3351,7 @@ func (self *PlatformTransport) runH3(
 				)
 				if err == nil {
 					writeCounter.Add(uint64(len(messages)))
+					writePayloadCounter.Add(uint64(len(messages)))
 					for _, message := range messages {
 						if connStream.useH3Datagrams {
 							self.h3DatagramStats.RecordStreamSent(len(message))
@@ -3395,7 +3397,7 @@ func (self *PlatformTransport) runH3(
 					ptMode,
 					slowMultiple,
 					&readPayloadCounter,
-					&writeCounter,
+					&writePayloadCounter,
 					handleCancel,
 				)
 			}, handleCancel)
@@ -3439,6 +3441,7 @@ func (self *PlatformTransport) runH3(
 							if err := framer.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
 								return
 							}
+							writeCounter.Add(1)
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 							continue
 						}
@@ -3522,6 +3525,7 @@ func (self *PlatformTransport) runH3(
 									}
 									MessagePoolReturn(message)
 									writeCounter.Add(1)
+									writePayloadCounter.Add(1)
 									if self.log.V(2).Enabled() {
 										self.log.Infof("[ts]%s->datagram\n", clientId)
 									}
