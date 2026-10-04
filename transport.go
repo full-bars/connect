@@ -1780,6 +1780,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			var readCounter atomic.Uint64
 			var readPayloadCounter atomic.Uint64
 			var writeCounter atomic.Uint64
+			var writePayloadCounter atomic.Uint64
 
 			// per-connection frame counts, so the log says what this transport carried
 			connectedAt := time.Now()
@@ -1888,6 +1889,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				}
 				if err == nil {
 					writeCounter.Add(uint64(len(messages)))
+					writePayloadCounter.Add(uint64(len(messages)))
 				}
 				return
 			}
@@ -1899,13 +1901,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 					mode, notify := self.activeMode()
 					if mode != ptMode {
 						startReadCount := readPayloadCounter.Load()
-						startWriteCount := writeCounter.Load()
+						startWriteCount := writePayloadCounter.Load()
 						select {
 						case <-handleCtx.Done():
 							return
 						case <-time.After(time.Duration(slowMultiple) * self.settings.InactiveDrainTimeout):
 							// no activity after cool down, shut down this transport
-							if readPayloadCounter.Load() == startReadCount && writeCounter.Load() == startWriteCount {
+							if readPayloadCounter.Load() == startReadCount && writePayloadCounter.Load() == startWriteCount {
 								handleCancel()
 							}
 						case <-notify:
@@ -1950,6 +1952,7 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 							if err := framer.Write(stream, make([]byte, 0)); err != nil {
 								return
 							}
+							writeCounter.Add(1)
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 							continue
 						}
