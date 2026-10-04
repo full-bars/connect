@@ -3143,6 +3143,7 @@ func (self *PlatformTransport) runH3(
 			}
 
 			var readCounter atomic.Uint64
+			var readPayloadCounter atomic.Uint64
 			var writeCounter atomic.Uint64
 			// The route selector classifies the exact message accepted by this H3
 			// generation. Keep the live QUIC DATAGRAM ceiling atomic because Transfer
@@ -3155,6 +3156,13 @@ func (self *PlatformTransport) runH3(
 					connStream.sendDatagram,
 				)),
 			)
+
+			// per-connection frame counts, so the log says what this transport carried
+			connectedAt := time.Now()
+			defer func() {
+				self.log.Infof("[t]h3 closed %s after %s (frames out=%d in=%d)\n",
+					clientId, time.Since(connectedAt).Round(time.Second), writeCounter.Load(), readCounter.Load())
+			}()
 
 			send := make(chan []byte, self.h3TransportBufferSize())
 			// Stream-only H3 retains its bounded burst queue. Hybrid H3
@@ -3386,7 +3394,7 @@ func (self *PlatformTransport) runH3(
 					handleCtx,
 					ptMode,
 					slowMultiple,
-					&readCounter,
+					&readPayloadCounter,
 					&writeCounter,
 					handleCancel,
 				)
@@ -3541,7 +3549,6 @@ func (self *PlatformTransport) runH3(
 					message,
 				)
 				if delivered {
-					readCounter.Add(1)
 					if self.settings.afterH3ReceiveEnqueueForTest != nil {
 						self.settings.afterH3ReceiveEnqueueForTest(message)
 					}
@@ -3574,7 +3581,9 @@ func (self *PlatformTransport) runH3(
 						if err != nil {
 							return
 						}
+						readCounter.Add(1)
 						if len(message) != 0 {
+							readPayloadCounter.Add(1)
 							self.h3DatagramStats.RecordStreamReceived(len(message))
 							if !offerRoutedMessage(
 								message,
@@ -3621,6 +3630,7 @@ func (self *PlatformTransport) runH3(
 						if message == nil {
 							continue
 						}
+						readCounter.Add(1)
 					} else {
 						stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
 						var err error
@@ -3629,6 +3639,7 @@ func (self *PlatformTransport) runH3(
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 							return
 						}
+						readCounter.Add(1)
 						if 0 == len(message) {
 							// ping
 							if self.log.V(2).Enabled() {
@@ -3638,6 +3649,8 @@ func (self *PlatformTransport) runH3(
 							continue
 						}
 					}
+					// count payload reads only: pings are keepalive, not use
+					readPayloadCounter.Add(1)
 					reliability := CarrierReliabilityReliable
 					receive := (chan<- []byte)(reliableReceive)
 					if unreliableReceive != nil {
