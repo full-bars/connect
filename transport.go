@@ -3350,8 +3350,14 @@ func (self *PlatformTransport) runH3(
 					writeBatchStorage,
 				)
 				if err == nil {
+					payloadCount := 0
+					for _, message := range messages {
+						if 0 < len(message) {
+							payloadCount += 1
+						}
+					}
 					writeCounter.Add(uint64(len(messages)))
-					writePayloadCounter.Add(uint64(len(messages)))
+					writePayloadCounter.Add(uint64(payloadCount))
 					for _, message := range messages {
 						if connStream.useH3Datagrams {
 							self.h3DatagramStats.RecordStreamSent(len(message))
