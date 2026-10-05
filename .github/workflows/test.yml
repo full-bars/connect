@@ -126,10 +126,11 @@ jobs:
       - name: Test upstream-broken cause/inventory tests (documented signatures only)
         run: |
           run_documented() {
-            name="$1"
-            pattern="$2"
-            out=$(go test -count=1 -timeout 10m -run "^${name}$" . 2>&1)
-            rc=$?
+            local name="$1"
+            local pattern="$2"
+            local out
+            local rc=0
+            out=$(go test -count=1 -timeout 10m -run "^${name}$" . 2>&1) || rc=$?
             if [ $rc -eq 0 ]; then
               echo "::warning::${name} now passes; remove its quarantine"
               return 0
