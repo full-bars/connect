@@ -52,8 +52,13 @@ const (
 	// reliable stream. Splitting one Transfer message across multiple lossy
 	// DATAGRAMs multiplies its loss probability and made full-MTU TCP 19% slower
 	// in the corrected one-bar full-TUN benchmark.
-	defaultH3DatagramMaxFragments  = 1
-	defaultH3DatagramMaxMessages   = 32
+	defaultH3DatagramMaxFragments = 1
+	defaultH3DatagramMaxMessages  = 32
+	// h3DatagramExpireInterval drives fragment expiry independently of arriving
+	// datagrams, so an incomplete message on a quiet but open connection is
+	// released instead of holding its allocation and its budget reservation
+	// until teardown.
+	h3DatagramExpireInterval       = 5 * time.Second
 	defaultH3DatagramReplayIds     = 256
 	defaultH3DatagramMessageBytes  = 8 * 1024
 	defaultH3DatagramPeerBytes     = 64 * 1024

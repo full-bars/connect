@@ -3139,7 +3139,34 @@ func (self *PlatformTransport) runH3(
 					self.log.Infof("[t]H3 DATAGRAM receiver init error = %s\n", datagramErr)
 					return
 				}
-				defer datagramReassembler.Close()
+				// Expiry is otherwise driven only by an arriving datagram, so an
+				// incomplete message on a quiet but open connection would hold
+				// its allocation and its budget reservation until teardown. The
+				// timer is stopped and joined BEFORE the reassembler is closed,
+				// so no tick can expire a closed one.
+				expireDone := make(chan struct{})
+				var expireStopped sync.WaitGroup
+				expireStopped.Add(1)
+				defer func() {
+					close(expireDone)
+					expireStopped.Wait()
+					datagramReassembler.Close()
+				}()
+				go HandleError(func() {
+					defer expireStopped.Done()
+					ticker := time.NewTicker(h3DatagramExpireInterval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-expireDone:
+							return
+						case <-handleCtx.Done():
+							return
+						case <-ticker.C:
+							datagramReassembler.Expire(time.Now())
+						}
+					}
+				})
 			}
 
 			var readCounter atomic.Uint64
