@@ -314,25 +314,28 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		if callerErr := ctx.Err(); callerErr != nil {
 			return nil, errors.Join(err, limited.readErr, callerErr, context.Cause(ctx))
 		}
-		if responseCtx.Err() != nil {
-			// The response-timeout close is ours while the caller is still
-			// live. Represent the outcome as one response-io refusal: the raw
-			// read symptom of our own close (e.g. a closed pipe) classifies
-			// as a hard cause and would block the transport fallback.
-			// Caller cancellation stays hard above.
-			return nil, &HTTPUpgradeError{Reason: "response-io"}
-		}
 		if limited.readErr != nil {
 			// Preserve the actual socket outcome before interpreting the parser
 			// error. Only a complete transport interruption permits a fresh
 			// negotiation; cancellation and hard siblings remain authoritative.
 			causes := flattenHttpRequestCauses(limited.readErr)
 			transportOnly := len(causes) != 0
+			ownedClosedPipe := len(causes) != 0
 			for _, cause := range causes {
 				if cause.kind < 2 {
 					transportOnly = false
-					break
 				}
+				if !errors.Is(cause.err, io.ErrClosedPipe) {
+					ownedClosedPipe = false
+				}
+			}
+			if !transportOnly && ownedClosedPipe && responseCtx.Err() != nil {
+				// The response-timeout close is ours and every recorded read
+				// cause is the closed pipe it owns: represent the refusal as
+				// response-io so the transport fallback stays eligible.
+				// Independent causes and caller cancellation keep their own
+				// authority.
+				return nil, &HTTPUpgradeError{Reason: "response-io"}
 			}
 			if transportOnly {
 				return nil, errors.Join(&HTTPUpgradeError{Reason: "response-io"}, err, limited.readErr)
