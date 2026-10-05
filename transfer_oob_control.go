@@ -181,7 +181,10 @@ func (self *ApiOutOfBandControl) sendControlWithCtx(
 			apiCallback.Result(result, err)
 		}()
 	}
-	self.sendControl(connectControl, ctx, frames, callback, retryable)
+	// Local control keeps its single-attempt join semantics: a canceled or
+	// late attempt closes its committed result exactly once and must never
+	// replay the create. The bounded retry applies to api-bound sends only.
+	self.sendControl(connectControl, ctx, frames, callback, retryable && self.localControl == nil)
 }
 
 func (self *ApiOutOfBandControl) sendControl(
