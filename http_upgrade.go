@@ -314,6 +314,14 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		if callerErr := ctx.Err(); callerErr != nil {
 			return nil, errors.Join(err, limited.readErr, callerErr, context.Cause(ctx))
 		}
+		if responseCtx.Err() != nil {
+			// The response-timeout close is ours while the caller is still
+			// live. Represent the outcome as one response-io refusal: the raw
+			// read symptom of our own close (e.g. a closed pipe) classifies
+			// as a hard cause and would block the transport fallback.
+			// Caller cancellation stays hard above.
+			return nil, &HTTPUpgradeError{Reason: "response-io"}
+		}
 		if limited.readErr != nil {
 			// Preserve the actual socket outcome before interpreting the parser
 			// error. Only a complete transport interruption permits a fresh
@@ -348,7 +356,9 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	if !stop() {
 		<-canceled
 		disarmed = true
-		return nil, responseCtx.Err()
+		// The callback that won the race closed the socket under our own
+		// response timeout; keep transport fallback eligible.
+		return nil, errors.Join(&HTTPUpgradeError{Reason: "response-io"}, responseCtx.Err())
 	}
 	disarmed = true
 	if err = conn.SetDeadline(time.Time{}); err != nil {
