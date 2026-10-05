@@ -255,7 +255,7 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 		if !ok {
 			t.Fatalf("could not find %s", test.fn)
 		}
-		note := strings.Index(body, "self.noteDialFailure()")
+		note := strings.Index(body, "self.noteDialFailure(err)")
 		if note < 0 {
 			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", test.fn)
 		}

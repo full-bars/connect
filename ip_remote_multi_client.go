@@ -316,8 +316,21 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// destinations and so already discounts race-loser noise.
 		//
 		// The truncation is enforced at raceClients in sendPacket
-		// (`raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]`).
+		// (multiRaceClientCount, which also applies MultiRaceDegradedClientCount).
 		MultiRaceClientCount: 0,
+		// MultiRaceDegradedClientCount bounds the race field while the control
+		// API is degraded (isBackendDegraded), whatever MultiRaceClientCount
+		// says. The wide race above is tail-latency insurance for a rough
+		// provider pool, and that argument assumes the race can be won. In an
+		// outage it cannot -- no contract can be authorized, so no exit can
+		// carry the flow -- and every extra racer is only another copy of the
+		// packet (and of every resend of it) on the wire: the fan-out half of
+		// the outage amplification in
+		// https://github.com/urnetwork/connect/issues/181. Two keeps the
+		// losing-first-pick cover for the moment the backend recovers; the
+		// bound lifts on the first successful backend round-trip.
+		// 0 disables the degraded bound.
+		MultiRaceDegradedClientCount: 2,
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
@@ -447,6 +460,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		EventEpoch:                  1 * time.Second,
 		BlockActionDecisionTtl:      30 * time.Second,
 		BlockActionDecisionMaxCount: 4096,
+		PolicyHintTtl:               10 * time.Minute,
+		PolicyHintMaxCount:          1024,
 		BlockActionAggMaxCount:      1024,
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
@@ -518,9 +533,13 @@ type MultiClientSettings struct {
 	CPingWriteTimeout             time.Duration
 	CPingMaxByteCountPerSecond    ByteCount
 	PingTimeout                   time.Duration
-	CPingTimeout                  time.Duration
-	CPingRestTimeout              time.Duration
-	AckTimeout                    time.Duration
+	// Optional identity-free terminal initial-ping diagnostics; nil is inert.
+	InitialPingObservations *InitialPingObservations
+	// Nil in production; focused controls pin first-ping writer ordering.
+	startChannelPingForTest func(start func())
+	CPingTimeout            time.Duration
+	CPingRestTimeout        time.Duration
+	AckTimeout              time.Duration
 	// BlackholeTimeout is the fallback no-send-ACK liveness interval for a
 	// generator without MultiClientGeneratorReadTimeout. The API generator
 	// uses its effective per-client transport ReadTimeout instead, so a
@@ -835,6 +854,7 @@ type MultiClientSettings struct {
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
+	MultiRaceDegradedClientCount         int
 
 	StatsWindowMaxUnhealthyDuration  time.Duration
 	StatsWindowWarnUnhealthyDuration time.Duration
@@ -879,9 +899,12 @@ type MultiClientSettings struct {
 
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
-	// UdpTransferNoAck keeps an established UDP flow off Transfer's reliable
-	// resend path. Initial provider-race attempts still request an ACK; a
-	// successful route write alone does not prove provider receipt.
+	// UdpTransferNoAck defaults to true and keeps an established UDP flow off
+	// Transfer's reliable resend path, including direct-capable routes. Set the
+	// provider's matching UdpTransferNoAck field to the same value for a symmetric
+	// UDP policy.
+	// Initial provider-race attempts still request an ACK; a successful route
+	// write alone does not prove provider receipt.
 	UdpTransferNoAck bool
 	// icmp echo egress. off by default until the provider fleet broadly
 	// parses icmp: a not-yet-upgraded provider silently blackholes icmp
@@ -1069,6 +1092,15 @@ type MultiClientSettings struct {
 	// default on this fork, and is inert on its own: something has to call
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
+
+	// DataOnlyProviderProbe lets an application-owned, finite probe evaluate
+	// one explicitly fixed provider with its real traffic. It is effective
+	// only with ProviderProbe=false, one fixed destination, and one hop.
+	// Registration still completes before admission; Added means selectable,
+	// not remotely qualified. Initial, continuous and busy-stall IpPing are
+	// omitted. Contracts, encryption, transfer ACKs, passive failure detection
+	// and request deadlines retain their normal owners. The default is false.
+	DataOnlyProviderProbe bool
 
 	// ProbeTimeout bounds one probe pass. 0 falls back to the built-in 4s. It
 	// bounds how long positive evidence is waited for; it is never a timer that
@@ -1266,6 +1298,12 @@ type MultiClientSettings struct {
 	BlockActionDecisionMaxCount int
 	// max distinct block actions aggregated per epoch
 	BlockActionAggMaxCount int
+	// how long a destination whose flow the security policy dropped as
+	// unsanctioned encrypted traffic keeps routing the app's retries
+	// consistently (local with the security bypass, refused without it).
+	// 0 disables the hints
+	PolicyHintTtl      time.Duration
+	PolicyHintMaxCount int
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
 
@@ -1568,6 +1606,9 @@ type RemoteUserNatMultiClient struct {
 	// immutable snapshot of the compiled overrides, swapped by `SetBlockActionOverrides`
 	blockActionState atomic.Pointer[blockActionState]
 	blockActionCache *blockActionCache
+	// destinations whose flow was dropped as unsanctioned encrypted traffic;
+	// nil when disabled
+	policyLocalHints *policyHintCache
 
 	// the G-4b flow-owner seam: the platform's resolver for "which pinned
 	// app owns this flow", with its per-flow-key answer cache. Zero values
@@ -1620,6 +1661,9 @@ type RemoteUserNatMultiClient struct {
 	// changing production selection or adding synchronization to the send path.
 	groupRaceCandidatesForTest func(*parsedPacketGroup) []*multiClientChannel
 	sendClientPathForTest      func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	// backendDegradedForTest replaces the process-wide isBackendDegraded read
+	// that bounds the race field. Production leaves it unset.
+	backendDegradedForTest func() bool
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -2433,6 +2477,7 @@ func NewRemoteUserNatMultiClient(
 		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
 		localUserNat:               localUserNat,
 		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		policyLocalHints:           newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
 		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
 		blockActionIgnoreCache:     newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:        &packetStatsCounters{},
@@ -2616,6 +2661,11 @@ func (self *RemoteUserNatMultiClient) localReceivePacket(
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return self.securityPolicyStats.Stats(reset)
+}
+
+// SecurityPolicyReasons returns the egress verdict-reason counts per port.
+func (self *RemoteUserNatMultiClient) SecurityPolicyReasons(reset bool) SecurityPolicyReasonStats {
+	return self.securityPolicyStats.Reasons(reset)
 }
 
 func (self *RemoteUserNatMultiClient) Monitor() MultiClientMonitor {
@@ -3605,7 +3655,8 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // safety layer: membership is untouched, only order.
 //
 // READ THIS BEFORE ASSUMING THIS FUNCTION STEERS TRAFFIC. It does not, in the
-// shipped configuration. MultiRaceClientCount is 0 (see its default), so
+// shipped configuration. MultiRaceClientCount is 0 (see its default; only a
+// degraded backend bounds it, see MultiRaceDegradedClientCount), so
 // raceOrderedClients is the WHOLE candidate list: every exit is dialed in
 // parallel and completeRace binds whichever responds with the lowest
 // MEASURED rtt, ignoring list order entirely. Most flows never race at all
@@ -5870,7 +5921,13 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 	)
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
-		self.blockActionCollector.add(decision, block, local, match, byteCount)
+		reason := BlockActionReasonSecuritySmtp
+		if match != nil && (match.blockOverride != nil || match.routeOverride != nil) {
+			reason = BlockActionReasonOverride
+		} else if blockerBlock {
+			reason = BlockActionReasonBlocker
+		}
+		self.blockActionCollector.add(decision, block, local, match, reason, byteCount)
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
@@ -5899,12 +5956,82 @@ func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
 		// Encryption enforcement is not overridable. Pass no match so a user
 		// override is not reported as the cause of this mandatory rejection.
-		self.blockActionCollector.add(decision, true, false, nil, byteCount)
+		self.blockActionCollector.add(decision, true, false, nil, BlockActionReasonSecuritySmtp, byteCount)
 	}
 	self.packetStatsCounters.blockEgressPacketCount.Add(1)
 	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
 	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
 	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+}
+
+// securityRoute turns a security result into the route for one packet (or one
+// flow group). It applies two client-side rules on top of blockActionApply:
+//
+//   - fail fast: the policy allows a flow while it is inspecting, so the first
+//     packets of a flow the policy later drops as unsanctioned encrypted traffic
+//     have already gone to a provider. Moving the rest of that flow to the local
+//     route (security bypass on) cannot work for TCP, whose source address would
+//     change mid-connection, and silently blocking it (bypass off) stalls the app
+//     until its own timeout. So when the deciding packet would flip a
+//     provider-routed flow, the packet is blocked and rejected to the app (TCP
+//     reset, ICMP port unreachable), with the bypass on or off.
+//   - hints: the destination of that flow is remembered for PolicyHintTtl. Every
+//     later packet to it is handled as that drop from its first packet: routed
+//     locally with the bypass on, so the app's retry works outside the tunnel as
+//     the bypass promises, or blocked and rejected at once with it off.
+//
+// An incident is never hinted and is never routed locally. Nothing changes on
+// providers; the reject goes only to the local app.
+func (self *RemoteUserNatMultiClient) securityRoute(
+	r SecurityPolicyResult,
+	decision securityDecision,
+	ipPath *IpPath,
+	localSecurityBypass bool,
+	blockerBlock bool,
+	match *blockActionMatch,
+) (result SecurityPolicyResult, block bool, local bool, reject bool, reason SecurityPolicyReason) {
+	reason = decision.reason
+	hinted := false
+	if (r == SecurityPolicyResultAllow || r == SecurityPolicyResultDrop) &&
+		reason != SecurityPolicyReasonNetwork &&
+		self.policyLocalHints.has(ipPath) {
+		r = SecurityPolicyResultDrop
+		reason = SecurityPolicyReasonDropEncrypted
+		hinted = true
+	}
+	block, local = blockActionApply(r, localSecurityBypass, blockerBlock, match)
+	switch {
+	case !hinted && decision.decidedNow &&
+		r == SecurityPolicyResultDrop &&
+		decision.reason == SecurityPolicyReasonDropEncrypted:
+		self.policyLocalHints.add(ipPath)
+		allowBlock, allowLocal := blockActionApply(SecurityPolicyResultAllow, localSecurityBypass, blockerBlock, match)
+		if !allowBlock && !allowLocal {
+			// the flow's earlier packets went to a provider
+			block = true
+			local = false
+			reject = true
+		}
+	case hinted && block:
+		reject = true
+	}
+	return r, block, local, reject, reason
+}
+
+// deliverPolicyReject tells the local app its flow was refused: a TCP reset or
+// an ICMP port unreachable for UDP. The packet is borrowed.
+func (self *RemoteUserNatMultiClient) deliverPolicyReject(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+	case IpProtocolUdp:
+		deliverIcmpPolicyUnreachable(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+	}
 }
 
 // `SendPacketFunction`
@@ -5972,7 +6099,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		self.rejectSmtpPacket(source, provideMode, ipPath, packet)
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, securityDecision, err := inspectEgressDetailed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		self.logSparseSendDrop("policy", &self.sendPolicyDropCount, err)
 		return false
@@ -6010,16 +6137,26 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		match = decision.match
 		blockerBlock = decision.blockerBlock
 	}
-	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+	r, block, local, reject, securityReason := self.securityRoute(
+		r,
+		securityDecision,
+		ipPath,
+		config.localSecurityBypass,
+		blockerBlock,
+		match,
+	)
 
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
-		self.blockActionCollector.add(decision, block, local, match, byteCount)
+		self.blockActionCollector.add(decision, block, local, match, blockActionReason(r, securityReason, blockerBlock, match), byteCount)
 	}
 
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, packet)
+		}
 		return false
 	}
 	if local {
@@ -6078,7 +6215,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		return false
 	}
 	relationship := egressRelationship(provideMode, self.provideMode)
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, securityDecision, err := inspectEgressDetailed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		self.logSparseSendDrop("fragment policy", &self.sendPolicyDropCount, err)
 		return false
@@ -6102,18 +6239,29 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		match = decision.match
 		blockerBlock = decision.blockerBlock
 	}
-	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+	r, block, local, reject, securityReason := self.securityRoute(
+		r,
+		securityDecision,
+		ipPath,
+		config.localSecurityBypass,
+		blockerBlock,
+		match,
+	)
+	actionReason := blockActionReason(r, securityReason, blockerBlock, match)
 	byteCount := ByteCount(0)
 	for _, fragment := range fragments {
 		fragmentByteCount := ByteCount(len(fragment))
 		byteCount += fragmentByteCount
 		if decision != nil && self.blockActionCollector.hasCallbacks() {
-			self.blockActionCollector.add(decision, block, local, match, fragmentByteCount)
+			self.blockActionCollector.add(decision, block, local, match, actionReason, fragmentByteCount)
 		}
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, reassembled)
+		}
 		return false
 	}
 	if local {
@@ -6360,7 +6508,7 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 			payload: payload,
 		}
 	}
-	result, err := inspectAndRefreshEgressGroupBorrowed(
+	result, securityDecision, err := inspectAndRefreshEgressGroupDetailedBorrowed(
 		self.securityPolicy,
 		egressRelationship(provideMode, self.provideMode),
 		memberIpPaths,
@@ -6370,20 +6518,24 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 		self.logSparseSendDrop("policy", &self.sendPolicyDropCount, err)
 		return false
 	}
-	block, local := blockActionApply(
+	result, block, local, reject, securityReason := self.securityRoute(
 		result,
+		securityDecision,
+		ipPath,
 		config.localSecurityBypass,
 		blockerBlock,
 		match,
 	)
 
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		actionReason := blockActionReason(result, securityReason, blockerBlock, match)
 		for _, packet := range group.packets {
 			self.blockActionCollector.add(
 				decision,
 				block,
 				local,
 				match,
+				actionReason,
 				ByteCount(len(packet)),
 			)
 		}
@@ -6391,6 +6543,9 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, group.packets[len(group.packets)-1])
+		}
 		return false
 	}
 	if local {
@@ -6714,6 +6869,30 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	)
 }
 
+// multiRaceClientCount is how many of the orderedCount race candidates one
+// cold-start race dials: all of them, truncated to configuredCount when that is
+// set (MultiRaceClientCount), and further to degradedCount while the backend is
+// degraded (MultiRaceDegradedClientCount). A zero count leaves its bound off.
+func multiRaceClientCount(orderedCount int, configuredCount int, degradedCount int, degraded bool) int {
+	count := orderedCount
+	if 0 < configuredCount && configuredCount < count {
+		count = configuredCount
+	}
+	if degraded && 0 < degradedCount && degradedCount < count {
+		count = degradedCount
+	}
+	return count
+}
+
+// backendDegraded reports the process-wide backend state that bounds the race
+// field.
+func (self *RemoteUserNatMultiClient) backendDegraded() bool {
+	if self.backendDegradedForTest != nil {
+		return self.backendDegradedForTest()
+	}
+	return isBackendDegraded()
+}
+
 // Routes and admits one already-parsed exact-flow group as a unit.
 func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	source TransferPath,
@@ -6987,12 +7166,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				return
 
 			default:
-				var raceOrderedClients []*multiClientChannel
-				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
-					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
-				} else {
-					raceOrderedClients = orderedClients
-				}
+				raceOrderedClients := orderedClients[:multiRaceClientCount(
+					len(orderedClients),
+					self.settings.MultiRaceClientCount,
+					self.settings.MultiRaceDegradedClientCount,
+					self.backendDegraded(),
+				)]
 
 				// Publish the race and every candidate before any SendGroup call.
 				// Queue admission and provider return run on independent goroutines;
@@ -8127,6 +8306,22 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 		} else if state, ok := race.clientStates[sourceClient]; !ok {
 			// this client is not part of the race, drop
 			self.log.Infof("[multi]receive client not part of race")
+		} else if race.responseWindowElapsed {
+			// The comparison deadline does not expire the application's flow.
+			// With no earlier answer, the first live candidate still wins.
+			if update.IsDone() || sourceClient.IsDone() {
+				return
+			}
+			state.packets = append(state.packets, &receivePacket{
+				Source: source, ProvideMode: provideMode, IpPath: ipPath,
+				Packet: packet, tcpControl: tcpControl,
+			})
+			receivePackets, abandonedClients, returnPackets, connectSucceeded =
+				update.commitRaceClientWithLock(sourceClient)
+			boundUpdate = update
+			if connectSucceeded {
+				connectPath = update.ipPath
+			}
 		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
 			packetCopy, pooled := MessagePoolCopyDetailed(packet)
 			receivePacket := &receivePacket{
@@ -8410,6 +8605,13 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					winner = orderedClients[len(orderedClients)-1]
 				}
 			}
+			if winner == nil {
+				// Retain only candidate identity until a response or flow cleanup.
+				// Clearing it here discarded a valid late DNS answer while its
+				// socket was still waiting. No worker or packet owner is retained.
+				race.responseWindowElapsed = true
+				return
+			}
 			if winner != nil {
 				receivePackets, abandonedClients, returnPackets, connectSucceeded =
 					update.commitRaceClientWithLock(winner)
@@ -8421,9 +8623,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					boundUpdate, boundClient = update, winner
 				}
 			}
-			// No response, or a committed client which was not in this stale
-			// race: release the race's buffered owners without changing the
-			// current binding.
+			// A committed client outside this stale race keeps its binding.
 			if update.race == race {
 				update.clearRaceWithLock()
 			}
@@ -9541,6 +9741,7 @@ type multiClientChannelUpdateRace struct {
 	packetCount            int
 	clientsWithPacketCount int
 	completeMonitor        *Monitor
+	responseWindowElapsed  bool
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -9726,6 +9927,43 @@ func standingReserveTarget(
 	return reserveTargetWindowSize
 }
 
+// backendDegraded reports the process-wide backend state that gates window
+// expansion.
+func (self *multiClientWindow) backendDegraded() bool {
+	if self.backendDegradedForTest != nil {
+		return self.backendDegradedForTest()
+	}
+	return isBackendDegraded()
+}
+
+// degradedWindowTarget caps a window's resize target at its current size
+// while the control API is degraded (see isBackendDegraded), so an outage
+// never grows the window. Every client the window adds during an outage is
+// pure cost: it needs the api to find a provider and authorize a contract
+// (and contract creation is itself gated while degraded), so it cannot carry
+// traffic, but it does open its own platform transports and, once in the
+// window, receives a copy of each cold-start race packet and each resend.
+// Over a long outage, with unhealthy exits removed and replaced every
+// WindowResizeTimeout, that is exactly the fan-out amplifier reported in
+// https://github.com/urnetwork/connect/issues/181.
+//
+// The cap only ever lowers the target, and never below the current size: it
+// does not shrink a window, so exits that are still up keep carrying flows.
+// An empty window keeps a target of one, so a window that is trying to form
+// still makes one exit's worth of attempts per pass: those evaluations are
+// what the outcome watchdog and the stall reason (ip_remote_multi_client_outcome.go)
+// read to tell the user the platform is unreachable, and they are the first
+// thing to succeed when it comes back. A disabled window (target 0) stays
+// disabled, so the outcome clock arms exactly as it did before. Recovery needs
+// nothing of its own: the first successful backend round-trip clears the
+// degraded state and the next resize pass expands to the full target.
+func degradedWindowTarget(targetWindowSize int, clientCount int, degraded bool) int {
+	if !degraded || targetWindowSize <= 0 {
+		return targetWindowSize
+	}
+	return min(targetWindowSize, max(1, clientCount))
+}
+
 type multiClientWindow struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -9823,6 +10061,9 @@ type multiClientWindow struct {
 	finishExpandRequestsForTest   <-chan struct{}
 	expireExpandPingForTest       <-chan struct{}
 	expireExpandPassForTest       <-chan struct{}
+	// backendDegradedForTest replaces the process-wide isBackendDegraded
+	// read in resize. Production leaves it unset.
+	backendDegradedForTest func() bool
 	// verdictRemovalTimes is the storm breaker's record of recent
 	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
 	// Guarded by stateLock. Only removals a verdict argued for are recorded
@@ -10046,6 +10287,11 @@ func (self *multiClientWindow) watchSendStalls() {
 func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) bool {
 	var stalled []*multiClientChannel
 	for _, client := range self.unorderedClients() {
+		// A finite application probe owns its data deadline and outcome. Skip
+		// this active question and its conviction together, not just the ping.
+		if client.dataOnlyProviderProbe {
+			continue
+		}
 		if client.sendStalled(stallTimeout) {
 			stalled = append(stalled, client)
 		}
@@ -11213,6 +11459,11 @@ func (self *multiClientWindow) resize() {
 			fixedDestination,
 		)
 
+		// while the control API is unreachable, hold the window at its
+		// current size. See degradedWindowTarget.
+		degraded := self.backendDegraded()
+		targetWindowSize = degradedWindowTarget(targetWindowSize, len(clients), degraded)
+
 		// publish the shortfall for the enumerator (it asks for v6-capable
 		// candidates first while one is open) and, at capacity, make room:
 		// with WindowSizeMax == WindowSizeMin the raise above cannot grow the
@@ -11221,7 +11472,10 @@ func (self *multiClientWindow) resize() {
 		self.setIpv6Shortfall(ipv6Shortfall)
 		withinCeiling := windowSize.WindowSizeHardMax <= 0 ||
 			len(clients)+len(warnedClients) <= windowSize.WindowSizeHardMax
-		if 0 < ipv6Shortfall && targetWindowSize <= len(clients) &&
+		// a family swap is an expansion by another name (it asks the
+		// enumerator for a candidate and admits it), so it waits out a
+		// degraded backend the same way
+		if !degraded && 0 < ipv6Shortfall && targetWindowSize <= len(clients) &&
 			!self.ipv6Starved(startTime) && !self.hasFamilySwapVictim() {
 			victim, flowless := self.selectFamilySwapVictim(clients, weights)
 			// a strict window cannot admit past its ceiling while a drained
@@ -11481,7 +11735,7 @@ func (self *multiClientWindow) expand(
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
 	type pendingPingFailure struct {
-		fail            func(bool) bool
+		fail            func(bool, initialPingOutcome) bool
 		args            *multiClientChannelArgs
 		evaluationCtx   context.Context
 		startedAt       time.Time
@@ -11708,7 +11962,11 @@ func (self *multiClientWindow) expand(
 				self.ctx,
 				pendingFailure.evaluationCtx,
 			)
-			if !pendingFailure.fail(!localContract && deadlineOwned) || !deadlineOwned {
+			pingOutcome := initialPingCanceled
+			if deadlineOwned {
+				pingOutcome = initialPingExpired
+			}
+			if !pendingFailure.fail(!localContract && deadlineOwned, pingOutcome) || !deadlineOwned {
 				continue
 			}
 			if localContract {
@@ -11823,8 +12081,9 @@ requestCandidates:
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerEvaluation = &providerEvaluationAttempt{
-				owner:         &self.providerEvaluation,
-				destinationId: args.Destination.Tail(),
+				owner:             &self.providerEvaluation,
+				destinationId:     args.Destination.Tail(),
+				observeLocalWrite: self.settings.DataOnlyProviderProbe,
 			}
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
@@ -11871,15 +12130,55 @@ requestCandidates:
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
+			} else if client.dataOnlyProviderProbe {
+				// Registered construction is sufficient to select this explicit
+				// provider. The application's DNS/URL exchange owns qualification;
+				// do not fabricate a ping, ACK, or successful observation.
+				mutex.Lock()
+				candidate := &expandEvaluatedCandidate{client: client, args: args}
+				if self.ctx.Err() != nil || evaluationCtx.Err() != nil || client.IsDone() {
+					cancelCandidate(candidate)
+				} else {
+					added += 1
+					if client.IsP2pOnly() {
+						addedP2pOnly += 1
+					}
+					pending = append(pending, candidate)
+					admitPending()
+				}
+				mutex.Unlock()
 			} else {
 				pingStartedAt := time.Now()
+				observations := self.settings.InitialPingObservations
+				var pingPath *initialPingPathWitness
+				if observations != nil {
+					pingPath = &initialPingPathWitness{}
+				}
+				observations.begin()
+				pingObserved := false // guarded by this expansion's existing mutex
+				observePing := func(outcome initialPingOutcome) {
+					if observations == nil || pingObserved {
+						return
+					}
+					pingObserved = true
+					if self.ctx.Err() != nil || evaluationCtx.Err() != nil {
+						outcome = initialPingCanceled
+					}
+					dependency := initialPingDependencySnapshot(client.client, args.providerEvaluation)
+					elapsed := time.Since(pingStartedAt)
+					observations.record(outcome, dependency, elapsed)
+					route, ack := pingPath.snapshot()
+					observations.recordPath(outcome, route, ack, elapsed)
+				}
 
 				// send an initial ping on the client and let the ack timeout close it
 				pingDone, pingCancel := context.WithCancel(self.ctx)
 				pendingPingDones = append(pendingPingDones, pingDone)
 
 				// must be called with mutex
-				fail := func(providerFailure bool) bool {
+				fail := func(providerFailure bool, outcome initialPingOutcome) bool {
+					// Observe before our own cancellation removes the carrier.
+					observePing(outcome)
 					select {
 					case <-pingDone.Done():
 						// already done
@@ -11929,7 +12228,7 @@ requestCandidates:
 						func() {
 							mutex.Lock()
 							defer mutex.Unlock()
-							fail(false)
+							fail(false, initialPingCanceled)
 						}()
 						return
 					case <-pingTimer.C:
@@ -11940,11 +12239,11 @@ requestCandidates:
 						mutex.Lock()
 						defer mutex.Unlock()
 						if evaluationCtx.Err() != nil {
-							fail(false)
+							fail(false, initialPingCanceled)
 							return
 						}
 						localContract := args.providerEvaluation.localContractUnavailable()
-						if !fail(!localContract) {
+						if !fail(!localContract, initialPingExpired) {
 							return
 						}
 						if localContract {
@@ -11985,7 +12284,7 @@ requestCandidates:
 								}
 								mutex.Lock()
 								defer mutex.Unlock()
-								fail(true)
+								fail(true, initialPingError)
 							}
 						}, client.Cancel)
 					}
@@ -12016,10 +12315,15 @@ requestCandidates:
 						self.clientExtenderIps(client),
 					)
 
+					var pingOptions []any
+					if pingPath != nil {
+						pingOptions = []any{observeTransportWrite(pingPath.observeRouteWrite)}
+					}
 					success, err := client.SendDetailedMessage(
 						&protocol.IpPing{},
 						self.settings.PingWriteTimeout,
 						func(err error) {
+							pingPath.observeAckCallback(err)
 							if self.beforeExpandPingResultForTest != nil {
 								self.beforeExpandPingResultForTest()
 							}
@@ -12037,6 +12341,7 @@ requestCandidates:
 							}
 
 							if err == nil {
+								observePing(initialPingAcknowledged)
 								// evaluated: the candidate answered its ping.
 								// Admission (with the same-clientId
 								// replacement gate) now runs through the
@@ -12061,17 +12366,18 @@ requestCandidates:
 								pingCancel()
 							} else {
 								providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
-								fail(providerFailure)
+								fail(providerFailure, initialPingError)
 							}
 						},
+						pingOptions...,
 					)
 					if err != nil {
 						if pingDone.Err() == nil {
 							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
-							fail(providerFailure)
+							fail(providerFailure, initialPingError)
 						}
 					} else if !success {
-						fail(!args.providerEvaluation.localContractUnavailable())
+						fail(!args.providerEvaluation.localContractUnavailable(), initialPingError)
 					}
 				})
 			}
@@ -12978,6 +13284,9 @@ func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
 }
 
 type multiClientChannel struct {
+	// Immutable at construction from the explicit fixed-provider authority.
+	dataOnlyProviderProbe bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
@@ -13430,8 +13739,9 @@ func newMultiClientChannel(
 	// }
 
 	clientChannel := &multiClientChannel{
-		ctx:    cancelCtx,
-		cancel: cancel,
+		dataOnlyProviderProbe: dataOnlyProviderProbeEnabled(settings, generator, args),
+		ctx:                   cancelCtx,
+		cancel:                cancel,
 		transportMigrator: func() MultiClientGeneratorTransportMigrator {
 			migrator, _ := generator.(MultiClientGeneratorTransportMigrator)
 			return migrator
@@ -13518,7 +13828,13 @@ func newMultiClientChannel(
 	}, cancel)
 
 	go HandleError(clientChannel.detectBlackhole, cancel)
-	go HandleError(clientChannel.ping, cancel)
+	if clientChannel.dataOnlyProviderProbe {
+		// The finite application probe supplies the first and subsequent data.
+	} else if startForTest := settings.startChannelPingForTest; startForTest != nil {
+		startForTest(func() { go HandleError(clientChannel.ping, cancel) })
+	} else {
+		go HandleError(clientChannel.ping, cancel)
+	}
 
 	clientReceiveUnsub := client.AddReceiveCallback(clientChannel.clientReceive)
 	clientChannel.clientReceiveUnsub = clientReceiveUnsub
@@ -15024,12 +15340,13 @@ func ipPacketTransferAckRequired(
 	if ipPacketTransferAckForRequest(ipPath, false) {
 		return true
 	}
+	if ipPath.Protocol == IpProtocolUdp {
+		return !udpTransferNoAck && !udpCollapsePrevention
+	}
 	if allowDirect {
 		return false
 	}
 	switch ipPath.Protocol {
-	case IpProtocolUdp:
-		return !udpTransferNoAck && !udpCollapsePrevention
 	case IpProtocolIcmp:
 		return !udpCollapsePrevention
 	default:
@@ -15449,11 +15766,10 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
-func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
+func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error), opts ...any) (bool, error) {
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
-		var opts []any
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}

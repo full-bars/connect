@@ -2,6 +2,8 @@ module github.com/urnetwork/connect
 
 go 1.26.3
 
+toolchain go1.26.5
+
 require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
@@ -94,3 +96,5 @@ retract v0.2.0 // retract self
 replace github.com/urnetwork/glog => ../glog
 
 replace github.com/pion/sctp => ./sctp
+
+replace gvisor.dev/gvisor => ../gvisor

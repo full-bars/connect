@@ -606,6 +606,12 @@ paths:
     post:
       description: |
         Send verification code to email or phone number.
+
+        With `result_errors` set, a code that was not sent is reported in the
+        result `error` (`verify_send_failed`, or `verify_rate_limited` with
+        `retry_after_seconds`). Without it, a rate limit is a 429 and a failed
+        send is a 502, both with a plain text body. Clients must not report a
+        code as sent unless the response is a 200 without `error`.
       operationId: Auth Verify Send
       security: []
       requestBody:
@@ -621,11 +627,27 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthVerifySendResult"
+        "429":
+          description: Too many attempts (requests without `result_errors`). Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a new code can be requested.
+              schema:
+                type: integer
+        "502":
+          description: The code could not be sent (requests without `result_errors`). Plain text body.
 
   /auth/password-reset:
     post:
       description: |
         Send password reset code to email or phone number.
+
+        With `result_errors` set, a reset code that was not sent is reported
+        in the result `error` (`verify_send_failed`, or `verify_rate_limited`
+        with `retry_after_seconds`). Without it, a rate limit is a 429 and a
+        failed send is a 502, both with a plain text body. Clients must not
+        report a reset code as sent unless the response is a 200 without
+        `error`.
       operationId: Auth Password Reset
       security: []
       requestBody:
@@ -641,6 +663,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthPasswordResetResult"
+        "429":
+          description: Too many attempts (requests without `result_errors`). Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a new reset code can be requested.
+              schema:
+                type: integer
+        "502":
+          description: The reset code could not be sent (requests without `result_errors`). Plain text body.
 
   /auth/password-set:
     post:
@@ -2784,7 +2815,13 @@ paths:
         the body is parsed. The server matches a transfer to a payment intent
         by the Solana Pay reference among the transaction's account keys, or
         by the memo text, and credits the plan or the data pack (see
-        `/solana/payment-intent` and `/pay/data/solana-intent`).
+        `/solana/payment-intent` and `/pay/data/solana-intent`). Each quote is
+        the price plus a unique sub-cent suffix, so a transfer with neither
+        reference nor memo falls back to its exact amount: it is credited only
+        when it is the one USDC transfer to our receiving address and exactly
+        one open intent was quoted that amount, sent between the quote and the
+        intent's `expires_at`. An ambiguous or unmatched transfer is recorded
+        as unfulfilled for support to credit by hand.
 
         The body is Helius's own enhanced-transaction ARRAY, not a wrapped
         object. One delivery carries a batch, and a customer's payment can sit
@@ -3612,7 +3649,8 @@ paths:
       description: |
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
-        neither is refused with `error.message`.
+        neither is refused with `error.message` and `error.code`
+        `seeker_token_not_found`.
       operationId: Account Verify Seeker Token
       security:
         - BearerAuth: []
@@ -3919,10 +3957,17 @@ paths:
         (/pay/solana) matches the transfer by the reference among the
         transaction's account keys OR by the memo text, then lands the data on
         the network (data only, valid for one year, no Pro) and emails the
-        network's admin when their login is an email.
+        network's admin when their login is an email. A transfer with no
+        reference and no memo (a wallet that cannot add one) is matched by its
+        exact `amount_usd`, which is unique among open quotes: it is credited
+        only when it is the one USDC transfer to our receiving address and
+        exactly one open intent was quoted that amount, sent between the quote
+        and `expires_at`. Anything else is recorded for support to credit by
+        hand.
 
-        The intent expires after 24 hours (`expires_at`); a payment that arrives
-        late still credits as long as the intent has not been swept. A reused
+        The intent expires after 24 hours (`expires_at`); a payment that carries
+        the reference or memo and arrives late still credits as long as the
+        intent has not been swept. A reused
         reference, an unknown item or an unknown network return `error.message`
         with a 200. Unauthenticated, per-ip rate limited.
       operationId: Pay Data Solana Intent
@@ -6211,6 +6256,11 @@ components:
             user_auth:
               description: email or phone number
               type: string
+            send_error:
+              description: |
+                Present when the verification code was not sent. Clients must
+                not say a code was sent, and show this instead.
+              $ref: "#/components/schemas/AuthVerifySendError"
         network:
           type: object
           required: []
@@ -6269,6 +6319,11 @@ components:
         use_numeric:
           description: optionally create a numeric 6 digit code instead of the default 8 digit
           type: boolean
+        result_errors:
+          description: |
+            Report a code that was not sent in the result `error` with a 200,
+            instead of a 429 or 502. New clients set this.
+          type: boolean
 
     AuthVerifySendResult:
       type: object
@@ -6278,6 +6333,28 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        error:
+          description: Present when the code was not sent (only with `result_errors`).
+          $ref: "#/components/schemas/AuthVerifySendError"
+
+    AuthVerifySendError:
+      description: A verification code that was not sent.
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: |
+            `verify_send_failed`: the email or SMS send failed.
+            `verify_rate_limited`: too many attempts; see `retry_after_seconds`.
+            Clients treat an unknown code as a code that was not sent.
+        message:
+          type: string
+        retry_after_seconds:
+          description: For `verify_rate_limited`, seconds until a new code can be requested.
+          type: integer
 
     AuthPasswordResetArgs:
       type: object
@@ -6287,6 +6364,11 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        result_errors:
+          description: |
+            Report a reset code that was not sent in the result `error` with a
+            200, instead of a 429 or 502. New clients set this.
+          type: boolean
 
     AuthPasswordResetResult:
       type: object
@@ -6296,6 +6378,9 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        error:
+          description: Present when the reset code was not sent (only with `result_errors`).
+          $ref: "#/components/schemas/AuthVerifySendError"
 
     AuthPasswordSetArgs:
       type: object
@@ -6408,6 +6493,11 @@ components:
             user_auth:
               description: email or phone number
               type: string
+            send_error:
+              description: |
+                Present when the verification code was not sent. Clients must
+                not say a code was sent, and show this instead.
+              $ref: "#/components/schemas/AuthVerifySendError"
         error:
           type: object
           required:
@@ -7425,12 +7515,22 @@ components:
     WalletCircleTransferOutArgs:
       type: object
       required:
+        - request_id
+        - to_address
+        - amount_usdc_nano_cents
         - terms
       properties:
+        request_id:
+          type: string
+          format: uuid
+          description: Caller-generated operation identity. Persist with the exact transfer intent before the first call and reuse unchanged for every retry, including after application restart. A distinct intended transfer requires a new id. Missing ids are refused; the server never invents a replacement.
         to_address:
           type: string
         amount_usdc_nano_cents:
           type: integer
+          minimum: 1000
+          multipleOf: 1000
+          description: Positive exact USDC amount, with one dollar represented by 1000000000. Values not representable with six decimals are refused.
         terms:
           description: user consent to accept terms of transfer
           type: boolean
@@ -7439,6 +7539,13 @@ components:
       type: object
       required: []
       properties:
+        request_id:
+          type: string
+          format: uuid
+        challenge_status:
+          type: string
+          enum: [PENDING, IN_PROGRESS, COMPLETE, FAILED, EXPIRED]
+          description: Status of the original retained user-confirmation challenge. COMPLETE is not a payment settlement or transfer receipt. Known challenges are observed without another transfer submission.
         user_token:
           type: object
           required:
@@ -7541,6 +7648,17 @@ components:
           type: integer
         update_time:
           type: string
+        guest:
+          type: boolean
+          description: |
+            The network has no login method (no email/phone, SSO, wallet or
+            seedphrase sign-in): a legacy guest network. Read from the live
+            auth methods on every call, so it stays true after a token refresh
+            (which signs every jwt without the `guest_mode` claim) and turns
+            false as soon as a login method is added with /auth/add-auth. A
+            client must not sell a plan to a guest network: nothing can sign
+            back in to it. Absent from older
+            servers, where a client falls back to the jwt `guest_mode` claim.
         price_tier:
           $ref: "#/components/schemas/PriceTier"
         onboarding_offer:
@@ -10532,7 +10650,11 @@ components:
       properties:
         amount_usd:
           type: number
-          description: the price the server quoted; the client must pay exactly this
+          description: >-
+            the amount the server quoted; the client must pay exactly this. It is
+            the plan price plus a unique sub-cent suffix (0.000001 to 0.009999,
+            in USDC's 6 decimals) that identifies a payment sent without the
+            reference, so show and pay every decimal
         tier:
           type: string
         plan:
@@ -10544,6 +10666,12 @@ components:
           type: boolean
         currency:
           type: string
+        recipient:
+          type: string
+          description: the merchant address (base58) to pay; build the payment url from this, never a hardcoded address
+        spl_token_mint:
+          type: string
+          description: the SPL token mint (base58) to pay in (USDC)
         error:
           oneOf:
             - $ref: "#/components/schemas/ErrorMessage"
@@ -11557,6 +11685,15 @@ components:
           properties:
             message:
               type: string
+            code:
+              description: |
+                Why the wallet was not verified, for a localized message.
+                `seeker_token_not_found`: the wallet holds no Seeker or Saga token.
+                `seeker_invalid_signature`: the wallet signature did not verify.
+                `seeker_lookup_failed`: the token lookup failed.
+                Absent from older servers; clients fall back to `message` for
+                an absent or unknown code.
+              type: string
 
     UploadLogFileResult:
       type: object
@@ -11693,7 +11830,11 @@ components:
       properties:
         amount_usd:
           type: number
-          description: the exact amount to send, in USDC
+          description: >-
+            the exact amount to send, in USDC: the data pack price plus a unique
+            sub-cent suffix (0.000001 to 0.009999, in USDC's 6 decimals) that
+            identifies a payment sent without the memo, so show and pay every
+            decimal
         reference:
           type: string
         memo:

@@ -65,10 +65,11 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		HelloRetryTimeout:        5 * time.Second,
 		MaxHttpResponseBodyBytes: DefaultMaxHttpResponseBodyBytes,
 
-		GetRetryCount:       1,
-		GetRetryStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable},
-		GetRetryMinTimeout:  100 * time.Millisecond,
-		GetRetryMaxTimeout:  1000 * time.Millisecond,
+		GetRetryCount:               1,
+		GetRetryStatusCodes:         []int{http.StatusBadGateway, http.StatusServiceUnavailable},
+		GetRetryMinTimeout:          100 * time.Millisecond,
+		GetRetryMaxTimeout:          1000 * time.Millisecond,
+		GetPreferredRouteHedgeDelay: time.Second,
 
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
@@ -80,9 +81,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 	}
 	// A configured process budget identifies an embedded/mobile client. Bound
 	// the connection-resident HTTP/WebSocket working set there; an unset or
-	// reference-sized budget leaves Go and gorilla defaults untouched for
-	// desktop and server callers.
-	if 0 < MemoryBudget() && MemoryBudget() < referenceMemoryBudgetByteCount {
+	// larger-than-reference budget leaves Go and gorilla defaults untouched
+	// for desktop and server callers. Include the exact reference: Android's
+	// 64-MiB process cap still needs explicit bounded HTTP/2 receive windows.
+	if 0 < MemoryBudget() && MemoryBudget() <= referenceMemoryBudgetByteCount {
 		settings.HttpReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
 		settings.HttpWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
 		settings.WebSocketReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
@@ -215,6 +217,15 @@ type ClientStrategySettings struct {
 	// [GetRetryMinTimeout, GetRetryMaxTimeout)
 	GetRetryMinTimeout time.Duration
 	GetRetryMaxTimeout time.Duration
+
+	// A remembered GET route can become stale after a mobile network change.
+	// If it has not written the request by this delay, allow other known
+	// routes to race it within ParallelBlockSize. The preferred attempt keeps
+	// its original overall deadline: a slow working TLS connection remains
+	// usable. Once written, the ordinary response deadline is unchanged.
+	// GETs alone are idempotent; POST and WebSocket ordering are unaffected.
+	// <= 0 disables this early race and retains the ordinary preferred path.
+	GetPreferredRouteHedgeDelay time.Duration
 
 	MinNextConnectDelay time.Duration
 	MaxNextConnectDelay time.Duration
@@ -1013,7 +1024,18 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 	eval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 ) *evalResult {
-	// in this order:
+	return self.parallelEvalWithRouteHedge(ctx, webSocketOnly, eval, attemptContext, 0)
+}
+
+func (self *ClientStrategy) parallelEvalWithRouteHedge(
+	ctx context.Context,
+	webSocketOnly bool,
+	eval func(context.Context, *clientDialer) *evalResult,
+	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+	preferredHedgeDelay time.Duration,
+) *evalResult {
+	// Ordinary ordering (GET can retain the first preferred attempt while
+	// allowing known alternatives to race after its establishment head start):
 	// 1. try all dialers that previously worked sequentially
 	// 2. try dialers that previously failed in parallel blocks
 	// 3. expand the extenders and try new extenders in parallel blocks
@@ -1052,7 +1074,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 
 	out := make(chan *evalResult)
 
-	run := func(dialer *clientDialer) {
+	runWithContext := func(evalCtx context.Context, dialer *clientDialer) {
 		success := false
 		defer func() {
 			if !success {
@@ -1062,7 +1084,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 				}
 			}
 		}()
-		result := eval(handleCtx, dialer)
+		result := eval(evalCtx, dialer)
 		if result == nil {
 			return
 		}
@@ -1075,6 +1097,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 			result.discardAfterContextCancellation()
 		}
 	}
+	run := func(dialer *clientDialer) { runWithContext(handleCtx, dialer) }
 
 	// keep trying as long as there is time left
 	for {
@@ -1115,6 +1138,69 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 			if SmartDialerEnabled() {
 				serialDialers = orderDialersByMeasuredCost(serialDialers)
 			}
+			if preferredHedgeDelay > 0 && self.settings.ParallelBlockSize > 1 &&
+				len(serialDialers) > 0 && len(serialDialers)+len(parallelDialers) > 1 {
+				// Retain one preferred attempt while exposing alternatives after
+				// a bounded head start. Canceling it at the head-start boundary
+				// would misclassify a slow but valid mobile handshake as failed.
+				headStartDelay := preferredHedgeDelay
+				if deadline, ok := handleCtx.Deadline(); ok {
+					// A caller with less than the configured head start still
+					// retains the ordinary preferred path's fallback share.
+					headStartDelay = min(headStartDelay, max(time.Duration(0),
+						time.Until(deadline)/time.Duration(len(serialDialers)+1)))
+				}
+				preferred := serialDialers[0]
+				parallelDialers = append(serialDialers[1:], parallelDialers...)
+				serialDialers = nil
+				written := make(chan struct{})
+				var writtenOnce sync.Once
+				preferredCtx := httptrace.WithClientTrace(handleCtx, &httptrace.ClientTrace{
+					WroteRequest: func(info httptrace.WroteRequestInfo) {
+						if info.Err == nil {
+							writtenOnce.Do(func() { close(written) })
+						}
+					},
+				})
+				startWorker(func() { runWithContext(preferredCtx, preferred) })
+				p++
+				timer := time.NewTimer(headStartDelay)
+				headStart := timer.C
+				writtenSignal := (<-chan struct{})(written)
+				waiting := true
+				for waiting {
+					select {
+					case <-handleCtx.Done():
+						timer.Stop()
+						return nil
+					case <-writtenSignal:
+						// A valid slow response is not a stale establishment.
+						timer.Stop()
+						headStart, writtenSignal = nil, nil
+					case <-headStart:
+						// The write and timer may become ready together. A write
+						// already reported by the transport keeps its response
+						// time without starting duplicate GETs.
+						select {
+						case <-written:
+							headStart, writtenSignal = nil, nil
+						default:
+							waiting = false
+						}
+					case result := <-out:
+						p--
+						if result != nil {
+							if result.Selected().err == nil || result.terminal {
+								timer.Stop()
+								return result
+							}
+							result.releaseAfterUse(handleCtx)
+						}
+						waiting = false
+					}
+				}
+				timer.Stop()
+			}
 			for i, dialer := range serialDialers {
 				select {
 				case <-handleCtx.Done():
@@ -1153,7 +1239,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 
 			// note parallel dialers is in the original weighted order
 			// WeightedShuffle(parallelDialers, dialerWeights)
-			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
+			n := min(len(parallelDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
 				startWorker(func() {
@@ -1447,11 +1533,12 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		defer request.Body.Close()
 	}
 	self.applyExtraHeaders(request.Header)
+	causes := newHttpRequestCauses(request.Context())
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
-	if result, ok := self.httpPlatformDirect(request); ok {
-		if result == nil {
-			return nil, fmt.Errorf("http request failed")
+	if result, ok, err := self.httpPlatformDirect(request); ok {
+		if err != nil {
+			return nil, fmt.Errorf("http request failed: %w", err)
 		}
 		return result, nil
 	}
@@ -1459,12 +1546,12 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		dialStart := time.Now()
 		timing := &dialTiming{}
-		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1476,12 +1563,16 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		dialer.Update(handleCtx, err)
 		timing.observe(dialer, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 
-	result := self.parallelEvalWithAttemptContext(request.Context(), false, eval, preferredHttpAttemptContext)
+	var preferredHedgeDelay time.Duration
+	if request.Method == http.MethodGet {
+		preferredHedgeDelay = self.settings.GetPreferredRouteHedgeDelay
+	}
+	result := self.parallelEvalWithRouteHedge(request.Context(), false, eval, preferredHttpAttemptContext, preferredHedgeDelay)
 	if result == nil {
-		return nil, fmt.Errorf("Timeout.")
+		return nil, causes.exhausted(request.Context(), self.ctx)
 	}
 	return materializeHttpResult(result)
 }
@@ -1507,11 +1598,12 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
+	causes := newHttpRequestCauses(request.Context())
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
-	if result, ok := self.httpPlatformDirect(request); ok {
-		if result == nil {
-			return nil, fmt.Errorf("http request failed")
+	if result, ok, err := self.httpPlatformDirect(request); ok {
+		if err != nil {
+			return nil, fmt.Errorf("http request failed: %w", err)
 		}
 		return result, nil
 	}
@@ -1520,12 +1612,12 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		handleCtx, authProgress := traceAuthPostAttempt(handleCtx)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		dialStart := time.Now()
 		timing := &dialTiming{}
-		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -1538,17 +1630,17 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		dialer.Update(handleCtx, err)
 		timing.observe(dialer, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		dialStart := time.Now()
 		timing := &dialTiming{}
-		response, err := httpClient.Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1560,13 +1652,13 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		dialer.Update(handleCtx, err)
 		timing.observe(dialer, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 
 	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
 	if result == nil {
 		observeAuthStrategyEnd(request.Context(), self.ctx)
-		return nil, fmt.Errorf("Timeout.")
+		return nil, causes.exhausted(request.Context(), self.ctx)
 	}
 	return materializeHttpResult(result)
 }
@@ -1600,6 +1692,7 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 		requestHeader = merged
 	}
 
+	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		wsDialer := dialer.WsDialer(self.settings)
 		dialStart := time.Now()
@@ -1615,11 +1708,11 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 
 		dialer.Update(handleCtx, err)
 		timing.observe(dialer, err)
-		// a pinned platform transport classifies the typed error of each
-		// attempt here; a failed parallelEval flattens it to "Timeout."
+		// A pinned platform transport observes each typed attempt before the
+		// operation owner snapshots the retained exhaustion causes.
 		observeDialAttempt(handleCtx, err)
 
-		return &evalResult{
+		return causes.track(&evalResult{
 			wsConn: wsConn,
 			err:    err,
 			httpResult: httpResult{
@@ -1628,12 +1721,12 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 				// header: response.Header.Clone(),
 				response: response,
 			},
-		}
+		})
 	}
 
 	result := self.parallelEval(ctx, true, eval)
 	if result == nil {
-		return nil, nil, nil, fmt.Errorf("Timeout.")
+		return nil, nil, nil, causes.exhausted(ctx, self.ctx)
 	}
 	return result.wsConn, result.response, result.dialer.Info(), result.err
 }
@@ -1649,6 +1742,7 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 		}
 		self.applyExtraHeaders(requestHeader)
 	}
+	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		timing := &dialTiming{}
 		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, timing.wrapDialer(dialer.WsDialer(self.settings)), H1FramerProtocol, maximum, enabled, stats)
@@ -1661,11 +1755,11 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 			timing.observe(dialer, err)
 			observeDialAttempt(handleCtx, err)
 		}
-		return &evalResult{h1Conn: conn, err: err, terminal: terminal}
+		return causes.track(&evalResult{h1Conn: conn, err: err, terminal: terminal})
 	}
 	result := self.parallelEval(ctx, true, eval)
 	if result == nil {
-		return nil, nil, fmt.Errorf("Timeout.")
+		return nil, nil, causes.exhausted(ctx, self.ctx)
 	}
 	return result.h1Conn, result.dialer.Info(), result.err
 }
