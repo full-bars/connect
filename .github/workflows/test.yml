@@ -135,7 +135,7 @@ jobs:
               echo "::warning::${name} now passes; remove its quarantine"
               return 0
             fi
-            if printf '%s' "$out" | rg -q "$pattern"; then
+            if printf '%s' "$out" | awk -v pat="$pattern" 'index($0, pat) != 0 { found = 1 } END { exit(found ? 0 : 1) }'; then
               echo "${name}: documented upstream failure (non-gating)"
               return 0
             fi
