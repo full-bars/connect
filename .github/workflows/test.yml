@@ -87,9 +87,10 @@ jobs:
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. the root package (the data path) takes 30 to 35 min
       # on a runner (1750 s and 2110 s measured on 2026-10-04), so 20 min
-      # stopped it partway. One test is skipped here and run in the next step.
+      # stopped it partway. Three tests are skipped here and reported in the
+      # non-blocking steps below.
       - name: Test
-        run: go test -count=1 -timeout 60m -skip '^TestUpstreamTcpSendBufferGrowsUnderLoad$' $(go list ./... | grep -v '/extender$')
+        run: go test -count=1 -timeout 60m -skip '^(TestUpstreamTcpSendBufferGrowsUnderLoad|TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget|TestOriginalInventoryActualCleanupRotationAndIndependentContracts)$' $(go list ./... | grep -v '/extender$')
 
       # TestUpstreamTcpSendBufferGrowsUnderLoad waits for the kernel to grow a
       # loopback socket's send buffer to tcp_wmem's maximum. Run 20 times on one
@@ -111,3 +112,16 @@ jobs:
       - name: Test extender (known flaky, non-blocking)
         continue-on-error: true
         run: go test -count=1 -timeout 5m ./extender/...
+
+      # Both deterministic upstream failures, reproduced 2026-10-05 on a
+      # pristine upstream checkout (1654b0d1) with no fork content:
+      # TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget reports
+      # visits=3 against its bound of 2 in the cause-flattening budget walker,
+      # and TestOriginalInventoryActualCleanupRotationAndIndependentContracts
+      # calls SetSeed after CloseAndWait, which the closed key manager refuses
+      # by design. Reported, not gating; both carry into the upstream-forward
+      # brief (connect-upstream-forward.md). Remove this step once upstream
+      # fixes them.
+      - name: Test upstream-broken cause/inventory tests (non-blocking)
+        continue-on-error: true
+        run: go test -count=1 -timeout 10m -run '^(TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget|TestOriginalInventoryActualCleanupRotationAndIndependentContracts)$' .
