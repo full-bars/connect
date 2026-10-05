@@ -349,6 +349,10 @@ func TestWholeWorkActualLifecycleCancellationJoinsPendingHttp(t *testing.T) {
 	entered := make(chan struct{})
 	var once sync.Once
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Drain the body before parking on the context: with the body unread,
+		// the server's background read cannot observe the client's close, so
+		// the context below would never fire and httptest's Close would hang.
+		io.Copy(io.Discard, request.Body)
 		once.Do(func() { close(entered) })
 		<-request.Context().Done()
 	}))
