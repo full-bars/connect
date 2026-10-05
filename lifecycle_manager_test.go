@@ -371,6 +371,33 @@ func TestClientCloseAndWaitJoinsContractManagerWorkers(t *testing.T) {
 	joined = true
 }
 
+// Cancel is the compatibility spelling for a non-joining client close. It
+// must still close every manager's worker admission; cancellation alone leaves
+// each contract-close join worker waiting forever on an admission that can
+// never publish completion.
+func TestClientCancelClosesContractManagerAdmission(t *testing.T) {
+	client := NewClient(
+		context.Background(),
+		NewId(),
+		NewNoContractClientOob(),
+		DefaultClientSettings(),
+	)
+	contractManager := client.ContractManager()
+	client.Cancel()
+
+	contractManager.mutex.Lock()
+	closed := contractManager.closed
+	contractManager.mutex.Unlock()
+	if !closed {
+		t.Fatal("client cancel left contract-manager worker admission open")
+	}
+	select {
+	case <-contractManager.workers.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("client cancel did not release contract-manager workers")
+	}
+}
+
 // TestClientCloseAndWaitJoinsContractStatusCallback proves a callback already
 // executing at shutdown is part of manager lifecycle, not a detached observer.
 func TestClientCloseAndWaitJoinsContractStatusCallback(t *testing.T) {
@@ -410,6 +437,61 @@ func TestClientCloseAndWaitJoinsContractStatusCallback(t *testing.T) {
 	releaseCallbackOnce.Do(func() { close(releaseCallback) })
 	waitCloseWaitResult(t, ctx, result, "join contract status callback")
 	joined = true
+}
+
+func TestContractStatusWindowDispatcherDoesNotCreatePerClientWorker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	defer client.Close()
+	manager := client.ContractManager()
+	delivered := make(chan *ContractStatus, 1)
+	unsub := manager.addContractStatusDispatchCallback(func(status *ContractStatus) {
+		delivered <- status
+	})
+
+	if got := len(manager.contractStatusCallbacks.Get()); got != 0 {
+		t.Fatalf("per-client status workers = %d, want 0", got)
+	}
+	status := &ContractStatus{Key: ContractKey{Destination: DestinationId(NewId())}}
+	manager.contractStatus(status)
+	select {
+	case got := <-delivered:
+		if got != status {
+			t.Fatal("direct dispatcher changed status identity")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct status dispatcher did not run")
+	}
+
+	unsub()
+	manager.contractStatus(status)
+	select {
+	case <-delivered:
+		t.Fatal("unsubscribed direct status dispatcher still ran")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestContractStatusWindowDispatcherRejectsAdmissionAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	manager := client.ContractManager()
+	client.Close()
+
+	called := false
+	unsub := manager.addContractStatusDispatchCallback(func(*ContractStatus) {
+		called = true
+	})
+	unsub()
+	manager.contractStatus(&ContractStatus{})
+	if called {
+		t.Fatal("closed manager admitted a direct status dispatcher")
+	}
+	if got := len(manager.contractStatusDispatchCallbacks.Get()); got != 0 {
+		t.Fatalf("closed manager direct dispatchers = %d, want 0", got)
+	}
 }
 
 // TestContractManagerCloseRejectsPausedCallbackAdmission proves callback

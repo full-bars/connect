@@ -116,7 +116,7 @@ func TestMonitorSetStallStatus(t *testing.T) {
 	AssertEqual(t, monitor.SetStallStatus(WindowStallProvidersUnresponsive, false), false)
 
 	// the size half preserves the diagnosis
-	monitor.AddWindowExpandEvent(false, 4)
+	monitor.AddWindowExpandEvent(false, 4, false)
 	windowExpandEvent := monitor.WindowExpandEvent()
 	AssertEqual(t, windowExpandEvent.TargetSize, 4)
 	AssertEqual(t, windowExpandEvent.Reason, WindowStallProvidersUnresponsive)
@@ -145,8 +145,8 @@ func TestMergedMonitorStallStatus(t *testing.T) {
 	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallPlatformUnreachable)
 
 	// one window failed while the other is still trying (target > 0): not failed
-	quality.AddWindowExpandEvent(false, 4)
-	speed.AddWindowExpandEvent(false, 1)
+	quality.AddWindowExpandEvent(false, 4, false)
+	speed.AddWindowExpandEvent(false, 1, false)
 	quality.SetStallStatus(WindowStallProvidersUnresponsive, true)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 
@@ -160,7 +160,7 @@ func TestMergedMonitorStallStatus(t *testing.T) {
 	AssertEqual(t, merged.WindowExpandEvent().Failed, true)
 
 	// min satisfied anywhere overrides failed
-	speed.AddWindowExpandEvent(true, 1)
+	speed.AddWindowExpandEvent(true, 1, false)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 }
 
@@ -224,15 +224,15 @@ func TestWindowOutcomeDeadlineSettings(t *testing.T) {
 // transitions directly: a monitor, a recorder, a log, and live notify monitors.
 func outcomeTestWindow(ctx context.Context, log *recordingLogger) *multiClientWindow {
 	window := &multiClientWindow{
-		ctx:              ctx,
-		log:              log,
-		windowType:       WindowTypeQuality,
-		settings:         DefaultMultiClientSettings(),
-		monitor:          NewRemoteUserNatMultiClientMonitorWithDefaults(),
-		clients:          map[Id]*multiClientChannel{},
-		generatorMonitor: NewMonitor(),
-		resizeMonitor:    NewMonitor(),
-		failures:         &windowFailureRecorder{},
+		ctx:                   ctx,
+		log:                   log,
+		windowType:            WindowTypeQuality,
+		settings:              DefaultMultiClientSettings(),
+		monitor:               NewRemoteUserNatMultiClientMonitorWithDefaults(),
+		clients:               map[Id]*multiClientChannel{},
+		generatorMonitor:      NewMonitor(),
+		resizeMonitor:         NewMonitor(),
+		failures:              &windowFailureRecorder{},
 		createFailThrottle:    newLogThrottle(evaluationFailureLogInterval),
 		pingFailThrottle:      newLogThrottle(evaluationFailureLogInterval),
 		enumerateZeroThrottle: newLogThrottle(evaluationFailureLogInterval),
@@ -357,6 +357,304 @@ func TestWindowOutcomeFailAndRecover(t *testing.T) {
 	AssertEqual(t,
 		windowOutcomeAction(time.Hour, 45*time.Second, 45*time.Second, true, true, true, false),
 		outcomeNone)
+}
+
+// outcomeRetryGenerator exposes each deterministic enumeration boundary while
+// retaining the empty generator's cleanup behavior.
+type outcomeRetryGenerator struct {
+	testingEmptyMultiClientGenerator
+	calls chan struct{}
+}
+
+// NextDestinations records one enumeration attempt and returns no providers,
+// leaving the window parked on its already-captured generator notification.
+func (self *outcomeRetryGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	self.calls <- struct{}{}
+	return map[MultiHopId]DestinationStats{}, nil
+}
+
+// TestWindowOutcomeFailureRetriesEnumerationUntilCanceled pins Failed as a
+// status latch, never a terminal machinery state. Many consecutive empty
+// provider passes under the failed latch must each accept another exact fill
+// request under the same live evaluation epoch. Only explicit lifetime
+// cancellation may terminate the enumerator.
+func TestWindowOutcomeFailureRetriesEnumerationUntilCanceled(t *testing.T) {
+	const retryCount = 64
+
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	window := outcomeTestWindow(ctx, log)
+	window.settings.WindowGeneratorTimeout = 0
+	window.generator = &outcomeRetryGenerator{calls: make(chan struct{})}
+	window.clientChannelArgs = make(chan *multiClientChannelArgs)
+	epoch := window.evalEpochContext()
+	resizeNotify := window.resizeMonitor.NotifyChannel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	select {
+	case <-window.generator.(*outcomeRetryGenerator).calls:
+	case <-done:
+		t.Fatal("window enumerator terminated before its first fill attempt")
+	}
+	window.failOutcome(45 * time.Second)
+	if !window.monitor.WindowExpandEvent().Failed {
+		t.Fatal("window did not publish the failed status latch")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("failed status canceled the window")
+	case <-epoch.Done():
+		t.Fatal("failed status canceled the evaluation epoch")
+	case <-resizeNotify:
+		t.Fatal("failed status closed an unrelated resize epoch")
+	default:
+	}
+
+	for attempt := 1; attempt <= retryCount; attempt += 1 {
+		window.generatorMonitor.NotifyAll()
+		select {
+		case <-window.generator.(*outcomeRetryGenerator).calls:
+		case <-done:
+			t.Fatalf("window enumerator terminally gave up after %d retries", attempt-1)
+		}
+		if !window.monitor.WindowExpandEvent().Failed {
+			t.Fatalf("retry %d cleared the failure status without a provider", attempt)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("retry %d canceled the window", attempt)
+		case <-epoch.Done():
+			t.Fatalf("retry %d canceled the evaluation epoch", attempt)
+		case <-done:
+			t.Fatalf("window enumerator stopped after retry %d", attempt)
+		default:
+		}
+	}
+	window.resizeMonitor.NotifyAll()
+	<-resizeNotify
+
+	cancel()
+	<-done
+	if _, ok := <-window.clientChannelArgs; ok {
+		t.Fatal("enumerator did not close its output after explicit cancellation")
+	}
+}
+
+// outcomeEnumerationGenerator exposes one platform enumeration call at a
+// time, so tests can choose owner cancellation or a genuine platform error.
+type outcomeEnumerationGenerator struct {
+	testingEmptyMultiClientGenerator
+	entered chan struct{}
+	results chan error
+}
+
+// Blocks at the exact platform enumeration boundary until the test chooses a
+// result.
+func (self *outcomeEnumerationGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	self.entered <- struct{}{}
+	return nil, <-self.results
+}
+
+// outcomeClientArgsGenerator exposes the client-args call after returning one
+// synthetic destination from platform enumeration.
+type outcomeClientArgsGenerator struct {
+	testingEmptyMultiClientGenerator
+	destination MultiHopId
+	entered     chan struct{}
+	results     chan error
+}
+
+// Supplies one candidate so the enumerator reaches client-args creation.
+func (self *outcomeClientArgsGenerator) NextDestinations(
+	count int,
+	excludeDestinations []MultiHopId,
+	rankMode string,
+) (map[MultiHopId]DestinationStats, error) {
+	return map[MultiHopId]DestinationStats{self.destination: {}}, nil
+}
+
+// Blocks at the exact platform client-mint boundary until the test chooses a
+// result.
+func (self *outcomeClientArgsGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {
+	self.entered <- struct{}{}
+	return nil, <-self.results
+}
+
+// outcomeEnumeratorTestWindow wires the production enumeration loop without
+// starting the rest of a multi-client window.
+func outcomeEnumeratorTestWindow(
+	ctx context.Context,
+	log *recordingLogger,
+	generator MultiClientGenerator,
+) *multiClientWindow {
+	window := outcomeTestWindow(ctx, log)
+	window.generator = generator
+	window.clientChannelArgs = make(chan *multiClientChannelArgs)
+	window.settings.WindowGeneratorTimeout = time.Hour
+	window.settings.WindowEnumerateErrorTimeout = 0
+	return window
+}
+
+// TestWindowEnumerationCancellationIsNotPlatformFailure pins window teardown
+// as lifecycle, not evidence that the platform was unreachable.
+func TestWindowEnumerationCancellationIsNotPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeEnumerationGenerator{
+		entered: make(chan struct{}),
+		results: make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if counts != [windowFailureClassCount]int{} {
+		t.Fatalf("teardown recorded window failures: %v", counts)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("teardown stall reason=%q, want %q", got, WindowStallEvaluating)
+	}
+	if lines := log.linesWith("[multi]window enumerate error"); len(lines) != 0 {
+		t.Fatalf("teardown logged an enumeration failure: %v", lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("teardown published a window stall: %v", lines)
+	}
+}
+
+// TestWindowClientArgsCancellationIsNotPlatformFailure pins the same owner
+// cancellation boundary after a destination was enumerated.
+func TestWindowClientArgsCancellationIsNotPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeClientArgsGenerator{
+		destination: RequireMultiHopId(NewId()),
+		entered:     make(chan struct{}),
+		results:     make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if counts != [windowFailureClassCount]int{} {
+		t.Fatalf("teardown recorded window failures: %v", counts)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("teardown stall reason=%q, want %q", got, WindowStallEvaluating)
+	}
+	if lines := log.linesWith("[multi]create client args error"); len(lines) != 0 {
+		t.Fatalf("teardown logged a client-args failure: %v", lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("teardown published a window stall: %v", lines)
+	}
+}
+
+// TestLiveWindowEnumerationErrorIsPlatformFailure preserves genuine platform
+// evidence while the owning window context remains live.
+func TestLiveWindowEnumerationErrorIsPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeEnumerationGenerator{
+		entered: make(chan struct{}),
+		results: make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	generator.results <- errors.New("synthetic platform timeout")
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if got := counts[windowFailurePlatform]; got != 1 {
+		t.Fatalf("platform failure count=%d, want 1", got)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	if lines := log.linesWith("[multi]window enumerate error"); len(lines) != 1 {
+		t.Fatalf("enumeration failure lines=%d, want 1: %v", len(lines), lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
+		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	}
+}
+
+// TestLiveWindowClientArgsErrorIsPlatformFailure preserves genuine client-mint
+// evidence while the owning window context remains live.
+func TestLiveWindowClientArgsErrorIsPlatformFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	log := newRecordingLogger()
+	generator := &outcomeClientArgsGenerator{
+		destination: RequireMultiHopId(NewId()),
+		entered:     make(chan struct{}),
+		results:     make(chan error),
+	}
+	window := outcomeEnumeratorTestWindow(ctx, log, generator)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		window.randomEnumerateClientArgs()
+	}()
+
+	<-generator.entered
+	generator.results <- errors.New("synthetic client-args timeout")
+	<-generator.entered
+	cancel()
+	<-done
+	generator.results <- nil
+
+	counts := window.failures.counts(time.Now())
+	if got := counts[windowFailurePlatform]; got != 1 {
+		t.Fatalf("platform failure count=%d, want 1", got)
+	}
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	if lines := log.linesWith("[multi]create client args error"); len(lines) != 1 {
+		t.Fatalf("client-args failure lines=%d, want 1: %v", len(lines), lines)
+	}
+	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
+		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	}
 }
 
 // the stall transition is logged once per change through publishStallStatus

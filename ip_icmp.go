@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,6 +29,26 @@ const (
 	icmp6TypeEchoRequest = byte(128)
 	icmp6TypeEchoReply   = byte(129)
 )
+
+// icmpv6 link-local control types (rfc 4443, rfc 4861, rfc 3810): multicast
+// listener query/report/done (130-132), router solicitation/advertisement
+// (133-134), neighbor solicitation/advertisement (135-136) and redirect
+// (137). None has meaning across a point-to-point tunnel; they are dropped
+// silently wherever they appear (see isIcmpv6LinkControlType).
+const (
+	icmp6TypeMulticastListenerQuery = byte(130)
+	icmp6TypeRedirect               = byte(137)
+)
+
+// errIcmpv6LinkControl is the parse error for an icmpv6 link-local control
+// message, distinct from a malformed packet so a caller can drop it quietly.
+var errIcmpv6LinkControl = errors.New("icmpv6 link-local control message is not carried")
+
+// isIcmpv6LinkControlType reports whether an icmpv6 type is link-local control
+// chatter (mld, router and neighbor discovery, redirect).
+func isIcmpv6LinkControlType(icmpType byte) bool {
+	return icmp6TypeMulticastListenerQuery <= icmpType && icmpType <= icmp6TypeRedirect
+}
 
 // minimal parsed view of an icmp echo packet on the send path, matching the
 // tcp/udp views. all slices alias the backing ip packet.
@@ -85,6 +106,7 @@ type icmpEgress interface {
 }
 
 type IcmpBufferSettings struct {
+	MemoryBudget *TransferMemoryBudget
 	// nil resolves to the local user nat `Log`
 	Log          Logger
 	ReadTimeout  time.Duration
@@ -127,7 +149,7 @@ func DefaultIcmpBufferSettingsWithBufferSize(bufferSize int) *IcmpBufferSettings
 		// backends allocate one read and one write buffer of this size per
 		// flow, so it is the dominant per-flow heap item in the budget model
 		// (see providerIcmpFlowByteCount)
-		ReadBufferByteCount: DefaultMtu + 64,
+		ReadBufferByteCount: DefaultTunnelMtu + 64,
 		SequenceBufferSize:  bufferSize,
 		UserLimit:           0,
 		GlobalLimit:         globalLimit,
@@ -273,9 +295,13 @@ type IcmpBuffer[BufferId comparable] struct {
 	icmpBufferSettings             *IcmpBufferSettings
 
 	mutex sync.Mutex
+	// The local NAT closes send admission before waiting, so no Add can race
+	// the terminal Wait.
+	sequenceWaitGroup sync.WaitGroup
 
-	sequences       map[BufferId]*IcmpSequence
-	sourceSequences map[TransferPath]map[BufferId]*IcmpSequence
+	sequences        map[BufferId]*IcmpSequence
+	sourceSequences  map[TransferPath]map[BufferId]*IcmpSequence
+	retiredSourceIds map[Id]bool
 }
 
 func newIcmpBuffer[BufferId comparable](
@@ -290,6 +316,7 @@ func newIcmpBuffer[BufferId comparable](
 		icmpBufferSettings: icmpBufferSettings,
 		sequences:          map[BufferId]*IcmpSequence{},
 		sourceSequences:    map[TransferPath]map[BufferId]*IcmpSequence{},
+		retiredSourceIds:   map[Id]bool{},
 	}
 }
 
@@ -307,6 +334,9 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 	initSequence := func(skip *IcmpSequence) *IcmpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		if self.retiredSourceIds[source.SourceId] {
+			return nil
+		}
 
 		sequence, ok := self.sequences[bufferId]
 		if ok {
@@ -357,12 +387,6 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			}
 		}
 
-		sourceIpCopy := make(net.IP, len(icmp.sourceIp))
-		copy(sourceIpCopy, icmp.sourceIp)
-
-		destinationIpCopy := make(net.IP, len(icmp.destinationIp))
-		copy(destinationIpCopy, icmp.destinationIp)
-
 		sequence = newIcmpSequenceWithTransferKey(
 			self.ctx,
 			self.receiveCallback,
@@ -370,12 +394,17 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			transferKey,
 			provideMode,
 			ipVersion,
-			sourceIpCopy,
+			icmp.sourceIp,
 			icmp.identifier,
-			destinationIpCopy,
+			icmp.destinationIp,
 			self.icmpBufferSettings,
 		)
+		if sequence == nil {
+			return nil
+		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		flowMemory := sequence.memory
+		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -383,7 +412,11 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			self.sourceSequences[source] = sourceSequences
 		}
 		sourceSequences[bufferId] = sequence
+		self.sequenceWaitGroup.Add(1)
 		go HandleError(func() {
+			defer self.sequenceWaitGroup.Done()
+			defer close(sequence.retirementDone)
+			defer flowMemory.release()
 			defer func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -403,7 +436,18 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		return sequence
 	}
 
+	memory, admitted := reserveNatMemory(self.icmpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
+	if !admitted {
+		return false, nil
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			memory.release()
+		}
+	}()
 	sendItem := &IcmpSendItem{
+		memory:      memory,
 		source:      source,
 		transferKey: transferKey,
 		provideMode: provideMode,
@@ -411,12 +455,28 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		ipPacket:    ipPacket,
 	}
 	sequence := initSequence(nil)
+	if sequence == nil {
+		return false, nil
+	}
 	if success, err := sequence.send(sendItem, timeout); err == nil {
+		accepted = success
 		return success, nil
 	} else {
 		// sequence closed
-		return initSequence(sequence).send(sendItem, timeout)
+		sequence = initSequence(sequence)
+		if sequence == nil {
+			return false, nil
+		}
+		var err error
+		accepted, err = sequence.send(sendItem, timeout)
+		return accepted, err
 	}
+}
+
+// Completion means every admitted echo sequence and its socket reader has
+// released all packet ownership. The caller has already stopped dispatch.
+func (self *IcmpBuffer[BufferId]) waitForLifecycle() {
+	self.sequenceWaitGroup.Wait()
 }
 
 // removeSequenceWithLock removes a sequence from both indexes before canceling
@@ -434,7 +494,33 @@ func (self *IcmpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, sequ
 	sequence.Cancel()
 }
 
+// Applies one exact provider-source tombstone and cancels matching echo-flow
+// ownership without disturbing sibling sources.
+func (self *IcmpBuffer[BufferId]) setSourceRetired(
+	sourceId Id,
+	retired bool,
+) (doneChannels []<-chan struct{}) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if !retired {
+		delete(self.retiredSourceIds, sourceId)
+		return nil
+	}
+	self.retiredSourceIds[sourceId] = true
+	for source, sourceSequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for bufferId, sequence := range sourceSequences {
+			doneChannels = append(doneChannels, sequence.retirementDone)
+			self.removeSequenceWithLock(bufferId, sequence)
+		}
+	}
+	return doneChannels
+}
+
 type IcmpSendItem struct {
+	memory      natMemoryReservation
 	source      TransferPath
 	transferKey TransferKey
 	provideMode protocol.ProvideMode
@@ -447,12 +533,16 @@ type IcmpSendItem struct {
 // identifier restored. transfer to this sequence is lossless and in order;
 // the backend is datagram best-effort like the network itself.
 type IcmpSequence struct {
+	memory                         natMemoryReservation
 	ctx                            context.Context
 	cancel                         context.CancelFunc
 	log                            Logger
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	icmpBufferSettings             *IcmpBufferSettings
+	// Closed by the owning buffer after Run joins its echo backend and drains
+	// queued packet ownership.
+	retirementDone chan struct{}
 
 	sendMutex sync.Mutex
 	sendItems chan *IcmpSendItem
@@ -514,14 +604,22 @@ func newIcmpSequenceWithTransferKey(
 	destinationIp net.IP,
 	icmpBufferSettings *IcmpBufferSettings,
 ) *IcmpSequence {
+	memory, admitted := reserveNatMemory(icmpBufferSettings.MemoryBudget, natIcmpFlowMemoryByteCount(icmpBufferSettings))
+	if !admitted {
+		return nil
+	}
+	sourceIp = slices.Clone(sourceIp)
+	destinationIp = slices.Clone(destinationIp)
 	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &IcmpSequence{
+		memory:             memory,
 		ctx:                cancelCtx,
 		cancel:             cancel,
 		log:                loggerOrDefault(icmpBufferSettings.Log),
 		receiveCallback:    receiveCallback,
 		icmpBufferSettings: icmpBufferSettings,
+		retirementDone:     make(chan struct{}),
 		sendItems:          make(chan *IcmpSendItem, icmpBufferSettings.SequenceBufferSize),
 		idleCondition:      NewIdleCondition(),
 		source:             source,
@@ -641,6 +739,9 @@ func (self *IcmpSequence) receivePacket(packet []byte) {
 }
 
 func (self *IcmpSequence) Run() {
+	defer self.memory.release()
+	var childWorkers sync.WaitGroup
+	defer childWorkers.Wait()
 	defer func() {
 		self.cancel()
 
@@ -658,7 +759,7 @@ func (self *IcmpSequence) Run() {
 					if !ok {
 						return
 					}
-					MessagePoolReturn(sendItem.ipPacket)
+					sendItem.release()
 				default:
 					return
 				}
@@ -680,7 +781,9 @@ func (self *IcmpSequence) Run() {
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]icmp connect success\n")
 
+	childWorkers.Add(1)
 	go HandleError(func() {
+		defer childWorkers.Done()
 		defer self.cancel()
 
 		for replyIter := uint64(0); ; replyIter += 1 {
@@ -741,7 +844,7 @@ func (self *IcmpSequence) Run() {
 			} else if self.log.V(1).Enabled() {
 				self.log.Infof("[f%d]icmp forward error = %s\n", sendIter, err)
 			}
-			MessagePoolReturn(sendItem.ipPacket)
+			sendItem.release()
 			sendIter += 1
 			if err != nil {
 				return
@@ -829,4 +932,84 @@ func (self *IcmpSequence) Close() {
 // no echo backend (see the build-tagged newIcmpEgress implementations)
 func icmpEgressUnsupportedError(ipVersion int) error {
 	return fmt.Errorf("No icmp egress support for ip version %d on this platform.", ipVersion)
+}
+
+const (
+	icmp4TypeDestinationUnreachable = byte(3)
+	icmp4CodePortUnreachable        = byte(3)
+	icmp6TypeDestinationUnreachable = byte(1)
+	icmp6CodePortUnreachable        = byte(4)
+	// rfc 792 quotes the ip header and the first 8 transport bytes
+	icmp4UnreachableQuotedTransport = 8
+	// rfc 4443 2.4: an error must not exceed the minimum ipv6 mtu
+	icmp6MinMtu = 1280
+)
+
+// icmpUnreachableForPolicyReject returns a port-unreachable error addressed to
+// the source of a rejected UDP datagram, as if from its destination (v4 type 3
+// code 3 per rfc 792 quoting the ip header and 8 transport bytes; v6 type 1
+// code 4 per rfc 4443 quoting as much as fits in 1280 bytes). It returns nil
+// for anything that is not a complete UDP datagram, so an error is never sent
+// about an error. The returned packet is a pool buffer owned by the caller.
+func icmpUnreachableForPolicyReject(packet []byte) []byte {
+	if len(packet) == 0 {
+		return nil
+	}
+	ipVersion := int(packet[0] >> 4)
+	switch ipVersion {
+	case 4:
+		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
+		if !ok || ipProtocol != ipProtocolNumberUdp || len(transport) < UdpHeaderSize {
+			return nil
+		}
+		ipHeaderByteCount := int(packet[0]&0x0f) * 4
+		quoted := packet[:ipHeaderByteCount+min(len(transport), icmp4UnreachableQuotedTransport)]
+		reply := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + IcmpHeaderSize + len(quoted))
+		writeIpv4Header(reply, ipProtocolNumberIcmp4, destinationIp, sourceIp)
+		icmp := reply[Ipv4HeaderSizeWithoutExtensions:]
+		icmp[0] = icmp4TypeDestinationUnreachable
+		icmp[1] = icmp4CodePortUnreachable
+		clear(icmp[2:IcmpHeaderSize])
+		copy(icmp[IcmpHeaderSize:], quoted)
+		binary.BigEndian.PutUint16(icmp[2:4], checksumFinish(checksumAdd(0, icmp)))
+		return reply
+	case 6:
+		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv6(packet)
+		if !ok || ipProtocol != ipProtocolNumberUdp || len(transport) < UdpHeaderSize {
+			return nil
+		}
+		quotedByteCount := min(len(packet), icmp6MinMtu-Ipv6HeaderSize-IcmpHeaderSize)
+		reply := MessagePoolGet(Ipv6HeaderSize + IcmpHeaderSize + quotedByteCount)
+		writeIpv6Header(reply, ipProtocolNumberIcmp6, destinationIp, sourceIp)
+		icmp := reply[Ipv6HeaderSize:]
+		icmp[0] = icmp6TypeDestinationUnreachable
+		icmp[1] = icmp6CodePortUnreachable
+		clear(icmp[2:IcmpHeaderSize])
+		copy(icmp[IcmpHeaderSize:], packet[:quotedByteCount])
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(ipProtocolNumberIcmp6, destinationIp, sourceIp, icmp))
+		return reply
+	default:
+		return nil
+	}
+}
+
+// deliverIcmpPolicyUnreachable hands a port-unreachable for a rejected UDP
+// datagram to the local receive callback. The datagram is borrowed.
+func deliverIcmpPolicyUnreachable(
+	receive ReceivePacketFunction,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	unreachable := icmpUnreachableForPolicyReject(packet)
+	if unreachable == nil {
+		return
+	}
+	defer MessagePoolReturn(unreachable)
+	if receive != nil {
+		HandleError(func() {
+			receive(source, provideMode, ipPath, unreachable)
+		})
+	}
 }

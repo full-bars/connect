@@ -110,7 +110,7 @@ func decodeSendPackLifecycleWirePack(
 	}
 	frame := transferFrame.GetFrame()
 	if frame == nil || frame.MessageType != protocol.MessageType_TransferPack {
-		t.Fatalf("lifecycle transfer had no Pack: %+v", transferFrame)
+		t.Fatalf("lifecycle transfer had no Pack: %+v", &transferFrame)
 	}
 	pack := &protocol.Pack{}
 	if err := ProtoUnmarshal(frame.MessageBytes, pack); err != nil {
@@ -512,6 +512,7 @@ func TestSendPackLifecycleObserverCompletesRejectedPack(t *testing.T) {
 		func(callbackErr error) { callbackResults <- callbackErr },
 		0,
 		Ctx(sendCtx),
+		sendPackRecoveryOption{upstreamRecoverable: true},
 	)
 	if success || err == nil {
 		MessagePoolReturn(frame.MessageBytes)
@@ -521,6 +522,15 @@ func TestSendPackLifecycleObserverCompletesRejectedPack(t *testing.T) {
 	started := waitSendPackLifecycleObservation(t, ctx, events)
 	firstWrite := waitSendPackLifecycleObservation(t, ctx, events)
 	terminal := waitSendPackLifecycleObservation(t, ctx, events)
+	for _, observation := range []SendPackLifecycleObservation{
+		started,
+		firstWrite,
+		terminal,
+	} {
+		if !observation.UpstreamRecoverable {
+			t.Fatalf("upstream-recoverable lifecycle lost at phase %d", observation.Phase)
+		}
+	}
 	requireSendPackLifecycleObservation(
 		t, started, client.ClientId(), destinationId, started.Token,
 		SendPackLifecyclePhaseStarted, true, false,

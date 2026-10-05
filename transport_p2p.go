@@ -168,13 +168,23 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		// continuously at that round-trip time.
 		EndToEndProbeInterval: 5 * time.Second,
 		EndToEndProbeTimeout:  15 * time.Second,
-		// Four transfer batches absorb ordinary goroutine scheduling jitter.
-		// A real detached-data-channel measurement sustained the same
-		// 53-54 MiB/s at depths 1/4/8/32. Keeping 32 therefore added no
-		// throughput, but allowed up to 2 MiB of MaxMessageByteCount payloads
-		// to sit in each unbudgeted receive route. Four cuts that hard bound
-		// to 256 KiB and shortens queueing latency.
+		// Four transfer batches absorb ordinary goroutine scheduling jitter on
+		// send and bound readiness prefetch. A real detached-data-channel
+		// measurement sustained the same 53-54 MiB/s at depths 1/4/8/32.
+		// Receive handoff has independent count and byte limits below.
 		ChannelBufferSize: 4,
+		// A cold SCTP congestion window can take several RTTs to catch a fixed
+		// datagram offer. Compact only the legacy writer's sustained backlog,
+		// with separately charged live roots; H1 and the native fast lane do
+		// not enter this queue.
+		LegacySendQueueByteCount: kib(256),
+		// The carrier readers hand off without waiting. Count and bytes are
+		// independent: 256 slots absorb concurrent data, ACK, contract, and
+		// probe sequence bursts, while the separate byte bound still permits at
+		// most four worst-case 64 KiB messages. Channel metadata adds only a few
+		// KiB per connection and cannot expand retained payload ownership.
+		ReceiveQueueMessageCount: 256,
+		ReceiveQueueByteCount:    kib(256),
 		// Transfer batching is capped at 3 KiB, so almost every data-channel
 		// message fits in the 4 KiB pooled class. The receiver retries once
 		// with Pion's exact required length for a legacy/atypical larger
@@ -247,6 +257,19 @@ type P2pTransportSettings struct {
 	// responses stop crossing the complete path.
 	EndToEndProbeTimeout time.Duration
 	ChannelBufferSize    int
+	// LegacySendQueueByteCount caps live packet roots in the compact SCTP
+	// writer. Each root and its fixed worker owner reserve from the actual
+	// peer connection's shared WebRTC budget. No-budget writes fall back to
+	// synchronous carrier backpressure; nonpositive disables the queue.
+	LegacySendQueueByteCount ByteCount
+	// ReceiveQueueMessageCount bounds complete messages waiting between the
+	// SCTP/SRTP readers and the RouteManager, including the one currently held
+	// by the forwarding worker. ReceiveQueueByteCount is the hard retained
+	// payload ceiling for that same queue. Nonpositive values retain
+	// compatibility by deriving the old ChannelBufferSize*MaxMessageByteCount
+	// bound.
+	ReceiveQueueMessageCount int
+	ReceiveQueueByteCount    ByteCount
 	// InitialReadBufferByteCount is the first pooled receive size.
 	// io.ErrShortBuffer retries with Pion's exact required length up to
 	// MaxMessageByteCount without consuming the queued SCTP message.
@@ -272,6 +295,8 @@ type P2pTransportSettings struct {
 	// stream readiness. A fixed worker shard invokes it out of band; events are
 	// dropped when that bounded shard queue is saturated.
 	EndToEndProbeObserver func(P2pStreamProbeEvent)
+	// Nil by default. Metadata-only carrier progress trace; must not block.
+	ProgressObserver func(TransferProgressEvent)
 	// Nil test barrier pauses one association after route cleanup but before its
 	// done publication.
 	beforeRunDoneForTest func(Id, PeerType)
@@ -311,7 +336,98 @@ type P2pTransport struct {
 
 type p2pRouteManager interface {
 	UpdateTransport(Transport, []Route)
+	UpdateTransportWithProperties(Transport, []Route, TransferCarrierProperties)
 	RemoveTransport(Transport)
+}
+
+// p2pTransferCarrierProperties exposes the complete P2P receive path to
+// Transfer's acknowledgement-flight controller. Both native RTP/SRTP and the
+// legacy SCTP lane terminate in a deliberately nonblocking bounded handoff;
+// even SCTP can therefore lose a complete Transfer message after its carrier
+// write succeeds. Advertising every mode as unreliable keeps at most the
+// receiver's data-slot capacity in flight and leaves one slot for cumulative
+// ACK, compact-recovery, probe, and contract control messages.
+func p2pTransferCarrierProperties(transport Transport) TransferCarrierProperties {
+	if _, ok := transport.(*P2pReceiveTransport); ok {
+		// The deprecated single-route constructor publishes a reliable immediate
+		// route. Its native fast reader still has a bounded zero-wait queue before
+		// this route; production publishes separate exact lanes below.
+		return TransferCarrierProperties{
+			ReceiveReliability: CarrierReliabilityReliable,
+		}
+	}
+	send, ok := transport.(*P2pSendTransport)
+	if !ok || send.settings == nil {
+		return TransferCarrierProperties{}
+	}
+	fastConn, supportsFastPath := send.conn.(webRtcFastPathConn)
+	potentiallyUnreliable := send.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly &&
+		(supportsFastPath || send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly)
+	if !potentiallyUnreliable {
+		return TransferCarrierProperties{}
+	}
+	properties := TransferCarrierProperties{
+		Unreliable:                   true,
+		unreliableFlightByteLimit:    p2pUnreliableFlightByteLimit(send.settings),
+		unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
+	}
+	properties.unreliableForMessageByteCount = func(int) bool {
+		if send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
+			return true
+		}
+		return supportsFastPath && fastConn.FastPathReady()
+	}
+	return properties
+}
+
+// Reserve at least 16 KiB, or one sixteenth of a larger queue, outside the
+// destination-wide Transfer data flight. Carrier admission is deliberately
+// nonblocking and also receives untracked cumulative ACK, compact-recovery,
+// contract, and probe messages. The reserve prevents an ordinary maximum
+// flight from consuming the complete hard byte ceiling while keeping retained
+// payload at the same configured bound.
+func p2pUnreliableFlightByteLimit(settings *P2pTransportSettings) ByteCount {
+	queueByteCount := p2pReceiveQueueByteCount(settings)
+	if queueByteCount <= 1 {
+		return 1
+	}
+	reserveByteCount := min(
+		queueByteCount-1,
+		max(kib(16), queueByteCount/16),
+	)
+	return queueByteCount - reserveByteCount
+}
+
+// Transfer maintains one destination-wide acknowledgement flight. Keep its
+// message ceiling below the complete-message receive queue while the separate
+// adaptive byte limit remains the tighter retained-payload bound. Reserving
+// one queue slot leaves immediate admission for cumulative ACK, compact
+// recovery, probe, and contract traffic; a one-slot route retains a progress
+// floor of one.
+func p2pUnreliableFlightMessageLimit(settings *P2pTransportSettings) int {
+	return max(1, p2pReceiveQueueMessageCount(settings)-1)
+}
+
+func p2pReceiveQueueMessageCount(settings *P2pTransportSettings) int {
+	if settings != nil && 0 < settings.ReceiveQueueMessageCount {
+		return settings.ReceiveQueueMessageCount
+	}
+	if settings == nil {
+		return 1
+	}
+	return max(1, settings.ChannelBufferSize)
+}
+
+func p2pReceiveQueueByteCount(settings *P2pTransportSettings) ByteCount {
+	if settings == nil {
+		return 1
+	}
+	maximumMessageByteCount := max(1, settings.MaxMessageByteCount)
+	if 0 < settings.ReceiveQueueByteCount {
+		return max(ByteCount(maximumMessageByteCount), settings.ReceiveQueueByteCount)
+	}
+	return ByteCount(max(1, settings.ChannelBufferSize)) *
+		ByteCount(maximumMessageByteCount)
 }
 
 // p2pConnectionRouteTestHooks exposes the two sides of a connected route
@@ -319,6 +435,55 @@ type p2pRouteManager interface {
 type p2pConnectionRouteTestHooks struct {
 	beforeConnectedUpdate func()
 	afterConnectedUpdate  func()
+}
+
+type p2pReceiveRouteLane struct {
+	transport   Transport
+	route       Route
+	reliability CarrierReliability
+}
+
+// updateP2pConnectionReceiveRoutes publishes or retires both physical receive
+// lanes as one connection-state transition. Each route gets immutable exact
+// reliability while the association remains one observable P2P adjacency.
+func updateP2pConnectionReceiveRoutes(
+	ctx context.Context,
+	manager p2pRouteManager,
+	lanes []p2pReceiveRouteLane,
+	connected bool,
+	testHooks ...p2pConnectionRouteTestHooks,
+) bool {
+	remove := func() {
+		for _, lane := range lanes {
+			manager.RemoveTransport(lane.transport)
+		}
+	}
+	if !connected || ctx.Err() != nil {
+		remove()
+		return false
+	}
+	var hooks p2pConnectionRouteTestHooks
+	if 0 < len(testHooks) {
+		hooks = testHooks[0]
+	}
+	if hooks.beforeConnectedUpdate != nil {
+		hooks.beforeConnectedUpdate()
+	}
+	for _, lane := range lanes {
+		manager.UpdateTransportWithProperties(
+			lane.transport,
+			[]Route{lane.route},
+			TransferCarrierProperties{ReceiveReliability: lane.reliability},
+		)
+	}
+	if hooks.afterConnectedUpdate != nil {
+		hooks.afterConnectedUpdate()
+	}
+	if ctx.Err() != nil {
+		remove()
+		return false
+	}
+	return true
 }
 
 // updateP2pConnectionRoute prevents a connected callback that was already in
@@ -341,7 +506,11 @@ func updateP2pConnectionRoute(
 		if hooks.beforeConnectedUpdate != nil {
 			hooks.beforeConnectedUpdate()
 		}
-		manager.UpdateTransport(transport, []Route{route})
+		manager.UpdateTransportWithProperties(
+			transport,
+			[]Route{route},
+			p2pTransferCarrierProperties(transport),
+		)
 		if hooks.afterConnectedUpdate != nil {
 			hooks.afterConnectedUpdate()
 		}
@@ -731,7 +900,8 @@ func (self *P2pTransport) run() {
 				if streamProbe != nil {
 					messageHandler = streamProbe.handle
 				}
-				t, route := newP2pReceiveTransport(
+				var receiveLanes []p2pReceiveRouteLane
+				p2pReceiveTransport, receiveLanes = newP2pReceiveTransportWithLanes(
 					handleCtx,
 					handleCancel,
 					conn,
@@ -740,7 +910,6 @@ func (self *P2pTransport) run() {
 					prefetched,
 					messageHandler,
 				)
-				p2pReceiveTransport = t.(*P2pReceiveTransport)
 				if self.settings.afterReceiveTransportForTest != nil {
 					self.settings.afterReceiveTransportForTest(p2pReceiveTransport)
 				}
@@ -748,11 +917,10 @@ func (self *P2pTransport) run() {
 				var routeConnected atomic.Bool
 				routeCallbacks := newLifecycleAdmission()
 				applyRoute := func(connected bool) {
-					routeInstalled := updateP2pConnectionRoute(
+					routeInstalled := updateP2pConnectionReceiveRoutes(
 						handleCtx,
 						self.receiveRouteManager,
-						t,
-						route,
+						receiveLanes,
 						connected,
 						p2pConnectionRouteTestHooks{
 							beforeConnectedUpdate: func() {
@@ -993,14 +1161,19 @@ var (
 type P2pSendTransport struct {
 	transportId Id
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	conn      net.Conn
-	peerId    Id
-	streamId  Id
-	send      chan []byte
-	done      chan struct{}
-	closeOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	conn     net.Conn
+	peerId   Id
+	streamId Id
+	send     chan []byte
+	// Endpoint readiness requests and replies must not compete for admission
+	// with a saturated application route. One fixed-size envelope per class
+	// is sufficient; the existing physical writer consumes both queues.
+	probeRequests  chan []byte
+	probeResponses chan []byte
+	done           chan struct{}
+	closeOnce      sync.Once
 
 	endToEndReadinessRequired bool
 	endToEndReady             atomic.Bool
@@ -1090,6 +1263,10 @@ func newP2pSendTransportForPeer(
 		settings:                  settings,
 	}
 	p2pSendTransport.probeSendAdmission.open = true
+	if endToEndReadinessRequired {
+		p2pSendTransport.probeRequests = make(chan []byte, 1)
+		p2pSendTransport.probeResponses = make(chan []byte, 1)
+	}
 	if !endToEndReadinessRequired {
 		p2pSendTransport.endToEndReady.Store(true)
 	}
@@ -1116,7 +1293,74 @@ func (self *P2pSendTransport) CloseAndWait(ctx context.Context) error {
 	return waitForLifecycleDone(ctx, self.done, "P2P send transport")
 }
 
+// At most two control messages may precede a ready ordinary message. The
+// tiny per-class queues are only installed on endpoint-probed generations;
+// standalone and relay transports retain the original single-route select.
+func (self *P2pSendTransport) nextSend(probeBurst *int) ([]byte, bool) {
+	if self.probeRequests == nil && self.probeResponses == nil {
+		select {
+		case <-self.ctx.Done():
+			return nil, false
+		case message, ok := <-self.send:
+			return message, ok
+		}
+	}
+	select {
+	case <-self.ctx.Done():
+		return nil, false
+	default:
+	}
+	if 2 <= *probeBurst {
+		select {
+		case message, ok := <-self.send:
+			*probeBurst = 0
+			return message, ok
+		default:
+		}
+		*probeBurst = 0
+	}
+	if message := self.takePendingProbe(*probeBurst); message != nil {
+		*probeBurst++
+		return message, true
+	}
+	select {
+	case <-self.ctx.Done():
+		return nil, false
+	case message := <-self.probeResponses:
+		*probeBurst++
+		return message, true
+	case message := <-self.probeRequests:
+		*probeBurst++
+		return message, true
+	case message, ok := <-self.send:
+		*probeBurst = 0
+		return message, ok
+	}
+}
+
+// Both the route consumer and compact legacy writer use the same bounded
+// request/response queues. The writer also checks them while bulk admission
+// has parked the route consumer; each writer serves at most two before data.
+func (self *P2pSendTransport) takePendingProbe(probeBurst int) []byte {
+	first, second := self.probeResponses, self.probeRequests
+	if probeBurst == 1 {
+		first, second = second, first
+	}
+	select {
+	case message := <-first:
+		return message
+	default:
+	}
+	select {
+	case message := <-second:
+		return message
+	default:
+		return nil
+	}
+}
+
 func (self *P2pSendTransport) run() {
+	var legacyQueue *p2pLegacySendQueue
 	defer close(self.done)
 	defer func() {
 		self.probeSendAdmission.close()
@@ -1125,6 +1369,9 @@ func (self *P2pSendTransport) run() {
 		}
 		self.cancel()
 		self.probeSendAdmission.wait()
+		if legacyQueue != nil {
+			legacyQueue.stopAndWait()
+		}
 		if self.routeRetired != nil {
 			if self.testingBeforeRouteRetirementWait != nil {
 				self.testingBeforeRouteRetirementWait()
@@ -1136,16 +1383,18 @@ func (self *P2pSendTransport) run() {
 		}
 		// Drain any pooled bytes the route manager or an admitted endpoint probe
 		// already enqueued before teardown closed both admission paths.
-	drainProbeRoute:
-		for {
-			select {
-			case b, ok := <-self.send:
-				if !ok {
+		for _, route := range []chan []byte{self.send, self.probeRequests, self.probeResponses} {
+		drainProbeRoute:
+			for {
+				select {
+				case b, ok := <-route:
+					if !ok {
+						break drainProbeRoute
+					}
+					MessagePoolReturn(b)
+				default:
 					break drainProbeRoute
 				}
-				MessagePoolReturn(b)
-			default:
-				break drainProbeRoute
 			}
 		}
 		if self.testingAfterProbeSendDrain != nil {
@@ -1153,14 +1402,42 @@ func (self *P2pSendTransport) run() {
 		}
 	}()
 
-	for {
-		select {
-		case <-self.ctx.Done():
-			return
-		case transferFrameBytes, ok := <-self.send:
-			if !ok {
-				return
+	var pairRecorded atomic.Bool
+	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
+		if deadline.IsZero() {
+			deadline = time.Now().Add(self.settings.WriteTimeout)
+		}
+		progressObserver := self.settings.ProgressObserver
+		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
+			TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
+		}, transferFrameBytes)
+		self.conn.SetWriteDeadline(deadline)
+		nw, err := self.conn.Write(transferFrameBytes)
+		if nw < len(transferFrameBytes) && err == nil {
+			err = io.ErrShortWrite
+		}
+		endTransferProgress(progressObserver, progress, "p2p_write_end", err == nil, err)
+		if err != nil {
+			DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
+			return err
+		}
+		if stats := self.settings.DataPlaneStats; stats != nil && !isP2pStreamProbe(transferFrameBytes) {
+			if pairRecorded.CompareAndSwap(false, true) {
+				recordP2pSelectedPair(stats, self.conn)
 			}
+			stats.legacySendMessageCount.Add(1)
+			stats.legacySendByteCount.Add(uint64(len(transferFrameBytes)))
+		}
+		return nil
+	}
+	probeBurst := 0
+	for {
+		transferFrameBytes, ok := self.nextSend(&probeBurst)
+		if !ok {
+			return
+		}
+		{
 
 			// The detached WebRTC data channel is message-oriented: one Write
 			// becomes one whole SCTP user message the peer reads back whole, so
@@ -1181,9 +1458,18 @@ func (self *P2pSendTransport) run() {
 					fastConn.WaitFastPathReady(self.ctx, self.settings.ConnectTimeout)
 				}
 				if supportsFastPath && fastConn.FastPathReady() {
+					if legacyQueue != nil {
+						if err := legacyQueue.flush(); err != nil {
+							MessagePoolReturn(transferFrameBytes)
+							return
+						}
+					}
 					fragmentCount, err := fastConn.WriteFastPathMessage(transferFrameBytes)
 					if err == nil {
 						if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
+							if pairRecorded.CompareAndSwap(false, true) {
+								recordP2pSelectedPair(stats, self.conn)
+							}
 							stats.fastSendMessageCount.Add(1)
 							stats.fastSendByteCount.Add(uint64(messageByteCount))
 							stats.fastSendFragmentCount.Add(uint64(fragmentCount))
@@ -1211,19 +1497,39 @@ func (self *P2pSendTransport) run() {
 				}
 			}
 
-			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			nw, err := self.conn.Write(transferFrameBytes)
-			MessagePoolReturn(transferFrameBytes)
-			if nw < messageByteCount && err == nil {
-				err = io.ErrShortWrite
+			if legacyQueue == nil && self.settings.LegacySendQueueByteCount > 0 &&
+				!probeMessage && smallPacketPoolSize < messageByteCount &&
+				messageByteCount+p2pLegacySendHeaderByteCount <= p2pLegacySendSlabByteCount {
+				var budget *TransferMemoryBudget
+				if owner, ok := self.conn.(p2pLegacySendMemoryBudget); ok {
+					budget = owner.legacySendMemoryBudget()
+				}
+				var probeSender *P2pSendTransport
+				if self.probeRequests != nil || self.probeResponses != nil {
+					probeSender = self
+				}
+				legacyQueue = newP2pLegacySendQueueWithProbes(self.ctx, self.cancel, writeLegacy, self.settings.LegacySendQueueByteCount, budget, probeSender)
+			}
+			// WriteTimeout bounds one physical SCTP write, not its wait behind
+			// earlier writes. A queued absolute deadline can be nearly expired
+			// before an otherwise healthy write starts and tear down both P2P
+			// directions. Zero starts the unchanged timeout in writeLegacy;
+			// queue capacity/context and Transfer's ACK lifetime remain bounded
+			// independently, including during ordered flushes and priority waits.
+			deadline := time.Time{}
+			var err error
+			if legacyQueue != nil {
+				if probeMessage || messagePoolIsSmallUnordered(transferFrameBytes) {
+					err = legacyQueue.enqueuePriority(transferFrameBytes, deadline)
+				} else {
+					err = legacyQueue.enqueue(transferFrameBytes, deadline, messageByteCount <= smallPacketPoolSize)
+				}
+			} else {
+				err = writeLegacy(transferFrameBytes, deadline)
+				MessagePoolReturn(transferFrameBytes)
 			}
 			if err != nil {
-				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
 				return
-			}
-			if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-				stats.legacySendMessageCount.Add(1)
-				stats.legacySendByteCount.Add(uint64(messageByteCount))
 			}
 		}
 	}
@@ -1231,6 +1537,10 @@ func (self *P2pSendTransport) run() {
 
 func (self *P2pSendTransport) TransportId() Id {
 	return self.transportId
+}
+
+func (self *P2pSendTransport) TransportType() TransportType {
+	return TransportTypeP2p
 }
 
 // lower priority takes precedence
@@ -1294,17 +1604,34 @@ func (self *P2pSendTransport) Downgrade(source TransferPath) {
 type P2pReceiveTransport struct {
 	transportId Id
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	conn      net.Conn
-	streamId  Id
-	receive   chan []byte
-	done      chan struct{}
-	closeOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	conn     net.Conn
+	streamId Id
+	// receive is the reliable SCTP route. unreliableReceive is either the same
+	// compatibility route or a distinct production native-datagram route.
+	receive           chan []byte
+	unreliableReceive chan []byte
+	// pendingReceive is only the native SRTP carrier-reader handoff. A separate
+	// forwarding worker may wait on RouteManager, but the datagram pump never
+	// does. Reliable SCTP bypasses it and applies direct bounded backpressure.
+	pendingReceive             chan []byte
+	pendingReceiveMessageCount atomic.Int64
+	pendingReceiveMessageLimit int64
+	pendingReceiveByteCount    atomic.Int64
+	pendingReceiveByteLimit    int64
+	done                       chan struct{}
+	closeOnce                  sync.Once
 	// messageHandler consumes endpoint-only raw stream control before Client.
 	messageHandler func([]byte) bool
+	prefetched     [][]byte
 
 	settings *P2pTransportSettings
+	// Test-only barrier reached after reliable immediate admission finds a full
+	// route and before the cancellation-bounded wait begins.
+	beforeReliableReceiveWaitForTest func()
+	// Nil test barrier exposes queue publication before receive accounting.
+	afterFastReceiveEnqueueForTest func()
 	// Nil test barrier pauses after pooled receive drain and before done.
 	testingBeforeDoneForTest func()
 }
@@ -1334,27 +1661,261 @@ func newP2pReceiveTransport(
 	prefetched [][]byte,
 	messageHandler func([]byte) bool,
 ) (Transport, Route) {
-	receive := make(chan []byte, settings.ChannelBufferSize)
-	p2pReceiveTransport := &P2pReceiveTransport{
-		transportId:    NewId(),
-		ctx:            ctx,
-		cancel:         cancel,
-		conn:           conn,
-		streamId:       streamId,
-		receive:        receive,
-		done:           make(chan struct{}),
-		messageHandler: messageHandler,
-		settings:       settings,
+	transport, _ := newP2pReceiveTransportCore(
+		ctx,
+		cancel,
+		conn,
+		streamId,
+		settings,
+		prefetched,
+		messageHandler,
+		false,
+	)
+	return transport, transport.receive
+}
+
+func newP2pReceiveTransportWithLanes(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	streamId Id,
+	settings *P2pTransportSettings,
+	prefetched [][]byte,
+	messageHandler func([]byte) bool,
+) (*P2pReceiveTransport, []p2pReceiveRouteLane) {
+	transport, lanes := newP2pReceiveTransportCore(
+		ctx,
+		cancel,
+		conn,
+		streamId,
+		settings,
+		prefetched,
+		messageHandler,
+		true,
+	)
+	return transport, lanes
+}
+
+func newP2pReceiveTransportCore(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	streamId Id,
+	settings *P2pTransportSettings,
+	prefetched [][]byte,
+	messageHandler func([]byte) bool,
+	splitLanes bool,
+) (*P2pReceiveTransport, []p2pReceiveRouteLane) {
+	receive := make(chan []byte)
+	unreliableReceive := receive
+	if splitLanes {
+		unreliableReceive = make(chan []byte)
 	}
-	for _, message := range prefetched {
-		if messageHandler != nil && messageHandler(message) {
-			MessagePoolReturn(message)
-			continue
-		}
-		receive <- message
+	p2pReceiveTransport := &P2pReceiveTransport{
+		transportId:                NewId(),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		conn:                       conn,
+		streamId:                   streamId,
+		receive:                    receive,
+		unreliableReceive:          unreliableReceive,
+		pendingReceive:             make(chan []byte, p2pReceiveQueueMessageCount(settings)),
+		pendingReceiveMessageLimit: int64(p2pReceiveQueueMessageCount(settings)),
+		pendingReceiveByteLimit:    int64(p2pReceiveQueueByteCount(settings)),
+		done:                       make(chan struct{}),
+		messageHandler:             messageHandler,
+		prefetched:                 prefetched,
+		settings:                   settings,
 	}
 	go HandleError(p2pReceiveTransport.run, cancel)
-	return p2pReceiveTransport, receive
+	lanes := []p2pReceiveRouteLane{{
+		transport:   p2pReceiveTransport,
+		route:       receive,
+		reliability: CarrierReliabilityReliable,
+	}}
+	if splitLanes {
+		lanes = append(lanes, p2pReceiveRouteLane{
+			transport:   newReceiveLaneTransport(p2pReceiveTransport),
+			route:       unreliableReceive,
+			reliability: CarrierReliabilityUnreliable,
+		})
+	}
+	return p2pReceiveTransport, lanes
+}
+
+// offerReceive transfers one complete Transfer frame according to its exact
+// physical lane. Reliable SCTP waits directly for route capacity/cancellation;
+// native SRTP enters the bounded zero-wait queue consumed by runReceiveQueue.
+func (self *P2pReceiveTransport) offerReceive(
+	message []byte,
+	fast bool,
+	fragmentCount int,
+	probeMessage bool,
+	countDeliveredStats bool,
+) (success bool) {
+	progressObserver := self.settings.ProgressObserver
+	// This trace follows the reliable lane's actual handoff. Fast-lane
+	// success also means a deliberate queue drop; do not label that delivery.
+	if fast {
+		progressObserver = nil
+	}
+	progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+		Stage: "p2p_receive_begin", PeerId: self.transportId, SequenceId: self.streamId,
+		TransportType: TransportTypeP2p,
+	}, message)
+	if progressObserver != nil {
+		defer func() {
+			var err error
+			if !success {
+				err = self.ctx.Err()
+			}
+			endTransferProgress(progressObserver, progress, "p2p_receive_end", success, err)
+		}()
+	}
+	if !fast {
+		// Keep the ready path nonblocking and give tests an exact full-route
+		// barrier. The second select is the only cancellation-bounded wait.
+		select {
+		case <-self.ctx.Done():
+			MessagePoolReturn(message)
+			return false
+		default:
+		}
+		select {
+		case <-self.ctx.Done():
+			MessagePoolReturn(message)
+			return false
+		case self.receive <- message:
+			if stats := self.settings.DataPlaneStats; stats != nil &&
+				!probeMessage && countDeliveredStats {
+				stats.legacyReceiveMessageCount.Add(1)
+				stats.legacyReceiveByteCount.Add(uint64(len(message)))
+			}
+			return true
+		default:
+		}
+		if self.beforeReliableReceiveWaitForTest != nil {
+			self.beforeReliableReceiveWaitForTest()
+		}
+		select {
+		case <-self.ctx.Done():
+			MessagePoolReturn(message)
+			return false
+		case self.receive <- message:
+			if stats := self.settings.DataPlaneStats; stats != nil &&
+				!probeMessage && countDeliveredStats {
+				stats.legacyReceiveMessageCount.Add(1)
+				stats.legacyReceiveByteCount.Add(uint64(len(message)))
+			}
+			return true
+		}
+	}
+	if !self.reservePendingReceive(len(message)) {
+		self.recordReceiveQueueDrop(message, fast, probeMessage)
+		return true
+	}
+	select {
+	case <-self.ctx.Done():
+		self.releasePendingReceive(len(message))
+		MessagePoolReturn(message)
+		return false
+	case self.pendingReceive <- message:
+		if self.afterFastReceiveEnqueueForTest != nil {
+			self.afterFastReceiveEnqueueForTest()
+		}
+		if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage && countDeliveredStats {
+			if fast {
+				stats.fastReceiveMessageCount.Add(1)
+				stats.fastReceiveByteCount.Add(uint64(len(message)))
+				stats.fastReceiveFragmentCount.Add(uint64(max(0, fragmentCount)))
+			}
+		}
+		return true
+	default:
+		self.releasePendingReceive(len(message))
+		self.recordReceiveQueueDrop(message, fast, probeMessage)
+		return true
+	}
+}
+
+func (self *P2pReceiveTransport) recordReceiveQueueDrop(
+	message []byte,
+	fast bool,
+	probeMessage bool,
+) {
+	if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
+		if fast {
+			stats.fastReceiveQueueDropCount.Add(1)
+			stats.fastReceiveQueueDropByteCount.Add(uint64(len(message)))
+			stats.fastDropCount.Add(1)
+		} else {
+			stats.legacyReceiveQueueDropCount.Add(1)
+			stats.legacyReceiveQueueDropByteCount.Add(uint64(len(message)))
+		}
+	}
+	MessagePoolReturn(message)
+}
+
+func (self *P2pReceiveTransport) reservePendingReceive(byteCount int) bool {
+	if byteCount <= 0 {
+		return false
+	}
+	for {
+		current := self.pendingReceiveMessageCount.Load()
+		if self.pendingReceiveMessageLimit <= current {
+			return false
+		}
+		if self.pendingReceiveMessageCount.CompareAndSwap(current, current+1) {
+			break
+		}
+	}
+	delta := int64(byteCount)
+	for {
+		current := self.pendingReceiveByteCount.Load()
+		if self.pendingReceiveByteLimit < current+delta {
+			self.releasePendingReceiveMessage()
+			return false
+		}
+		if self.pendingReceiveByteCount.CompareAndSwap(current, current+delta) {
+			return true
+		}
+	}
+}
+
+func (self *P2pReceiveTransport) releasePendingReceive(byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	if remaining := self.pendingReceiveByteCount.Add(-int64(byteCount)); remaining < 0 {
+		panic("negative P2P receive queue byte count")
+	}
+	self.releasePendingReceiveMessage()
+}
+
+func (self *P2pReceiveTransport) releasePendingReceiveMessage() {
+	if remaining := self.pendingReceiveMessageCount.Add(-1); remaining < 0 {
+		panic("negative P2P receive queue message count")
+	}
+}
+
+// The only native-datagram worker allowed to wait for RouteManager consumption.
+// The SRTP reader enqueues to pendingReceive with a zero-wait send.
+func (self *P2pReceiveTransport) runReceiveQueue() {
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case message := <-self.pendingReceive:
+			select {
+			case <-self.ctx.Done():
+				self.releasePendingReceive(len(message))
+				MessagePoolReturn(message)
+				return
+			case self.unreliableReceive <- message:
+				self.releasePendingReceive(len(message))
+			}
+		}
+	}
 }
 
 // Close cancels this receive route and interrupts its read without closing the
@@ -1382,12 +1943,17 @@ func (self *P2pReceiveTransport) CloseAndWait(ctx context.Context) error {
 
 func (self *P2pReceiveTransport) run() {
 	defer close(self.done)
-	var fastWorker sync.WaitGroup
+	var receiveWorkers sync.WaitGroup
+	receiveWorkers.Add(1)
+	go HandleError(func() {
+		defer receiveWorkers.Done()
+		self.runReceiveQueue()
+	}, self.cancel)
 	if fastConn, ok := self.conn.(webRtcFastPathConn); ok &&
 		self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
-		fastWorker.Add(1)
+		receiveWorkers.Add(1)
 		go HandleError(func() {
-			defer fastWorker.Done()
+			defer receiveWorkers.Done()
 			self.runFast(fastConn)
 		}, self.cancel)
 	}
@@ -1395,7 +1961,7 @@ func (self *P2pReceiveTransport) run() {
 	// yet at shutdown.
 	defer func() {
 		self.cancel()
-		fastWorker.Wait()
+		receiveWorkers.Wait()
 		defer func() {
 			if self.testingBeforeDoneForTest != nil {
 				self.testingBeforeDoneForTest()
@@ -1403,16 +1969,39 @@ func (self *P2pReceiveTransport) run() {
 		}()
 		for {
 			select {
-			case b, ok := <-self.receive:
-				if !ok {
-					return
-				}
+			case b := <-self.pendingReceive:
+				self.releasePendingReceive(len(b))
 				MessagePoolReturn(b)
 			default:
 				return
 			}
 		}
 	}()
+
+	// The reliable-unordered ready-header reader may observe complete SCTP
+	// messages before the marker. Deliver them only after the route worker has
+	// started; constructor-time direct delivery would deadlock before RouteManager
+	// can publish the lane. Cancellation returns the untouched suffix exactly.
+	prefetched := self.prefetched
+	self.prefetched = nil
+	for messageIndex, message := range prefetched {
+		if self.messageHandler != nil && self.messageHandler(message) {
+			MessagePoolReturn(message)
+			continue
+		}
+		if !self.offerReceive(
+			message,
+			false,
+			0,
+			isP2pStreamProbe(message),
+			false,
+		) {
+			for _, remaining := range prefetched[messageIndex+1:] {
+				MessagePoolReturn(remaining)
+			}
+			return
+		}
+	}
 
 	// The detached WebRTC data channel is message-oriented. Read directly into
 	// the pooled buffer whose ownership is handed to the receive route. The
@@ -1462,16 +2051,9 @@ func (self *P2pReceiveTransport) run() {
 				}
 				continue
 			}
-			// The route now owns this exact slice and returns it to the pool.
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(transferFrameBytes)
+			// The route owns the exact slice only when immediate admission wins.
+			if !self.offerReceive(transferFrameBytes, false, 0, probeMessage, true) {
 				return
-			case self.receive <- transferFrameBytes:
-				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-					stats.legacyReceiveMessageCount.Add(1)
-					stats.legacyReceiveByteCount.Add(uint64(len(transferFrameBytes)))
-				}
 			}
 		}
 		if err != nil {
@@ -1487,8 +2069,7 @@ func (self *P2pReceiveTransport) run() {
 }
 
 // runFast transfers complete datagram-lane messages into the shared receive
-// route. This worker may apply route backpressure; the independent SRTP reader
-// retains a bounded queue and drops only after that queue is also exhausted.
+// route. It never propagates route backpressure into the native SRTP reader.
 func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 	messages := conn.FastPathMessages()
 	for {
@@ -1504,16 +2085,14 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 				MessagePoolReturn(received.message)
 				continue
 			}
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(received.message)
+			if !self.offerReceive(
+				received.message,
+				true,
+				received.fragmentCount,
+				probeMessage,
+				true,
+			) {
 				return
-			case self.receive <- received.message:
-				if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-					stats.fastReceiveMessageCount.Add(1)
-					stats.fastReceiveByteCount.Add(uint64(len(received.message)))
-					stats.fastReceiveFragmentCount.Add(uint64(received.fragmentCount))
-				}
 			}
 		}
 	}
@@ -1521,6 +2100,10 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 
 func (self *P2pReceiveTransport) TransportId() Id {
 	return self.transportId
+}
+
+func (self *P2pReceiveTransport) TransportType() TransportType {
+	return TransportTypeP2p
 }
 
 // lower priority takes precedence

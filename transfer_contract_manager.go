@@ -40,6 +40,10 @@ type ContractKey struct {
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// LogicalLane is local queue-generation identity only. It is intentionally
+	// absent from CreateContract: every lane requests the same backend contract
+	// class, but must not flush a sibling lane's pending queue on idle exit.
+	LogicalLane uint32
 	// NetworkPeer is contract sizing/retention policy, not routing identity:
 	// it is true only when the sender has an authenticated same-network
 	// relationship with Destination. Unlike ForceStream, it never classifies a
@@ -431,6 +435,11 @@ type ContractManager struct {
 	sendNoContractClientIds    map[Id]bool
 
 	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
+	// Multi-client windows install one nonblocking dispatcher per client and
+	// coalesce all of those clients into the window's single callback worker.
+	// Keeping this internal prevents a general caller from putting blocking work
+	// back on HandleControlFrame.
+	contractStatusDispatchCallbacks *CallbackList[ContractStatusFunction]
 
 	localStats *ContractManagerStats
 
@@ -484,26 +493,27 @@ func NewContractManager(
 	}
 
 	contractManager := &ContractManager{
-		ctx:                        managerCtx,
-		cancel:                     cancel,
-		client:                     client,
-		settings:                   settings,
-		provideSecretKeys:          map[protocol.ProvideMode][]byte{},
-		provideModes:               map[protocol.ProvideMode]bool{},
-		providePaused:              false,
-		provideMonitor:             NewMonitor(),
-		destinationContracts:       map[ContractKey]*contractQueue{},
-		receiveNoContractClientIds: receiveNoContractClientIds,
-		sendNoContractClientIds:    sendNoContractClientIds,
-		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
-		localStats:                 NewContractManagerStats(),
-		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
-		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
-		contractStatsSequences:     map[Id]uint64{},
-		controlSyncProvide:         NewControlSync(managerCtx, client, "provide"),
-		controlSyncProvideOob:      NewControlSyncOob(managerCtx, client, "provide-oob"),
-		workers:                    newLifecycleAdmission(),
-		closeControlSyncs:          map[*ControlSync]bool{},
+		ctx:                             managerCtx,
+		cancel:                          cancel,
+		client:                          client,
+		settings:                        settings,
+		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
+		provideModes:                    map[protocol.ProvideMode]bool{},
+		providePaused:                   false,
+		provideMonitor:                  NewMonitor(),
+		destinationContracts:            map[ContractKey]*contractQueue{},
+		receiveNoContractClientIds:      receiveNoContractClientIds,
+		sendNoContractClientIds:         sendNoContractClientIds,
+		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatusDispatchCallbacks: NewCallbackList[ContractStatusFunction](),
+		localStats:                      NewContractManagerStats(),
+		contractStatsEntries:            map[contractStatsKey]*contractStatsEntry{},
+		contractStatsCallbacks:          NewCallbackList[ContractStatsFunction](),
+		contractStatsSequences:          map[Id]uint64{},
+		controlSyncProvide:              NewControlSync(managerCtx, client, "provide"),
+		controlSyncProvideOob:           NewControlSyncOob(managerCtx, client, "provide-oob"),
+		workers:                         newLifecycleAdmission(),
+		closeControlSyncs:               map[*ControlSync]bool{},
 	}
 
 	if client.ClientId() != ControlId {
@@ -840,8 +850,35 @@ func (self *ContractManager) AddContractStatusCallback(contractStatusCallback Co
 	}
 }
 
+// addContractStatusDispatchCallback registers an internal callback whose only
+// permitted work is a bounded, nonblocking Dispatch into a parent-owned
+// worker. RemoteUserNatMultiClient uses it to avoid allocating a goroutine and
+// SequenceBufferSize-sized ring for every exit when one coalescer per window is
+// sufficient. Public callbacks continue through AddContractStatusCallback and
+// retain independent failure containment.
+func (self *ContractManager) addContractStatusDispatchCallback(
+	contractStatusCallback ContractStatusFunction,
+) func() {
+	if contractStatusCallback == nil {
+		return func() {}
+	}
+	self.mutex.Lock()
+	if self.closed {
+		self.mutex.Unlock()
+		return func() {}
+	}
+	callbackId := self.contractStatusDispatchCallbacks.Add(contractStatusCallback)
+	self.mutex.Unlock()
+	return func() {
+		self.contractStatusDispatchCallbacks.Remove(callbackId)
+	}
+}
+
 // ContractStatusFunction
 func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
+	for _, dispatch := range self.contractStatusDispatchCallbacks.Get() {
+		dispatch(contractStatus)
+	}
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		contractStatusCallback.Dispatch(contractStatus)
 	}
@@ -1245,23 +1282,68 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	reason := verifyFailureReason(
+		self.providePaused,
+		self.provideModes,
+		self.provideSecretKeys,
+		provideMode,
+		func(provideSecretKey []byte) bool {
+			return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+		},
+	)
+	if reason != "" {
+		self.logVerifyFailure(provideMode, reason)
+		return false
+	}
+	return true
+}
+
+// verifyFailureReason names why a contract cannot be verified, or "" when it
+// can. A bare "verification failed" cannot separate a missing per-mode secret
+// from an HMAC mismatch, and those have completely different causes: a key the
+// platform is not signing with, versus a signing disagreement. Pure, so every
+// branch is testable without a client.
+func verifyFailureReason(
+	providePaused bool,
+	provideModes map[protocol.ProvideMode]bool,
+	provideSecretKeys map[protocol.ProvideMode][]byte,
+	provideMode protocol.ProvideMode,
+	verifyHmac func(provideSecretKey []byte) bool,
+) string {
 	// when paused, only allow ProvideMode_Stream for return traffic and
 	// ProvideMode_Network for network peers (pause stops public/ff only)
-	if self.providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
-		return false
+	if providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
+		return "paused"
 	}
-
-	if !self.provideModes[provideMode] {
-		return false
+	if !provideModes[provideMode] {
+		return "mode-not-enabled"
 	}
-
-	provideSecretKey, ok := self.provideSecretKeys[provideMode]
+	provideSecretKey, ok := provideSecretKeys[provideMode]
 	if !ok {
-		// provide mode is not enabled
-		return false
+		return "no-secret-key"
 	}
+	if !verifyHmac(provideSecretKey) {
+		return "hmac-mismatch"
+	}
+	return ""
+}
 
-	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+// logVerifyFailure records the reason a contract failed verification. The
+// secret itself is never logged, only its length. V(1), so it costs nothing in
+// normal operation.
+func (self *ContractManager) logVerifyFailure(provideMode protocol.ProvideMode, reason string) {
+	if self.client == nil {
+		return
+	}
+	if v := self.client.log.V(1); v.Enabled() {
+		v.Infof(
+			"[contract]verify failed mode=%s reason=%s mode_enabled=%v secret_len=%d\n",
+			provideMode,
+			reason,
+			self.provideModes[provideMode],
+			len(self.provideSecretKeys[provideMode]),
+		)
+	}
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
@@ -1451,32 +1533,70 @@ func (self *ContractManager) addContractToQueue(
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
+	// Linearize result publication with Close. Once shutdown's final flush
+	// starts, a returned reservation must use the existing retired-result close
+	// path, never repopulate a queue that no worker will consume or flush again.
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return errContractQueueDrained
+	}
 	return contractQueue.Add(contract, storedContract)
 }
 
+// Coalesces an identical pending request within its exact queue generation.
+// Completion releases admission; this is not remote exactly-once semantics.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	// The external OOB owns transport and frame buffers; this manager owns its
+	// callback until it has consumed or closed every returned reservation. The
+	// generator joins the Client before closing OOB admission, so retaining this
+	// owner also retains permission for the callback's bounded shutdown close.
+	self.mutex.Lock()
+	if self.closed || !self.workers.start() {
+		self.mutex.Unlock()
+		return
+	}
+	self.mutex.Unlock()
+
 	// Retain ownership through the asynchronous callback. A route promotion can
 	// force-remove and drain this exact generation while the request is in
 	// flight; the callback then rejects and closes its stale result instead of
 	// reopening the old key.
 	contractQueue := self.openContractQueue(contractKey)
+	request := contractCreateRequest{
+		key:               contractKey,
+		seqIndex:          contractSeqIndex,
+		transferByteCount: self.contractByteCount(contractKey, contractSeqIndex, minByteCount),
+	}
+	if !contractQueue.beginCreate(request) {
+		self.closeContractQueue(contractKey, contractQueue)
+		self.workers.finish()
+		return
+	}
+	finish := func() {
+		defer self.workers.finish()
+		contractQueue.finishCreate(request)
+		self.closeContractQueue(contractKey, contractQueue)
+	}
 
 	streamVersion := uint32(DefaultStreamVersion)
+	senderRole := contractKey.EncryptionRole.toProtobuf()
 
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
-		TransferByteCount: uint64(self.contractByteCount(contractKey, contractSeqIndex, minByteCount)),
+		TransferByteCount: uint64(request.transferByteCount),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
+		SenderRole:        &senderRole,
 	}
 	if self.settings.TrackUsedContracts {
 		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()
 	}
 	frame, err := ToFrame(createContract, self.settings.ProtocolVersion)
 	if err != nil {
-		self.closeContractQueue(contractKey, contractQueue)
+		finish()
 		self.client.log.Infof("[contract]could not create contract frame = %s", err)
 		return
 	}
@@ -1488,7 +1608,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
-			defer self.closeContractQueue(contractKey, contractQueue)
+			defer finish()
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
@@ -1628,11 +1748,16 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// holds little state — a mutex, a monitor, and a derived context
 	// — and its supervisor goroutine exits on success or when the
 	// parent context closes, so there's no long-lived leak.
+	// One identity belongs to this logical incremental report. ControlSync
+	// retransfers and the closed-client OOB path keep the serialized frame;
+	// another equal-byte checkpoint is a different operation with a new ID.
+	// Deploy only after every backend route supports close-report identities.
 	frame, err := ToFrame(&protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
+		ReportId:         NewId().Bytes(),
 	}, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
@@ -1875,6 +2000,14 @@ type queuedContract struct {
 	enqueueTime time.Time
 }
 
+// The original key also fences legacy queues that intentionally collapse
+// routing keys. Successor indices and larger reservations are not retries.
+type contractCreateRequest struct {
+	key               ContractKey
+	seqIndex          uint64
+	transferByteCount ByteCount
+}
+
 type contractQueue struct {
 	updateMonitor *Monitor
 	log           Logger
@@ -1883,6 +2016,9 @@ type contractQueue struct {
 	openCount int
 	contracts map[Id]*queuedContract
 	drained   bool
+	// Only externally owned in-flight callbacks retain entries. No process
+	// budget, completed-request cache, or retry timer is introduced here.
+	pendingCreates map[contractCreateRequest]bool
 
 	// remember all added contract ids
 	trackUsedContracts bool
@@ -1894,6 +2030,28 @@ type contractQueue struct {
 }
 
 var errContractQueueDrained = errors.New("contract queue drained")
+
+// Linearizes nonblocking admission under this queue generation's lock.
+func (self *contractQueue) beginCreate(request contractCreateRequest) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.drained || self.pendingCreates[request] {
+		return false
+	}
+	if self.pendingCreates == nil {
+		self.pendingCreates = map[contractCreateRequest]bool{}
+	}
+	self.pendingCreates[request] = true
+	return true
+}
+
+// Releases only this generation after its response processing has completed.
+// Queue waiters retain their existing bounded retry and contract notifications.
+func (self *contractQueue) finishCreate(request contractCreateRequest) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	delete(self.pendingCreates, request)
+}
 
 func newContractQueue(log Logger, trackUsedContracts bool) *contractQueue {
 	return &contractQueue{

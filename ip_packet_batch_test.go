@@ -4,11 +4,298 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Closing either dispatch topology must return every pooled packet that was
+// accepted into a queue but not yet handed to a protocol flow.
+func TestLocalUserNatCloseReturnsQueuedPacketOwnership(t *testing.T) {
+	for _, shardCount := range []int{1, 4} {
+		t.Run(fmt.Sprintf("shards-%d", shardCount), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			settings := DefaultLocalUserNatSettingsWithBufferSize(64)
+			settings.SendShardCount = shardCount
+			localUserNat := NewLocalUserNat(ctx, "close-queue-ownership", settings)
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var blockOnce sync.Once
+			localUserNat.afterSendPacketForTest = func() {
+				blockOnce.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+
+			// The malformed lead packet is returned synchronously by the worker,
+			// then its test edge holds that worker while the owned queue fills.
+			lead := MessagePoolCopy([]byte{0xff})
+			if !localUserNat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Public, lead, time.Second) {
+				MessagePoolReturn(lead)
+				t.Fatal("lead packet was not admitted")
+			}
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("local NAT worker did not reach the disposition edge")
+			}
+
+			witnesses := make([][]byte, 64)
+			for packetIndex := range witnesses {
+				packet := MessagePoolCopy([]byte{0xff})
+				witnesses[packetIndex] = MessagePoolShareReadOnly(packet)
+				if !localUserNat.SendPacket(
+					SourceId(NewId()),
+					protocol.ProvideMode_Public,
+					packet,
+					time.Second,
+				) {
+					MessagePoolReturn(packet)
+					for _, witness := range witnesses[:packetIndex+1] {
+						MessagePoolReturn(witness)
+					}
+					close(release)
+					localUserNat.Close()
+					t.Fatalf("queued packet %d was not admitted", packetIndex)
+				}
+			}
+
+			localUserNat.Close()
+			close(release)
+			select {
+			case <-localUserNat.runDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("local NAT shutdown did not finish")
+			}
+			requireIpPacketBatchWitnessesReleased(t, witnesses)
+		})
+	}
+}
+
+// The joining close cannot publish completion while a packet-owning worker is
+// held, and every queued owner is returned before that completion is visible.
+func TestLocalUserNatCloseAndWaitJoinsQueuedPacketOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultLocalUserNatSettingsWithBufferSize(8)
+	localUserNat := NewLocalUserNat(ctx, "close-wait-queue-ownership", settings)
+
+	workerEntered := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var blockOnce sync.Once
+	localUserNat.afterSendPacketForTest = func() {
+		blockOnce.Do(func() {
+			close(workerEntered)
+			<-releaseWorker
+		})
+	}
+	waitEntered := make(chan struct{})
+	localUserNat.beforeRunDoneWaitForTest = func() {
+		close(waitEntered)
+	}
+
+	lead := MessagePoolCopy([]byte{0xff})
+	if !localUserNat.SendPacket(
+		SourceId(NewId()),
+		protocol.ProvideMode_Public,
+		lead,
+		time.Second,
+	) {
+		MessagePoolReturn(lead)
+		t.Fatal("lead packet was not admitted")
+	}
+	select {
+	case <-workerEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local NAT worker did not reach the disposition edge")
+	}
+
+	packet := MessagePoolCopy([]byte{0xff})
+	witness := MessagePoolShareReadOnly(packet)
+	if !localUserNat.SendPacket(
+		SourceId(NewId()),
+		protocol.ProvideMode_Public,
+		packet,
+		time.Second,
+	) {
+		MessagePoolReturn(packet)
+		MessagePoolReturn(witness)
+		close(releaseWorker)
+		t.Fatal("queued packet was not admitted")
+	}
+
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer joinCancel()
+	joinResult := make(chan error, 1)
+	go func() {
+		joinResult <- localUserNat.CloseAndWait(joinCtx)
+	}()
+	select {
+	case <-waitEntered:
+	case <-joinCtx.Done():
+		close(releaseWorker)
+		t.Fatalf("joining close did not reach its ownership barrier: %v", joinCtx.Err())
+	}
+	select {
+	case err := <-joinResult:
+		close(releaseWorker)
+		t.Fatalf("joining close returned while the packet worker was held: %v", err)
+	default:
+	}
+
+	close(releaseWorker)
+	select {
+	case err := <-joinResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-joinCtx.Done():
+		t.Fatalf("joining close did not finish after worker release: %v", joinCtx.Err())
+	}
+	if !MessagePoolReturn(witness) {
+		t.Fatal("queued packet owner remained live after joining close")
+	}
+}
+
+// A joining close cannot publish completion after dispatch has stopped while
+// a TCP sequence still owns its first queued packet.
+func TestLocalUserNatCloseAndWaitJoinsTcpSequenceOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultLocalUserNatSettingsWithBufferSize(8)
+	sequenceEntered := make(chan struct{})
+	releaseSequence := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseSequence) })
+	}
+	defer release()
+	settings.TcpBufferSettings.beforeSequenceRunForTest = func() {
+		close(sequenceEntered)
+		<-releaseSequence
+	}
+	flowWaitEntered := make(chan struct{})
+	settings.beforeFlowWorkersWaitForTest = func() {
+		close(flowWaitEntered)
+	}
+	localUserNat := NewLocalUserNat(ctx, "close-wait-tcp-ownership", settings)
+
+	ipPath := &IpPath{
+		Version:         4,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IPv4(10, 0, 0, 9),
+		SourcePort:      40001,
+		DestinationIp:   net.IPv4(203, 0, 113, 7),
+		DestinationPort: 443,
+	}
+	packet := MessagePoolCopy(ipOosTcpPacketSequence(ipPath, tcpFlagSyn, 1000, nil))
+	earlyWitness := MessagePoolShareReadOnly(packet)
+	finalWitness := MessagePoolShareReadOnly(packet)
+	earlyWitnessLive := true
+	finalWitnessLive := true
+	defer func() {
+		if earlyWitnessLive {
+			MessagePoolReturn(earlyWitness)
+		}
+		if finalWitnessLive {
+			MessagePoolReturn(finalWitness)
+		}
+	}()
+	if !localUserNat.SendPacket(
+		SourceId(NewId()),
+		protocol.ProvideMode_Public,
+		packet,
+		time.Second,
+	) {
+		MessagePoolReturn(packet)
+		t.Fatal("TCP SYN was not admitted")
+	}
+	select {
+	case <-sequenceEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("TCP sequence did not reach the held ownership edge")
+	}
+
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer joinCancel()
+	joinResult := make(chan error, 1)
+	go func() {
+		joinResult <- localUserNat.CloseAndWait(joinCtx)
+	}()
+	select {
+	case <-flowWaitEntered:
+	case <-joinCtx.Done():
+		t.Fatalf("local NAT did not reach its flow-worker join: %v", joinCtx.Err())
+	}
+	select {
+	case err := <-joinResult:
+		t.Fatalf("joining close returned while the TCP owner was held: %v", err)
+	default:
+	}
+	if MessagePoolReturn(earlyWitness) {
+		earlyWitnessLive = false
+		t.Fatal("held TCP sequence did not retain production packet ownership")
+	}
+	earlyWitnessLive = false
+
+	release()
+	select {
+	case err := <-joinResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-joinCtx.Done():
+		t.Fatalf("joining close did not finish after TCP release: %v", joinCtx.Err())
+	}
+	if !MessagePoolReturn(finalWitness) {
+		finalWitnessLive = false
+		t.Fatal("TCP sequence ownership remained live after joining close")
+	}
+	finalWitnessLive = false
+}
+
+// A producer admitted before cancellation may publish after a receive worker's
+// cancellation drain. The terminal wait performs one final drain only after
+// every producer has joined.
+func TestUdpReceiveDispatcherTerminalWaitDrainsLateAdmittedPacket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultUdpBufferSettingsWithBufferSize(1)
+	dispatcher := newUdpReceiveDispatcher(ctx, settings)
+	shard := &dispatcher.shards[0]
+	workerDone := make(chan struct{})
+	dispatcher.waitGroup.Add(1)
+	go func() {
+		defer dispatcher.waitGroup.Done()
+		defer close(workerDone)
+		shard.run()
+	}()
+	cancel()
+	select {
+	case <-workerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP receive dispatcher did not stop")
+	}
+
+	packet := MessagePoolCopy([]byte{0xff})
+	witness := MessagePoolShareReadOnly(packet)
+	shard.items <- udpReceiveDispatchItem{packet: packet}
+	dispatcher.waitForLifecycle()
+	if MessagePoolReturn(witness) {
+		return
+	}
+
+	// Reclaim the production owner on old behavior so a regression failure
+	// cannot contaminate later process-wide pool assertions.
+	returnQueuedUdpDispatchItems(shard.items)
+	t.Fatal("terminal UDP dispatcher wait left a late admitted packet queued")
+}
 
 // Returns pooled UDP packet bytes suitable for exact directional-flow tests.
 func ipPacketBatchTestPacket(sourcePort int, destinationPort int, payload string) []byte {
@@ -97,6 +384,55 @@ func TestGroupIpPacketsPreservesDirectionalFlowOrder(t *testing.T) {
 	MessagePoolReturn(flowAFirst)
 }
 
+func TestGroupIpPacketsBoundedSplitsOwnershipWithoutRejectingPackets(t *testing.T) {
+	packets := [][]byte{
+		ipPacketBatchTestPacket(41101, 443, "a"),
+		ipPacketBatchTestPacket(41101, 443, "b"),
+		ipPacketBatchTestPacket(41101, 443, "c"),
+		ipPacketBatchTestPacket(41101, 443, "d"),
+		ipPacketBatchTestPacket(41101, 443, "e"),
+	}
+	defer func() {
+		for _, packet := range packets {
+			MessagePoolReturn(packet)
+		}
+	}()
+
+	groups, rejected := groupIpPacketsBounded(packets, 2, mib(1))
+	if len(rejected) != 0 {
+		t.Fatalf("bounded grouping rejected %d valid packets", len(rejected))
+	}
+	wantCounts := []int{2, 2, 1}
+	if len(groups) != len(wantCounts) {
+		t.Fatalf("group count = %d, want %d", len(groups), len(wantCounts))
+	}
+	packetIndex := 0
+	for groupIndex, group := range groups {
+		if len(group.packets) != wantCounts[groupIndex] {
+			t.Fatalf("group %d packets = %d, want %d", groupIndex, len(group.packets), wantCounts[groupIndex])
+		}
+		for _, packet := range group.packets {
+			if &packet[0] != &packets[packetIndex][0] {
+				t.Fatalf("group order changed at packet %d", packetIndex)
+			}
+			packetIndex++
+		}
+	}
+
+	// A byte bound splits before crossing it, but cannot make one otherwise
+	// valid oversized packet impossible to send.
+	byteBound := ByteCount(len(packets[0]) + len(packets[1]) - 1)
+	groups, rejected = groupIpPacketsBounded(packets[:2], 8, byteBound)
+	if len(rejected) != 0 || len(groups) != 2 ||
+		len(groups[0].packets) != 1 || len(groups[1].packets) != 1 {
+		t.Fatalf("byte-bounded groups = %#v rejected=%d", groups, len(rejected))
+	}
+	groups, rejected = groupIpPacketsBounded(packets[:1], 8, 1)
+	if len(rejected) != 0 || len(groups) != 1 || len(groups[0].packets) != 1 {
+		t.Fatal("oversized singleton was rejected by the ownership bound")
+	}
+}
+
 // Local admission is all-or-nothing, while the additive batch API consumes
 // every input on both admission outcomes and reports the exact accepted count.
 func TestLocalUserNatSendPacketBatchConsumesAllPackets(t *testing.T) {
@@ -123,12 +459,22 @@ func TestLocalUserNatSendPacketBatchConsumesAllPackets(t *testing.T) {
 	if acceptedCount != len(acceptedPackets) {
 		t.Fatalf("accepted count = %d, want %d", acceptedCount, len(acceptedPackets))
 	}
+	acceptedFirst := acceptedPackets[0]
+	acceptedPackets[0] = nil
 	queued := <-localUserNat.sendPackets
+	defer queued.finish()
 	if len(queued.packets) != len(acceptedPackets) {
 		t.Fatalf("queued packet count = %d, want %d", len(queued.packets), len(acceptedPackets))
 	}
+	if queued.packets[0] == nil || &queued.packets[0][0] != &acceptedFirst[0] {
+		t.Fatal("queued packet list aliases caller slice metadata")
+	}
 	for packetIndex, packet := range queued.packets {
-		if &packet[0] != &acceptedPackets[packetIndex][0] {
+		wantPacket := acceptedPackets[packetIndex]
+		if packetIndex == 0 {
+			wantPacket = acceptedFirst
+		}
+		if &packet[0] != &wantPacket[0] {
 			t.Fatalf("queued packet %d is not the exact input", packetIndex)
 		}
 		MessagePoolReturn(packet)
@@ -232,6 +578,7 @@ func TestRemoteUserNatProviderGroupsIngressByDirectionalTuple(t *testing.T) {
 	}
 	for groupIndex, wantPacketIndexes := range wantGroupIndexes {
 		queued := <-localUserNat.sendPackets
+		defer queued.finish()
 		if queued.source != source.LocalMask() || queued.transferKey != transferKey {
 			t.Fatalf("group %d metadata = (%s, %#v), want (%s, %#v)", groupIndex, queued.source, queued.transferKey, source.LocalMask(), transferKey)
 		}

@@ -18,6 +18,24 @@ type combineItem struct {
 	updateTime time.Time
 
 	heapIndex int
+	// retainedByteCount includes the item, its fragment pointer table, every
+	// packet wrapper, and each pooled fragment backing allocation.
+	retainedByteCount ByteCount
+	payloadByteCount  ByteCount
+}
+
+const (
+	combineItemRetainedByteCount    ByteCount = 256
+	combinePacketRetainedByteCount  ByteCount = 48
+	combinePointerRetainedByteCount ByteCount = 8
+)
+
+func newCombineItemRetainedByteCount(fragmentCount int) ByteCount {
+	return combineItemRetainedByteCount + ByteCount(fragmentCount)*combinePointerRetainedByteCount
+}
+
+func combineFragmentRetainedByteCount(data []byte) ByteCount {
+	return combinePacketRetainedByteCount + MessagePoolMetaByteCount + ByteCount(cap(data))
 }
 
 // func newCombineItem(key [17]byte) *combineItem {
@@ -36,6 +54,8 @@ type combineQueue struct {
 	orderedItems  []*combineItem
 	keyItems      map[[17]byte]*combineItem
 	addrItemCount map[string]int
+	addrByteCount map[string]ByteCount
+	retainedBytes ByteCount
 }
 
 func newCombineQueue(settings *PacketTranslationSettings) *combineQueue {
@@ -44,23 +64,28 @@ func newCombineQueue(settings *PacketTranslationSettings) *combineQueue {
 		orderedItems:  []*combineItem{},
 		keyItems:      map[[17]byte]*combineItem{},
 		addrItemCount: map[string]int{},
+		addrByteCount: map[string]ByteCount{},
 	}
 	heap.Init(cq)
 	return cq
 }
 
-func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
-	for 0 < len(self.orderedItems) && self.orderedItems[0].updateTime.Before(minUpdateTime) {
-		item := heap.Remove(self, 0).(*combineItem)
-
-		delete(self.keyItems, item.key)
-
-		if c := self.addrItemCount[item.addr.String()]; c <= 1 {
-			delete(self.addrItemCount, item.addr.String())
-		} else {
-			self.addrItemCount[item.addr.String()] = c - 1
-		}
-
+func (self *combineQueue) remove(item *combineItem, releasePackets bool) {
+	heap.Remove(self, item.heapIndex)
+	delete(self.keyItems, item.key)
+	addrKey := item.addr.String()
+	if c := self.addrItemCount[addrKey]; c <= 1 {
+		delete(self.addrItemCount, addrKey)
+	} else {
+		self.addrItemCount[addrKey] = c - 1
+	}
+	if bytes := self.addrByteCount[addrKey] - item.retainedByteCount; bytes <= 0 {
+		delete(self.addrByteCount, addrKey)
+	} else {
+		self.addrByteCount[addrKey] = bytes
+	}
+	self.retainedBytes -= item.retainedByteCount
+	if releasePackets {
 		for _, p := range item.packets {
 			if p != nil {
 				MessagePoolReturn(p.data)
@@ -69,20 +94,46 @@ func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
 	}
 }
 
+func (self *combineQueue) OldestUpdateTime() (time.Time, bool) {
+	if len(self.orderedItems) == 0 {
+		return time.Time{}, false
+	}
+	return self.orderedItems[0].updateTime, true
+}
+
+func (self *combineQueue) RetainedByteCount() ByteCount {
+	return self.retainedBytes
+}
+
+func (self *combineQueue) RemoveOlder(minUpdateTime time.Time) {
+	for 0 < len(self.orderedItems) && !self.orderedItems[0].updateTime.After(minUpdateTime) {
+		self.remove(self.orderedItems[0], true)
+	}
+}
+
 func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (out *packet, limit bool, err error) {
 	c := uint8(header[16])
 	i := uint8(header[17])
 
+	if c == 0 {
+		err = fmt.Errorf("fragment count must be positive")
+		return
+	}
 	if c <= i {
 		err = fmt.Errorf("index must be less than count %d <= %d", c, i)
 		return
 	}
 
 	key := [17]byte(header[:])
+	if self.settings.DnsMaxCombineFragmentCount < int(c) {
+		limit = true
+		return
+	}
 
 	item, ok := self.keyItems[key]
 	if !ok {
-		if self.settings.DnsMaxCombinePerAddress <= self.addrItemCount[addr.String()] {
+		addrKey := addr.String()
+		if self.settings.DnsMaxCombinePerAddress <= self.addrItemCount[addrKey] {
 			// fmt.Printf("LIMIT ADDR (%d)\n", self.addrItemCount[addr.String()])
 			limit = true
 			return
@@ -94,20 +145,46 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 			return
 		}
 
-		c := uint8(key[16])
 		item = &combineItem{
-			key:     key,
-			addr:    addr,
-			packets: make([]*packet, c),
+			key:               key,
+			addr:              addr,
+			packets:           make([]*packet, c),
+			retainedByteCount: newCombineItemRetainedByteCount(int(c)),
 		}
-
 	}
 
-	if item.packets[i] == nil {
+	oldPacket := item.packets[i]
+	oldRetainedByteCount := ByteCount(0)
+	oldPayloadByteCount := ByteCount(0)
+	if oldPacket != nil {
+		oldRetainedByteCount = combineFragmentRetainedByteCount(oldPacket.data)
+		oldPayloadByteCount = ByteCount(len(oldPacket.data))
+	}
+	retainedDelta := combineFragmentRetainedByteCount(data) - oldRetainedByteCount
+	payloadDelta := ByteCount(len(data)) - oldPayloadByteCount
+	if self.settings.DnsMaxCombinedPacketByteCount < item.payloadByteCount+payloadDelta {
+		limit = true
+		return
+	}
+	prospectiveItemBytes := item.retainedByteCount + retainedDelta
+	addrKey := item.addr.String()
+	prospectiveTotalBytes := self.retainedBytes + retainedDelta
+	prospectiveAddressBytes := self.addrByteCount[addrKey] + retainedDelta
+	if !ok {
+		prospectiveTotalBytes += item.retainedByteCount
+		prospectiveAddressBytes += item.retainedByteCount
+	}
+	if self.settings.DnsMaxCombineBytes < prospectiveTotalBytes ||
+		self.settings.DnsMaxCombineBytesPerAddress < prospectiveAddressBytes {
+		limit = true
+		return
+	}
+
+	if oldPacket == nil {
 		item.n += 1
 	} else {
 		// duplicate fragment index; release the prior buffer
-		MessagePoolReturn(item.packets[i].data)
+		MessagePoolReturn(oldPacket.data)
 	}
 	item.packets[i] = &packet{
 		data: data,
@@ -115,6 +192,12 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 	}
 	item.updateAddr = addr
 	item.updateTime = time.Now()
+	item.retainedByteCount = prospectiveItemBytes
+	item.payloadByteCount += payloadDelta
+	if ok {
+		self.retainedBytes += retainedDelta
+		self.addrByteCount[addrKey] += retainedDelta
+	}
 
 	if item.n == len(item.packets) {
 		// combine the data
@@ -142,22 +225,16 @@ func (self *combineQueue) Combine(addr net.Addr, header [18]byte, data []byte) (
 		}
 
 		if ok {
-			heap.Remove(self, item.heapIndex)
-
-			delete(self.keyItems, item.key)
-
-			if c := self.addrItemCount[addr.String()]; c <= 1 {
-				delete(self.addrItemCount, addr.String())
-			} else {
-				self.addrItemCount[addr.String()] = c - 1
-			}
+			self.remove(item, false)
 		}
 
 	} else if !ok {
 		heap.Push(self, item)
 
 		self.keyItems[item.key] = item
-		self.addrItemCount[addr.String()] += 1
+		self.addrItemCount[addrKey] += 1
+		self.addrByteCount[addrKey] += item.retainedByteCount
+		self.retainedBytes += item.retainedByteCount
 	} else {
 		heap.Fix(self, item.heapIndex)
 	}
@@ -207,6 +284,9 @@ type pumpItem struct {
 	header     [18]byte
 	tld        []byte
 	updateTime time.Time
+	// insertion order within the owning pumpQueue, assigned by Add.
+	// zero for an item that was never added.
+	seq uint64
 
 	heapIndex    int
 	maxHeapIndex int
@@ -219,6 +299,14 @@ type pumpQueue struct {
 	orderedItems []*pumpItem
 
 	addrMaxHeap map[string]*pumpQueueMaxHeap
+
+	// counter for pumpItem.seq, which breaks ties between items stamped with the
+	// same updateTime. updateTime alone is only a partial order, and a heap over
+	// a partial order returns an arbitrary element among ties, so RemoveLast
+	// would not reliably return the most recently added item. That is not a rare
+	// edge case: time.Now() advances every ~500us on Windows, so a burst of adds
+	// lands wholly inside one tick and the ties are the normal case there.
+	seq uint64
 
 	settings *PacketTranslationSettings
 }
@@ -275,11 +363,13 @@ func (self *pumpQueue) RemoveLastN(addr net.Addr, n int) []*pumpItem {
 	return items
 }
 
+// removes every item that was updated at or before minUpdateTime.
+// see combineQueue.RemoveOlder for why the boundary is inclusive.
 func (self *pumpQueue) RemoveOlder(minUpdateTime time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	for 0 < len(self.orderedItems) && self.orderedItems[0].updateTime.Before(minUpdateTime) {
+	for 0 < len(self.orderedItems) && !self.orderedItems[0].updateTime.After(minUpdateTime) {
 		item := heap.Remove(self, 0).(*pumpItem)
 		maxHeap, ok := self.addrMaxHeap[item.addr.String()]
 		if ok {
@@ -289,6 +379,15 @@ func (self *pumpQueue) RemoveOlder(minUpdateTime time.Time) {
 			}
 		}
 	}
+}
+
+func (self *pumpQueue) OldestUpdateTime() (time.Time, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.orderedItems) == 0 {
+		return time.Time{}, false
+	}
+	return self.orderedItems[0].updateTime, true
 }
 
 func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
@@ -315,6 +414,8 @@ func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
 	}
 
 	item.updateTime = time.Now()
+	self.seq += 1
+	item.seq = self.seq
 
 	heap.Push(self, item)
 	heap.Push(maxHeap, item)
@@ -344,8 +445,15 @@ func (self *pumpQueue) Len() int {
 	return len(self.orderedItems)
 }
 
+// ordered by update time ascending, ties broken by insertion order so that the
+// order is total. see pumpQueue.seq
 func (self *pumpQueue) Less(i int, j int) bool {
-	return self.orderedItems[i].updateTime.Before(self.orderedItems[j].updateTime)
+	a := self.orderedItems[i]
+	b := self.orderedItems[j]
+	if a.updateTime.Equal(b.updateTime) {
+		return a.seq < b.seq
+	}
+	return a.updateTime.Before(b.updateTime)
 }
 
 func (self *pumpQueue) Swap(i int, j int) {
@@ -409,8 +517,17 @@ func (self *pumpQueueMaxHeap) Len() int {
 	return len(self.orderedItems)
 }
 
+// ordered by update time descending, ties broken by insertion order so that the
+// order is total. see pumpQueue.seq. RemoveLast reads the head of this heap, so
+// without the tiebreak it returns an arbitrary item from the newest tick rather
+// than the most recently added one.
 func (self *pumpQueueMaxHeap) Less(i int, j int) bool {
-	return self.orderedItems[j].updateTime.Before(self.orderedItems[i].updateTime)
+	a := self.orderedItems[i]
+	b := self.orderedItems[j]
+	if a.updateTime.Equal(b.updateTime) {
+		return b.seq < a.seq
+	}
+	return b.updateTime.Before(a.updateTime)
 }
 
 func (self *pumpQueueMaxHeap) Swap(i int, j int) {

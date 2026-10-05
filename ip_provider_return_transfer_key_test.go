@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -365,6 +366,8 @@ func providerReturnAckRecordFromWire(
 
 // Installs a deliberately paused send sequence so a test can inspect the
 // exact provider return pack before a sequence worker serializes it.
+// Real sequences belong to the Client; provider/source cancellation arrives
+// through each Pack's context, not through the shared sequence lifetime.
 func installProviderReturnTestSequence(
 	t *testing.T,
 	provider *RemoteUserNatProvider,
@@ -373,7 +376,7 @@ func installProviderReturnTestSequence(
 ) *SendSequence {
 	t.Helper()
 	sequence := &SendSequence{
-		ctx:           provider.ctx,
+		ctx:           client.Ctx(),
 		cancel:        func() {},
 		packs:         make(chan *SendPack, 1),
 		idleCondition: NewIdleCondition(),
@@ -481,6 +484,7 @@ func TestRemoteUserNatProviderIngressPreservesTransferKey(t *testing.T) {
 
 	select {
 	case queued := <-localUserNat.sendPackets:
+		defer queued.finish()
 		if queued.source != source.LocalMask() {
 			t.Fatalf("NAT source = %s, want %s", queued.source, source.LocalMask())
 		}
@@ -540,6 +544,7 @@ func TestRemoteUserNatProviderIngressKeepsSourceAndTransferKeyPaired(t *testing.
 		default:
 			t.Fatalf("provider did not enqueue source/key pair %d", pairIndex)
 		}
+		defer queued.finish()
 		if queued.source != sources[pairIndex].LocalMask() {
 			t.Fatalf(
 				"NAT pair %d source = %s, want %s",
@@ -838,9 +843,9 @@ func TestRemoteUserNatProviderReturnV1RetriesRejectedSocketPacket(t *testing.T) 
 	}
 }
 
-// A keyed no-contract return batch must use SendMulti while preserving the
-// received force-stream, role, and session independently of contract policy,
-// while retaining TCP recovery ownership for every frame in the batch.
+// A keyed no-contract return batch must remain one logical group while
+// preserving the received force-stream, role, and session independently of
+// contract policy, and retaining TCP recovery ownership for every frame.
 func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 	provider, client, _ := newProviderTransferKeyTestFixture(t)
 	peerId := NewId()
@@ -894,8 +899,14 @@ func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 	)
 	queued := waitProviderReturnTestPack(t, sequence)
 	defer queued.returnFrames()
-	if queued.Frame != nil || len(queued.Frames) != len(responses) {
-		t.Fatalf("provider batch shape = (%p,%d), want (nil,%d)", queued.Frame, len(queued.Frames), len(responses))
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(responses) {
+		t.Fatalf(
+			"provider batch shape = (%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(responses),
+		)
 	}
 	for frameIndex, frame := range queued.Frames {
 		if !frame.Raw {
@@ -921,6 +932,257 @@ func TestRemoteUserNatProviderReturnBatchPreservesTransferKey(t *testing.T) {
 			queued.EncryptionRole,
 			queued.EncryptionCompanion,
 		)
+	}
+}
+
+// Contract-bearing socket drains must enter the same logical group path. The
+// selected SendSequence, not this callback, owns carrier-safe chunking and
+// contract-envelope boundaries; falling back to one Pack per packet would
+// silently restore H1's download-direction framing and ACK amplification.
+func TestRemoteUserNatProviderReturnBatchGroupsContractBearingDrain(t *testing.T) {
+	provider, client, _ := newProviderTransferKeyTestFixture(t)
+	peerId := NewId()
+	source := SourceId(peerId)
+	transferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: false,
+	}
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+		ForceStream:       true,
+		EncryptionRole:    sequenceTlsRoleServer,
+	})
+	responses := [][]byte{
+		craftSecurityPacket(
+			IpProtocolTcp,
+			net.ParseIP("203.0.113.11"),
+			443,
+			net.ParseIP("10.0.0.12"),
+			43001,
+			false,
+			[]byte{1},
+		),
+		craftSecurityPacket(
+			IpProtocolTcp,
+			net.ParseIP("203.0.113.11"),
+			443,
+			net.ParseIP("10.0.0.12"),
+			43001,
+			false,
+			[]byte{2},
+		),
+	}
+	responsePath, err := ParseIpPath(responses[0])
+	if err != nil {
+		t.Fatalf("parse contract-bearing provider return batch: %v", err)
+	}
+
+	provider.receiveTransferBatch(
+		source,
+		transferKey,
+		protocol.ProvideMode_Public,
+		responsePath,
+		responses,
+	)
+	queued := waitProviderReturnTestPack(t, sequence)
+	defer queued.returnFrames()
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(responses) {
+		t.Fatalf(
+			"contract-bearing provider batch shape=(%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(responses),
+		)
+	}
+	for frameIndex, frame := range queued.Frames {
+		packetBytes, decodeErr := ipPacketFromProviderBytes(frame)
+		if decodeErr != nil {
+			t.Fatalf("decode contract-bearing provider frame %d: %v", frameIndex, decodeErr)
+		}
+		if !bytes.Equal(packetBytes, responses[frameIndex]) {
+			t.Fatalf("contract-bearing provider frame %d changed or reordered", frameIndex)
+		}
+	}
+}
+
+func TestRemoteUserNatProviderReturnBatchUsesProductionLogicalBound(t *testing.T) {
+	provider, client, _ := newProviderTransferKeyTestFixture(t)
+	peerId := NewId()
+	client.ContractManager().AddNoContractPeer(peerId)
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+		ForceStream:       true,
+		EncryptionRole:    sequenceTlsRoleServer,
+	})
+	sequence.packs = make(chan *SendPack, 2)
+	template := craftSecurityPacket(
+		IpProtocolTcp,
+		net.ParseIP("203.0.113.11"),
+		443,
+		net.ParseIP("10.0.0.12"),
+		43001,
+		false,
+		make([]byte, 1400),
+	)
+	path, err := ParseIpPath(template)
+	if err != nil {
+		t.Fatalf("parse provider production-bound packet: %v", err)
+	}
+	packets := make([][]byte, providerReturnBatchMaxFrames+1)
+	for packetIndex := range packets {
+		packets[packetIndex] = MessagePoolCopy(template)
+	}
+	item := providerReturnItem{
+		source: SourceId(peerId),
+		transferKey: TransferKey{
+			ForceStream:       true,
+			CompanionContract: true,
+			EncryptionRole:    protocol.SequenceRole_SequenceRoleServer,
+		},
+		provideMode:     protocol.ProvideMode_Public,
+		recoveryMode:    receiveRecoveryModeTcpSocket,
+		ipProtocol:      IpProtocolTcp,
+		packets:         packets,
+		packetByteCount: ByteCount(len(packets) * len(template)),
+		batch:           true,
+		schedulingKey:   ipSendSchedulingKey(path),
+	}
+	if !provider.sendReturnBatch(&item) {
+		t.Fatal("provider production-bound batch was not admitted")
+	}
+	if got := len(sequence.packs); got != 2 {
+		t.Fatalf("provider production-bound logical groups=%d, want 2", got)
+	}
+	first := <-sequence.packs
+	second := <-sequence.packs
+	defer first.returnFrames()
+	defer second.returnFrames()
+	if len(first.Frames) != providerReturnBatchMaxFrames || len(second.Frames) != 1 {
+		t.Fatalf(
+			"provider production-bound group frames=%d/%d, want %d/1",
+			len(first.Frames),
+			len(second.Frames),
+			providerReturnBatchMaxFrames,
+		)
+	}
+}
+
+// BenchmarkRemoteUserNatProviderReturnBatchLimits measures the provider-side
+// policy/routing admission boundary that a larger socket drain can amortize.
+// Carrier-safe H1 chunks remain independently bounded by SendSequence; this
+// benchmark changes only the logical group presented to that scheduler.
+func BenchmarkRemoteUserNatProviderReturnBatchLimits(b *testing.B) {
+	const packetCount = 64
+	variants := []struct {
+		name      string
+		maxFrames int
+		maxBytes  int64
+	}{
+		{name: "16_frames_24_KiB", maxFrames: 16, maxBytes: 24 * 1024},
+		{name: "32_frames_48_KiB", maxFrames: 32, maxBytes: 48 * 1024},
+	}
+	for _, variant := range variants {
+		b.Run(variant.name, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+			b.Cleanup(func() {
+				cancel()
+				client.Cancel()
+			})
+			provider := &RemoteUserNatProvider{
+				ctx:                 ctx,
+				client:              client,
+				settings:            DefaultRemoteUserNatProviderSettings(),
+				packetStatsCounters: &packetStatsCounters{},
+			}
+			peerId := NewId()
+			client.ContractManager().AddNoContractPeer(peerId)
+			sequenceId := sendSequenceId{
+				Destination:       peerId,
+				CompanionContract: true,
+				ForceStream:       true,
+				EncryptionRole:    sequenceTlsRoleServer,
+			}
+			sequence := &SendSequence{
+				ctx:           ctx,
+				cancel:        func() {},
+				packs:         make(chan *SendPack, packetCount),
+				idleCondition: NewIdleCondition(),
+			}
+			client.sendBuffer.mutex.Lock()
+			client.sendBuffer.sendSequences[sequenceId] = sequence
+			client.sendBuffer.wireSendSequences[sequenceId.wireId()] = sequence
+			client.sendBuffer.mutex.Unlock()
+			b.Cleanup(func() {
+				client.sendBuffer.mutex.Lock()
+				delete(client.sendBuffer.sendSequences, sequenceId)
+				delete(client.sendBuffer.wireSendSequences, sequenceId.wireId())
+				client.sendBuffer.mutex.Unlock()
+				for 0 < len(sequence.packs) {
+					(<-sequence.packs).returnFrames()
+				}
+			})
+
+			template := craftSecurityPacket(
+				IpProtocolTcp,
+				net.ParseIP("203.0.113.11"),
+				443,
+				net.ParseIP("10.0.0.12"),
+				43001,
+				false,
+				make([]byte, 1400),
+			)
+			path, err := ParseIpPath(template)
+			if err != nil {
+				b.Fatalf("parse provider benchmark packet: %v", err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(packetCount * len(template)))
+			var logicalGroupCount int64
+			b.ResetTimer()
+			for range b.N {
+				var packetValues [packetCount][]byte
+				packets := packetValues[:]
+				for packetIndex := range packets {
+					packets[packetIndex] = MessagePoolCopy(template)
+				}
+				item := providerReturnItem{
+					source: SourceId(peerId),
+					transferKey: TransferKey{
+						ForceStream:       true,
+						CompanionContract: true,
+						EncryptionRole:    protocol.SequenceRole_SequenceRoleServer,
+					},
+					provideMode:     protocol.ProvideMode_Public,
+					recoveryMode:    receiveRecoveryModeTcpSocket,
+					ipProtocol:      IpProtocolTcp,
+					packets:         packets,
+					packetByteCount: ByteCount(packetCount * len(template)),
+					batch:           true,
+					schedulingKey:   ipSendSchedulingKey(path),
+				}
+				if !provider.sendReturnBatchWithLimits(
+					&item,
+					variant.maxFrames,
+					variant.maxBytes,
+				) {
+					b.Fatal("provider benchmark batch was not admitted")
+				}
+				groupCount := len(sequence.packs)
+				if groupCount == 0 {
+					b.Fatal("provider benchmark emitted no logical group")
+				}
+				logicalGroupCount += int64(groupCount)
+				for range groupCount {
+					(<-sequence.packs).returnFrames()
+				}
+			}
+			b.ReportMetric(float64(logicalGroupCount)/float64(b.N), "logical-groups/op")
+		})
 	}
 }
 
@@ -1029,8 +1291,14 @@ func TestRemoteUserNatProviderReturnV1RetriesRejectedSocketBatch(t *testing.T) {
 			queued.returnFrames()
 		}
 	}()
-	if queued.Frame != nil || len(queued.Frames) != len(expectedResponses) {
-		t.Fatalf("retried provider v1 batch shape=(%p,%d), want (nil,%d)", queued.Frame, len(queued.Frames), len(expectedResponses))
+	if queued.Frame != nil || !queued.logicalGroup || len(queued.Frames) != len(expectedResponses) {
+		t.Fatalf(
+			"retried provider v1 batch shape=(%p,logical=%t,%d), want (nil,true,%d)",
+			queued.Frame,
+			queued.logicalGroup,
+			len(queued.Frames),
+			len(expectedResponses),
+		)
 	}
 	for frameIndex, frame := range queued.Frames {
 		if frame.Raw {
@@ -1357,5 +1625,129 @@ func TestRemoteUserNatProviderForceStreamTcpReturnRetriesFirstDrop(t *testing.T)
 	case inspectionErr := <-ackInspectionErrs:
 		t.Fatalf("provider return ack gate: %v", inspectionErr)
 	default:
+	}
+}
+
+// A provider has already consumed TCP bytes from the origin socket before it
+// hands the reconstructed packet to Transfer. Admission therefore moves the
+// only recoverable copy into SendSequence: an end-to-end Ack timeout must keep
+// retrying that same item, not close the sequence and report a terminal error.
+//
+// This is the exact main-proxy failure from 2026-08-30. The origin LB returned
+// 200, the hosted DeviceLocal stayed ready, and remote ingress stopped until
+// the 30-second request deadline because the provider-return Transfer item hit
+// its finite AckTimeout while the H1 carrier was reforming.
+func TestRemoteUserNatProviderTcpReturnSurvivesAckTimeout(t *testing.T) {
+	var forceAckTimeout atomic.Bool
+	clientSettings := DefaultClientSettings()
+	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
+	clientSettings.SendBufferSettings.MinResendInterval = 5 * time.Millisecond
+	clientSettings.SendBufferSettings.RttMinResendInterval = 5 * time.Millisecond
+	clientSettings.SendBufferSettings.MaxResendInterval = 10 * time.Millisecond
+	clientSettings.SendBufferSettings.AckTimeout = time.Hour
+	clientSettings.SendBufferSettings.IdleTimeout = time.Hour
+	clientSettings.SendBufferSettings.forceAckTimeoutForTest = func(sendSequenceId) bool {
+		return forceAckTimeout.Load()
+	}
+	provider, providerClient, _ := newProviderTransferKeyTestFixtureWithClientSettings(
+		t,
+		DefaultRemoteUserNatProviderSettings(),
+		clientSettings,
+	)
+
+	peerId := NewId()
+	providerClient.ContractManager().AddNoContractPeer(peerId)
+	providerToDrop := make(Route)
+	providerClient.RouteManager().UpdateTransport(
+		NewSendClientTransport(DestinationId(peerId)),
+		[]Route{providerToDrop},
+	)
+
+	response := craftSecurityPacket(
+		IpProtocolTcp,
+		net.ParseIP("203.0.113.7"),
+		8080,
+		net.ParseIP("10.0.0.9"),
+		42001,
+		false,
+		[]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	)
+	responsePath, err := ParseIpPath(response)
+	if err != nil {
+		t.Fatalf("parse provider TCP return: %v", err)
+	}
+	transferKey := TransferKey{
+		ForceStream:         true,
+		EncryptionRole:      protocol.SequenceRole_SequenceRoleServer,
+		EncryptionCompanion: false,
+	}
+	completion := &providerReturnTestAckTarget{completed: make(chan error, 1)}
+	provider.returnAckTargetForTest = completion
+
+	provider.receiveTransferWithRecovery(
+		SourceId(peerId),
+		transferKey,
+		protocol.ProvideMode_Public,
+		receiveRecoveryModeTcpSocket,
+		responsePath,
+		response,
+	)
+
+	waitWrite := func(name string) providerReturnRetryRecord {
+		t.Helper()
+		select {
+		case transferFrameBytes := <-providerToDrop:
+			defer MessagePoolReturn(transferFrameBytes)
+			record, target, decodeErr := providerReturnRetryRecordFromWire(
+				transferFrameBytes,
+				response,
+			)
+			if decodeErr != nil {
+				t.Fatalf("decode %s provider return: %v", name, decodeErr)
+			}
+			if !target {
+				t.Fatalf("%s write did not contain the provider TCP return", name)
+			}
+			return record
+		case completionErr := <-completion.completed:
+			t.Fatalf("provider return completed before %s write: %v", name, completionErr)
+			return providerReturnRetryRecord{}
+		case <-time.After(time.Second):
+			t.Fatalf("wait for %s provider return write", name)
+			return providerReturnRetryRecord{}
+		}
+	}
+
+	first := waitWrite("initial")
+	forceAckTimeout.Store(true)
+	for retryIndex := 1; retryIndex <= 3; retryIndex++ {
+		retry := waitWrite(fmt.Sprintf("post-timeout retry %d", retryIndex))
+		if !providerReturnRetryIdentityEqual(first, retry) ||
+			!bytes.Equal(first.wireBytes, retry.wireBytes) {
+			t.Fatalf(
+				"post-timeout retry %d changed provider return identity: first=%+v retry=%+v",
+				retryIndex,
+				first,
+				retry,
+			)
+		}
+		select {
+		case completionErr := <-completion.completed:
+			t.Fatalf(
+				"provider return became terminal after post-timeout retry %d: %v",
+				retryIndex,
+				completionErr,
+			)
+		default:
+		}
+	}
+	provider.Close()
+	select {
+	case completionErr := <-completion.completed:
+		if completionErr == nil {
+			t.Fatal("provider shutdown acknowledged an undelivered retained return")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider shutdown did not release its retained return")
 	}
 }

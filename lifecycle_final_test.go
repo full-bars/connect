@@ -1,3 +1,5 @@
+//go:build !js
+
 // Exact lifecycle regressions cover callback admission, context callbacks,
 // transport drains, and pooled-owner rejection at shutdown.
 package connect
@@ -742,7 +744,7 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	}
 	defer localPipe.Close()
 	defer remotePipe.Close()
-	transportValue, route := NewP2pReceiveTransport(
+	transportValue, _ := NewP2pReceiveTransport(
 		transportCtx,
 		cancelTransport,
 		conn,
@@ -769,7 +771,18 @@ func TestP2pReceiveTransportDoneFollowsFinalPoolDrain(t *testing.T) {
 	blockedReadCapture.requireOwnerLive(t, "P2P blocked-read buffer")
 	capture := newLifecyclePoolCapture(MessagePoolGet(512))
 	defer capture.cleanup()
-	route <- capture.owner
+	// Exercise the native-datagram carrier handoff. Reliable SCTP now waits
+	// directly on its exact route; only the fast lane owns the bounded pending
+	// queue whose final drain this test pins.
+	if !transport.offerReceive(capture.owner, true, 0, false, false) {
+		t.Fatal("receive final-drain frame was not admitted")
+	}
+	if retained := transport.pendingReceiveByteCount.Load(); retained != 512 {
+		t.Fatalf("receive final-drain retained bytes = %d, want 512", retained)
+	}
+	if retained := transport.pendingReceiveMessageCount.Load(); retained != 1 {
+		t.Fatalf("receive final-drain retained messages = %d, want 1", retained)
+	}
 	capture.requireOwnerLive(t, "receive final-drain frame")
 	joinResult := make(chan error, 1)
 	go func() { joinResult <- lifecycle.CloseAndWait(ctx) }()
@@ -1207,6 +1220,59 @@ func (consumingLifecycleSignalSender) SendSignal(
 	MessagePoolReturn(signal.MessageBytes)
 }
 
+// TestPeerConnPionStartupAndTeardownAreSerialized pins the cancellation race
+// that previously let Run create an ICE agent after teardown had already
+// closed the PeerConnection. A non-mutating setup hook must not block physical
+// teardown, while Run must recheck cancellation under the Pion mutation gate
+// before SetLocalDescription.
+func TestPeerConnPionStartupAndTeardownAreSerialized(t *testing.T) {
+	ctx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelWait()
+	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	defer cancelPeer()
+	settings := DefaultWebRtcSettings()
+	settings.Log = NewNoopLogger()
+	settings.IceServerUrls = nil
+	settings.EnableDatagramFastPath = false
+	peer, err := newPeerConn(
+		peerCtx,
+		peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		NewId(),
+		true,
+		consumingLifecycleSignalSender{},
+		settings,
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := webrtc.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startupEntered := make(chan struct{})
+	releaseStartup := make(chan struct{})
+	peer.beforeSetLocalDescriptionForTest = func() {
+		close(startupEntered)
+		<-releaseStartup
+	}
+	if !peer.startWorker("peer connection run", peer.Run) {
+		t.Fatal("could not start peer Run")
+	}
+	waitCloseWaitBarrier(t, ctx, startupEntered, "Pion startup mutation")
+	if !peer.pionLifecycleLock.TryLock() {
+		t.Fatal("non-mutating startup hook retained the Pion lifecycle owner")
+	}
+	peer.pionLifecycleLock.Unlock()
+	go peer.teardown()
+	waitCloseWaitBarrier(t, ctx, peer.ctx.Done(), "peer cancellation before teardown")
+	waitCloseWaitBarrier(t, ctx, peer.teardownDone, "Pion teardown during setup hook")
+	close(releaseStartup)
+	waitCloseWaitBarrier(t, ctx, peer.workers.Done(), "canceled Pion startup worker")
+	if peer.pc.LocalDescription() != nil {
+		t.Fatal("canceled startup set a local description after teardown began")
+	}
+}
+
 // TestPeerConnPionRegistrationUsesCallbackGate starts the real Run callback
 // registration and makes Pion dispatch a terminal state callback. The peer
 // gate must retain that concrete callback until its body returns.
@@ -1224,8 +1290,9 @@ func TestPeerConnPionRegistrationUsesCallbackGate(t *testing.T) {
 		false,
 		consumingLifecycleSignalSender{},
 		settings,
-		func() (*webrtc.PeerConnection, error) {
-			return webrtc.NewPeerConnection(webrtc.Configuration{})
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := webrtc.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
 		},
 	)
 	if err != nil {
@@ -1287,8 +1354,8 @@ func TestPeerConnFastPathOnTrackUsesCallbackGate(t *testing.T) {
 	}
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	signalPipeA.SetSignalReceiver(managerB)
 	signalPipeB.SetSignalReceiver(managerA)
 	streamId := NewId()
@@ -1358,8 +1425,9 @@ func TestPeerConnFastPathRtcpUsesOwnedWorker(t *testing.T) {
 		false,
 		consumingLifecycleSignalSender{},
 		settings,
-		func() (*webrtc.PeerConnection, error) {
-			return api.NewPeerConnection(webrtc.Configuration{})
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, createErr := api.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, createErr
 		},
 	)
 	if err != nil {

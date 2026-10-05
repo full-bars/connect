@@ -1,3 +1,5 @@
+//go:build !js
+
 // Intermediary topology tests pin adjacent destination route keys across both
 // private forwarding directions with real loopback WebRTC associations.
 package connect
@@ -152,7 +154,7 @@ func TestIntermediaryStreamSequenceMatchesAdjacentDestinationsBothDirections(
 		settings.Log = NewNoopLogger()
 		settings.IceServerUrls = nil
 		settings.UseLoopbackOnlyIceInterfaces = true
-		return NewWebRtcManager(ctx, router.sender(clientId), settings)
+		return newTestWebRtcManager(t, ctx, router.sender(clientId), settings)
 	}
 	sourceWebRtcManager := newWebRtcManager(sourceId)
 	intermediaryWebRtcManager := newWebRtcManager(intermediaryId)
@@ -490,27 +492,44 @@ func TestIntermediaryStreamSequenceMatchesAdjacentDestinationsBothDirections(
 		"to-source",
 	)
 
-	assertSingleReceiveTransport := func(routeManager *RouteManager, label string) {
+	assertExactReceiveTransports := func(routeManager *RouteManager, label string) {
 		receiveCount := 0
+		reliabilityCounts := map[CarrierReliability]int{}
 		routeManager.mutex.Lock()
 		for transport, routes := range routeManager.readerMatchState.transportRoutes {
 			if len(routes) == 0 || !transport.MatchesReceive(StreamId(streamId)) {
 				continue
 			}
-			receiveTransport, ok := transport.(*P2pReceiveTransport)
-			if !ok || receiveTransport.streamId != streamId {
+			var receiveTransport *P2pReceiveTransport
+			switch typedTransport := transport.(type) {
+			case *P2pReceiveTransport:
+				receiveTransport = typedTransport
+			case *receiveLaneTransport:
+				receiveTransport, _ = typedTransport.base.(*P2pReceiveTransport)
+			}
+			if receiveTransport == nil || receiveTransport.streamId != streamId {
 				routeManager.mutex.Unlock()
 				t.Fatalf("%s registered an unexpected receive transport", label)
 			}
 			receiveCount += 1
+			reliability := routeManager.readerMatchState.
+				transportProperties[transport].ReceiveReliability
+			reliabilityCounts[reliability] += 1
 		}
 		routeManager.mutex.Unlock()
-		if receiveCount != 1 {
-			t.Fatalf("%s receive transport count=%d, want 1", label, receiveCount)
+		if receiveCount != 2 ||
+			reliabilityCounts[CarrierReliabilityReliable] != 1 ||
+			reliabilityCounts[CarrierReliabilityUnreliable] != 1 {
+			t.Fatalf(
+				"%s receive routes=%d reliability=%+v, want one SCTP and one native lane",
+				label,
+				receiveCount,
+				reliabilityCounts,
+			)
 		}
 	}
-	assertSingleReceiveTransport(privateManagers.toDestination, "from-source")
-	assertSingleReceiveTransport(privateManagers.toSource, "from-destination")
+	assertExactReceiveTransports(privateManagers.toDestination, "from-source")
+	assertExactReceiveTransports(privateManagers.toSource, "from-destination")
 
 	for {
 		select {

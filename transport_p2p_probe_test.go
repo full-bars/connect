@@ -1,3 +1,5 @@
+//go:build !js
+
 // End-to-end stream readiness tests model opaque intermediary forwarding,
 // exact transport generations, reconnect epochs, compatibility, and carrier
 // accounting without requiring a public network.
@@ -233,16 +235,17 @@ func newStoppedP2pStreamProbe(
 		timeout = 2 * interval
 	}
 	return &p2pStreamProbe{
-		ctx:          probeCtx,
-		cancel:       cancel,
-		routeManager: routeManager,
-		streamId:     streamId,
-		interval:     interval,
-		timeout:      timeout,
-		observer:     settings.EndToEndProbeObserver,
-		routeUpdate:  NewMonitor(),
-		responses:    make(chan Id, 1),
-		done:         make(chan struct{}),
+		ctx:              probeCtx,
+		cancel:           cancel,
+		routeManager:     routeManager,
+		streamId:         streamId,
+		interval:         interval,
+		timeout:          timeout,
+		observer:         settings.EndToEndProbeObserver,
+		progressObserver: settings.ProgressObserver,
+		routeUpdate:      NewMonitor(),
+		responses:        make(chan Id, 1),
+		done:             make(chan struct{}),
 	}
 }
 
@@ -813,6 +816,59 @@ func TestP2pStreamProbeStaleReadyGrantCannotReregisterClearedRoute(t *testing.T)
 	if activeRoutes := writer.GetActiveRoutes(); len(activeRoutes) != 0 {
 		t.Fatalf("stale readiness grant re-registered %d routes", len(activeRoutes))
 	}
+}
+
+// A successful endpoint probe rematches the physical send route. That rematch
+// must retain native-fast delivery semantics so the SendSequence continues to
+// apply its bounded unreliable-carrier flight after readiness is granted.
+func TestP2pStreamProbeReadyRematchPreservesFastCarrierProperties(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultP2pTransportSettings()
+	settings.DataPlaneMode = P2pDataPlaneModeFastOnly
+	routeManager := NewRouteManager(ctx, "probe-fast-properties")
+	streamId := NewId()
+	destination := DestinationId(NewId())
+	route := make(Route, 1)
+	transport := newP2pProbeTestSendTransport(
+		destination.DestinationId,
+		streamId,
+		route,
+		settings,
+	)
+	// Model the connected callback's pre-readiness publication. The probe
+	// rematch below is the boundary that historically replaced these
+	// properties with the zero value.
+	routeManager.UpdateTransportWithProperties(
+		transport,
+		[]Route{route},
+		p2pTransferCarrierProperties(transport),
+	)
+	writer := routeManager.OpenMultiRouteWriter(destination)
+	defer routeManager.CloseMultiRouteWriter(writer)
+	selector := writer.(*MultiRouteSelector)
+	if selector.transferFlightPolicy().limited {
+		t.Fatal("not-ready endpoint route entered the active Transfer flight policy")
+	}
+
+	probe := newStoppedP2pStreamProbe(ctx, routeManager, streamId, settings)
+	probe.setSendRoute(transport, route)
+	generation, _ := probe.sendRouteState()
+	if !probe.setReady(transport, route, generation.epoch, true) {
+		t.Fatal("native-fast route did not become probe-ready")
+	}
+	if !selector.transferFlightPolicy().limited {
+		t.Fatal("probe readiness rematch erased native-fast carrier properties")
+	}
+	wantLimit := max(1, settings.ReceiveQueueMessageCount-1)
+	if limit := selector.transferFlightPolicy().messageLimit; limit != wantLimit {
+		t.Fatalf(
+			"probe readiness flight limit = %d, want receive data depth %d",
+			limit,
+			wantLimit,
+		)
+	}
+	probe.clearSendRoute(transport, route)
 }
 
 // Reusing one transport pointer for a later route epoch does not let a stale
@@ -1433,10 +1489,8 @@ func TestP2pStreamProbeStreamSequenceCancelSynchronouslyWithdrawsReadiness(t *te
 	webRtcSettingsB.UseLoopbackOnlyIceInterfaces = true
 	signalPipeA := newP2pProbeSignalPipe()
 	signalPipeB := newP2pProbeSignalPipe()
-	webRtcManagerA := NewWebRtcManager(ctx, signalPipeA, webRtcSettingsA)
-	webRtcManagerB := NewWebRtcManager(ctx, signalPipeB, webRtcSettingsB)
-	defer webRtcManagerA.Close()
-	defer webRtcManagerB.Close()
+	webRtcManagerA := newTestWebRtcManager(t, ctx, signalPipeA, webRtcSettingsA)
+	webRtcManagerB := newTestWebRtcManager(t, ctx, signalPipeB, webRtcSettingsB)
 	signalPipeA.SetSignalReceiver(webRtcManagerB)
 	signalPipeB.SetSignalReceiver(webRtcManagerA)
 

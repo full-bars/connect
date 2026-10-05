@@ -3,6 +3,8 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
 
 	"encoding/base64"
 
@@ -10,6 +12,26 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Bounded retry for a lifecycle-bound out-of-band control request. The control
+// API is the only source of contracts, so a single transient timeout used to
+// cost the caller a whole retry cycle, which is tens of seconds of stalled
+// traffic. The retries share the request's one admission, so the callback still
+// fires exactly once and CloseAndWait keeps its exact ownership barrier.
+const oobControlMaxAttempts = 4
+
+// oobControlRetryDelay is the backoff before the next attempt. `attempt` is the
+// attempt that just failed, one-based.
+func oobControlRetryDelay(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 250 * time.Millisecond
+	case 2:
+		return 1 * time.Second
+	default:
+		return 3 * time.Second
+	}
+}
 
 // control messages for a client out of band with the client sequence
 // some control messages require blocking response, but there is a potential deadlock
@@ -35,10 +57,21 @@ type OutOfBandControlWithCtx interface {
 	SendControlWithCtx(ctx context.Context, frames []*protocol.Frame, callback OobResultFunction)
 }
 
+// NetworkClientControl is an explicitly supplied in-process control boundary.
+// Implementations authenticate the current derived JWT, preserve controller
+// accounting, and return only after processing the complete request. They must
+// honor ctx cancellation; the caller still joins their terminal return.
+type NetworkClientControl interface {
+	ConnectControl(context.Context, string, *ConnectControlArgs) (*ConnectControlResult, error)
+}
+
 type ApiOutOfBandControl struct {
-	api      *BringYourApi
-	ownsApi  bool
-	requests *lifecycleAdmission
+	localControl NetworkClientControl
+	api          *BringYourApi
+	ownsApi      bool
+	requests     *lifecycleAdmission
+	// Immutable, self-reported telemetry only; never an authorization claim.
+	probeClaimed bool
 
 	// Nil test barrier exposes the exact join boundary after admission closes.
 	beforeCloseWaitForTest func()
@@ -50,13 +83,30 @@ func NewApiOutOfBandControl(
 	byJwt string,
 	apiUrl string,
 ) *ApiOutOfBandControl {
+	return newApiOutOfBandControl(ctx, clientStrategy, byJwt, apiUrl, false)
+}
+
+// The generator supplies the immutable probe marker for its private controls.
+func newApiOutOfBandControl(ctx context.Context, clientStrategy *ClientStrategy, byJwt, apiUrl string, probeClaimed bool) *ApiOutOfBandControl {
 	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
 	return &ApiOutOfBandControl{
-		api:      api,
-		ownsApi:  true,
-		requests: newLifecycleAdmission(),
+		api:          api,
+		ownsApi:      true,
+		requests:     newLifecycleAdmission(),
+		probeClaimed: probeClaimed,
 	}
+}
+
+// Local control keeps the actual API OOB owner and its processed-result,
+// frame-ownership and close/join rules. It does not replace the data transport.
+func NewApiOutOfBandControlWithLocalControl(ctx context.Context, strategy *ClientStrategy, byJwt, apiUrl string, control NetworkClientControl) *ApiOutOfBandControl {
+	if control == nil {
+		panic("local control authority is required")
+	}
+	owner := NewApiOutOfBandControl(ctx, strategy, byJwt, apiUrl)
+	owner.localControl = control
+	return owner
 }
 
 func NewApiOutOfBandControlWithApi(api *BringYourApi) *ApiOutOfBandControl {
@@ -79,7 +129,7 @@ func (self *ApiOutOfBandControl) SendControl(
 ) {
 	// bound to the api lifecycle context: keep trying as long as the
 	// lifecycle is active
-	self.sendControl(self.api.ConnectControl, frames, callback)
+	self.sendControlWithCtx(self.api.ctx, frames, callback, true)
 }
 
 // SendControlWithCtx is a one-shot send on a caller-chosen context, for
@@ -90,16 +140,59 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 	frames []*protocol.Frame,
 	callback OobResultFunction,
 ) {
+	self.sendControlWithCtx(ctx, frames, callback, false)
+}
+
+func (self *ApiOutOfBandControl) sendControlWithCtx(
+	ctx context.Context,
+	frames []*protocol.Frame,
+	callback OobResultFunction,
+	retryable bool,
+) {
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
-		self.api.ConnectControlWithCtx(ctx, connectControlArgs, apiCallback)
+		if self.localControl == nil {
+			self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)
+			return
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, self.api.clientStrategy.settings.RequestTimeout)
+		go func() {
+			defer cancel()
+			var result *ConnectControlResult
+			var err error
+			byJwt := self.api.ByJwt()
+			HandleError(func() {
+				if err = requestCtx.Err(); err == nil {
+					result, err = self.localControl.ConnectControl(requestCtx, byJwt, connectControlArgs)
+				}
+			}, func(recovered error) { err = fmt.Errorf("local control failed: %w", recovered) })
+			if requestCtx.Err() != nil {
+				// A local handler may return a committed contract after its
+				// request was canceled. Retain this admitted owner through the
+				// requester's zero-use close before discarding that result. The
+				// canceled result never reaches a data producer or becomes success.
+				var cleanupErr error
+				HandleError(func() {
+					cleanupErr = self.closeUndeliveredLocalContracts(requestCtx, byJwt, connectControlArgs, result)
+				}, func(recovered error) {
+					cleanupErr = fmt.Errorf("local undelivered contract cleanup failed: %w", recovered)
+				})
+				result, err = nil, errors.Join(requestCtx.Err(), cleanupErr)
+			}
+			apiCallback.Result(result, err)
+		}()
 	}
-	self.sendControl(connectControl, frames, callback)
+	// Local control keeps its single-attempt join semantics: a canceled or
+	// late attempt closes its committed result exactly once and must never
+	// replay the create. The bounded retry applies to api-bound sends only.
+	self.sendControl(connectControl, ctx, frames, callback, retryable && self.localControl == nil)
 }
 
 func (self *ApiOutOfBandControl) sendControl(
 	connectControl func(*ConnectControlArgs, ConnectControlCallback),
+	ctx context.Context,
 	frames []*protocol.Frame,
 	callback OobResultFunction,
+	retryable bool,
 ) {
 	safeCallback := func(resultFrames []*protocol.Frame, err error) {
 		if callback != nil {
@@ -133,37 +226,64 @@ func (self *ApiOutOfBandControl) sendControl(
 	MessagePoolReturn(packBytes)
 	returnFrames()
 
-	connectControl(
-		&ConnectControlArgs{
-			Pack: encodedPack,
-		},
-		NewApiCallback(func(result *ConnectControlResult, err error) {
-			// Request completion is published after every callback-local pooled
-			// buffer has returned. CloseAndWait may therefore use completion as
-			// an exact ownership barrier.
-			defer self.requests.finish()
-			if err != nil {
-				safeCallback(nil, err)
-				return
-			}
+	connectControlArgs := &ConnectControlArgs{
+		Pack: encodedPack,
+	}
+	// The request keeps its single admission across attempts, so completion is
+	// still published exactly once and CloseAndWait keeps its exact barrier.
+	var attempt func(n int)
+	attempt = func(n int) {
+		connectControl(
+			connectControlArgs,
+			NewApiCallback(func(result *ConnectControlResult, err error) {
+				if err != nil && retryable && n < oobControlMaxAttempts &&
+					ctx.Err() == nil {
+					time.AfterFunc(oobControlRetryDelay(n), func() {
+						if ctx.Err() == nil {
+							attempt(n + 1)
+						} else {
+							defer self.requests.finish()
+							safeCallback(nil, err)
+						}
+					})
+					return
+				}
+				// Request completion is published after every callback-local pooled
+				// buffer has returned. CloseAndWait may therefore use completion as
+				// an exact ownership barrier.
+				defer self.requests.finish()
+				if err != nil {
+					safeCallback(nil, err)
+					return
+				}
+				if result == nil {
+					safeCallback(nil, errors.New("connect control response is absent"))
+					return
+				}
+				if result.Error != nil {
+					safeCallback(nil, errors.New("connect control rejected: "+result.Error.Message))
+					return
+				}
 
-			packBytes, err := DecodeBase64(base64.StdEncoding, result.Pack)
-			if err != nil {
-				safeCallback(nil, err)
-				return
-			}
-			defer MessagePoolReturn(packBytes)
+				packBytes, err := DecodeBase64(base64.StdEncoding, result.Pack)
+				if err != nil {
+					safeCallback(nil, err)
+					return
+				}
+				defer MessagePoolReturn(packBytes)
 
-			responsePack := &protocol.Pack{}
-			err = ProtoUnmarshal(packBytes, responsePack)
-			if err != nil {
-				safeCallback(nil, err)
-				return
-			}
+				responsePack := &protocol.Pack{}
+				err = ProtoUnmarshal(packBytes, responsePack)
+				if err != nil {
+					safeCallback(nil, err)
+					return
+				}
 
-			safeCallback(responsePack.Frames, nil)
-		}),
-	)
+				safeCallback(responsePack.Frames, nil)
+			}),
+		)
+	}
+	attempt(1)
 }
 
 // Close prevents later request admission. A control constructed with its own
