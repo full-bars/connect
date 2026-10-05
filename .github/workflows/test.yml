@@ -119,9 +119,30 @@ jobs:
       # visits=3 against its bound of 2 in the cause-flattening budget walker,
       # and TestOriginalInventoryActualCleanupRotationAndIndependentContracts
       # calls SetSeed after CloseAndWait, which the closed key manager refuses
-      # by design. Reported, not gating; both carry into the upstream-forward
-      # brief (connect-upstream-forward.md). Remove this step once upstream
-      # fixes them.
-      - name: Test upstream-broken cause/inventory tests (non-blocking)
-        continue-on-error: true
-        run: go test -count=1 -timeout 10m -run '^(TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget|TestOriginalInventoryActualCleanupRotationAndIndependentContracts)$' .
+      # by design. Each documented failure signature passes here, with a
+      # warning once a test starts passing again; ANY other failure gates.
+      # Both carry in the upstream-forward brief (connect-upstream-forward.md).
+      # Remove the quarantine once upstream fixes them.
+      - name: Test upstream-broken cause/inventory tests (documented signatures only)
+        run: |
+          run_documented() {
+            name="$1"
+            pattern="$2"
+            out=$(go test -count=1 -timeout 10m -run "^${name}$" . 2>&1)
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              echo "::warning::${name} now passes; remove its quarantine"
+              return 0
+            fi
+            if printf '%s' "$out" | rg -q "$pattern"; then
+              echo "${name}: documented upstream failure (non-gating)"
+              return 0
+            fi
+            printf '%s\n' "$out" | tail -60
+            echo "${name}: new failure signature; gating"
+            return 1
+          }
+          rc=0
+          run_documented TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget 'absent branches escaped shared admission: visits=3 retained=2 incomplete=1 overflow=true' || rc=1
+          run_documented TestOriginalInventoryActualCleanupRotationAndIndependentContracts 'client key manager closed' || rc=1
+          exit $rc
