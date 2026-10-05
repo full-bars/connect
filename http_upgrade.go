@@ -325,7 +325,7 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 				if cause.kind < 2 {
 					transportOnly = false
 				}
-				if !errors.Is(cause.err, io.ErrClosedPipe) {
+				if cause.err != io.ErrClosedPipe {
 					ownedClosedPipe = false
 				}
 			}
