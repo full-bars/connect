@@ -637,6 +637,18 @@ type PlatformTransportSettings struct {
 	// Nil gives the transport a counter of its own.
 	ExtenderIpsMonitor *MonitorValue[uint64]
 
+	// CarrierDialRate caps process-wide carrier dial attempts per second across
+	// all runH3 modes (H3, H3Dns, H3DnsPump). Zero or negative uses the default
+	// (8 dials/second). A negative CarrierDialRate set explicitly to -1 disables
+	// dial limiting.
+	CarrierDialRate float64
+	// CarrierDialBurst caps the token bucket burst size for carrier dials. Zero
+	// or negative uses the default (16).
+	CarrierDialBurst int
+
+	// Nil outside package tests. Replaces the carrier dial limiter.
+	carrierDialLimiterForTest *carrierDialLimiter
+
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
 	afterRoutesRemovedForTest func()
@@ -939,8 +951,9 @@ type PlatformTransport struct {
 	h3BudgetReservation *platformTransportBudgetReservation
 	// DNS translation and a selected outer extender draw from this bounded
 	// subdivision of h3BudgetReservation, never from unreserved process space.
-	h3NestedBudget *PlatformTransportBudget
-	h3Gate         *platformH3Gate
+	h3NestedBudget     *PlatformTransportBudget
+	h3Gate             *platformH3Gate
+	carrierDialLimiter *carrierDialLimiter
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -1442,6 +1455,23 @@ func NewPlatformTransportWithTargetMode(
 		}
 	}
 	transport.h3Gate = newPlatformH3Gate(transport)
+	if settings.carrierDialLimiterForTest != nil {
+		transport.carrierDialLimiter = settings.carrierDialLimiterForTest
+	} else if settings.CarrierDialRate == -1 {
+		transport.carrierDialLimiter = newCarrierDialLimiter(-1, 0)
+	} else if settings.CarrierDialRate > 0 || settings.CarrierDialBurst > 0 {
+		rate := settings.CarrierDialRate
+		if rate <= 0 {
+			rate = defaultCarrierDialRate
+		}
+		burst := settings.CarrierDialBurst
+		if burst <= 0 {
+			burst = defaultCarrierDialBurst
+		}
+		transport.carrierDialLimiter = newCarrierDialLimiter(rate, burst)
+	} else {
+		transport.carrierDialLimiter = defaultCarrierDialLimiter
+	}
 	h1Enabled := targetMode == TransportModeH1 ||
 		(targetMode == TransportModeAuto &&
 			transport.modePreference(TransportModeH1) != modePreferenceNone)
@@ -2814,12 +2844,14 @@ func (self *PlatformTransport) runH3(
 	for {
 		// wait until we are back in the specific pt mode or auto mode
 		// stand down while a strictly better mode is active
+		parked := false
 		func() {
 			for {
 				standDown, notify := self.standDown(ptMode)
 				if !standDown {
 					return
 				}
+				parked = true
 				select {
 				case <-ctx.Done():
 					return
@@ -2830,6 +2862,7 @@ func (self *PlatformTransport) runH3(
 		if ctx.Err() != nil {
 			return
 		}
+		hadConnection = reconnectFastPathAllowed(hadConnection, parked)
 		if !self.waitDialAdmission(ctx) {
 			return
 		}
@@ -3005,6 +3038,11 @@ func (self *PlatformTransport) runH3(
 				// for the old path is meaningless — dial now over the new one
 			case <-time.After(connectDelay):
 			}
+		}
+		if !self.waitCarrierDialSlot(ctx) {
+			releaseReconnect()
+			cancelConnect()
+			return
 		}
 		attemptCtx, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
 		if !acquired {
