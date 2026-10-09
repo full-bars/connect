@@ -259,7 +259,11 @@ func TestSmartDialerWeightsDampTheSlowRouteOnAScoredStrategy(t *testing.T) {
 	var carried atomic.Int32
 	fast := wiredDialer("fast", 0, 200*time.Millisecond, &carried)
 	slow := wiredDialer("slow", 25, 20*time.Second, &carried)
-	strategy := wiredStrategy(t, fast, slow)
+	// Unseeded on purpose: a route with no delivery evidence has a neutral
+	// score of exactly 1.0, which leaves the base weight at the dialer's
+	// minimum. A seeded score above 1 would lift the damped weight over the
+	// minimum and hide a floor that flattens the latency factor.
+	strategy := wiredUnseededStrategy(t, fast, slow)
 	if strategy.scores == nil {
 		t.Fatal("a real strategy must carry delivery scores")
 	}
