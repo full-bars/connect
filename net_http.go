@@ -1044,6 +1044,7 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 // temporary limits are still read outside the strategy lock.
 func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clientDialer]float32, time.Time, uint64) {
 	var networkId string
+	smart := false
 	weights, generation := func() (map[*clientDialer]float32, uint64) {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1066,9 +1067,7 @@ func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clie
 				}
 				weights[dialer] = w
 			}
-			if SmartDialerEnabled() {
-				applySmartDialerWeights(weights)
-			}
+			smart = SmartDialerEnabled()
 		} else {
 			for dialer, _ := range self.dialers {
 				if dialer.IsExtender() {
@@ -1089,6 +1088,13 @@ func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clie
 		for dialer := range weights {
 			weights[dialer] *= self.scores.weight(networkId, dialer.dialerKey())
 		}
+	}
+
+	// Measured connect cost refines the delivery-scored weight. It runs last:
+	// upstream's base weight is each dialer's minimum, so applying it earlier
+	// would let the minimum floor erase every latency factor.
+	if smart {
+		applySmartDialerWeights(weights)
 	}
 
 	// the directory is an external object, so the limits are read with no
