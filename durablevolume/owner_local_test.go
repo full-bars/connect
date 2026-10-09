@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Owner-local custody uses real protected descriptors on the test data volume.
 // Only kernel mount facts model a laptop whose state shares its system device.
@@ -87,8 +87,8 @@ func TestOwnerLocalPolicyCannotAuthorizeDaemon(t *testing.T) {
 	}
 }
 
-// A literal root mount is admitted only in the owner-local parser and kernel
-// census. Physical-device checks are exercised above without writing root disk.
+// A literal root mount is admitted by both scopes' parsers and kernel census.
+// Physical-device checks are exercised above without writing root disk.
 func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 	fixture := newOwnerLocalFixture(t)
 	fixture.config.Volumes[0].MountPath = "/"
@@ -103,8 +103,8 @@ func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 		t.Fatalf("declared system mount was refused: %+v %v", mount, err)
 	}
 	owner.scope = daemonScope
-	if _, err := owner.mountFacts(); err == nil {
-		t.Fatal("daemon kernel admission accepted the system filesystem")
+	if mount, err := owner.mountFacts(); err != nil || mount.Path != "/" {
+		t.Fatalf("daemon kernel admission refused the declared system mount: %+v %v", mount, err)
 	}
 	owner.scope = ownerLocalScope
 	fixture.host.change(func() { fixture.host.uuidDevice.Major ^= 1 })
@@ -113,7 +113,7 @@ func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 	}
 	fixture.host.change(func() { fixture.host.uuidDevice.Major ^= 1 })
 	fixture.host.change(func() {
-		fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 1, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: "ext4"})
+		fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 1, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: testFilesystemType})
 	})
 	if _, err := owner.mountFacts(); err == nil {
 		t.Fatal("nested same-device mount concealed the selected state root")

@@ -54,6 +54,7 @@ type ControlDohUrlError struct {
 	Detail string
 }
 
+// The code, then the detail when there is one.
 func (self *ControlDohUrlError) Error() string {
 	if self.Detail == "" {
 		return fmt.Sprintf("control doh: %s", self.Code)
@@ -71,10 +72,9 @@ func ControlDohUrlErrorCode(err error) string {
 	return ""
 }
 
-// ParseControlDohUrl reads one bootstrap DoH server url. It returns the url in
-// the form the DoH client queries -- trimmed, a lower case scheme and the ip
-// in its canonical form -- and the server's ip, whose family is the list the
-// url belongs to.
+// Reads one bootstrap DoH server url. It returns the url in the form the DoH
+// client queries -- trimmed, a lower case scheme and the ip in its canonical
+// form -- and the server's ip, whose family is the list the url belongs to.
 func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 	invalid := func(code string, detail string) (string, netip.Addr, error) {
 		return "", netip.Addr{}, &ControlDohUrlError{Code: code, Detail: detail}
@@ -126,9 +126,9 @@ func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 	return u.String(), addr.Unmap(), nil
 }
 
-// ControlDohSettings is the DoH settings of a client strategy whose user named
-// bootstrap DoH servers: the defaults, with the named servers ahead of the
-// default servers of their family. With none named it is the defaults.
+// The DoH settings of a client strategy whose user named bootstrap DoH servers:
+// the defaults, with the named servers ahead of the default servers of their
+// family. With none named it is the defaults.
 //
 // The named servers are also seeded as the best recent performers
 // (`ServerStatsSeed`), because a query fans out in a weighted random order
@@ -164,4 +164,33 @@ func controlDohUrlsFirst(dohUrls []string, defaultDohUrls []string) []string {
 		}
 	}
 	return merged
+}
+
+// A copy of DoH settings that names only the built-in servers: the server
+// lists of `DefaultDnsResolverSettings`, and no seed, which only ever favors a
+// named server. Everything else is kept as given. A strategy that refuses
+// custom DoH servers (`ClientStrategySettings.DisableCustomDohServers`) takes
+// this in place of any settings it is handed, `ControlDohSettings` included.
+func builtInDohServerSettings(settings *DohSettings) *DohSettings {
+	if settings == nil {
+		return DefaultDohSettings()
+	}
+	copied := *settings
+	defaultResolverSettings := DefaultDnsResolverSettings()
+	if settings.DnsResolverSettings == nil {
+		copied.DnsResolverSettings = defaultResolverSettings
+	} else {
+		resolverSettings := *settings.DnsResolverSettings
+		resolverSettings.RemoteDohUrlsIpv4 = defaultResolverSettings.RemoteDohUrlsIpv4
+		resolverSettings.RemoteDohUrlsIpv6 = defaultResolverSettings.RemoteDohUrlsIpv6
+		resolverSettings.LocalDohUrlsIpv4 = defaultResolverSettings.LocalDohUrlsIpv4
+		resolverSettings.LocalDohUrlsIpv6 = defaultResolverSettings.LocalDohUrlsIpv6
+		resolverSettings.RemoteDnsIpv4 = defaultResolverSettings.RemoteDnsIpv4
+		resolverSettings.RemoteDnsIpv6 = defaultResolverSettings.RemoteDnsIpv6
+		resolverSettings.LocalDnsIpv4 = defaultResolverSettings.LocalDnsIpv4
+		resolverSettings.LocalDnsIpv6 = defaultResolverSettings.LocalDnsIpv6
+		copied.DnsResolverSettings = &resolverSettings
+	}
+	copied.ServerStatsSeed = nil
+	return &copied
 }

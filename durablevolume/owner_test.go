@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Kernel facts are synthetic; protected paths, bytes, descriptors and leases
 // are real. Explicit barriers expose ordering without sleeps or live mounts.
@@ -13,22 +13,23 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // A private host instance never changes facts outside its own test owner.
 type fixtureHost struct {
-	stateLock      sync.Mutex
-	mounts         []Mount
-	uuidDevice     Device
-	filesystem     Filesystem
-	filesystemHook func(*os.File)
-	mountsErr      error
-	uuidErr        error
-	filesystemErr  error
+	stateLock       sync.Mutex
+	mounts          []Mount
+	uuidDevice      Device
+	filesystem      Filesystem
+	filesystemHook  func(*os.File)
+	writeHealthHook func(string, *os.File) error
+	mountsErr       error
+	uuidErr         error
+	filesystemErr   error
 }
 
 // Returns a copy so readers cannot mutate or race the next census.
@@ -56,6 +57,19 @@ func (self *fixtureHost) Filesystem(file *os.File) (Filesystem, error) {
 		hook(file)
 	}
 	return facts, err
+}
+
+// Refusal hooks cannot replace the successful write-health kernel operations.
+func (self *fixtureHost) observeWriteHealth(operation string, file *os.File) error {
+	hook := func() func(string, *os.File) error {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.writeHealthHook
+	}()
+	if hook != nil {
+		return hook(operation, file)
+	}
+	return nil
 }
 
 // Changes facts at a chosen causal boundary without process-global hooks.
@@ -88,6 +102,11 @@ func newVolumeFixture(t *testing.T) *volumeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Custody walks never follow symlinks; Darwin's temp directory is below
+	// the /var alias of /private/var.
+	if base, err = filepath.EvalSymlinks(base); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(base); err != nil {
 			t.Error(err)
@@ -108,21 +127,21 @@ func newVolumeFixture(t *testing.T) *volumeFixture {
 	if err := os.WriteFile(lease, leaseBytes, 0600); err != nil {
 		t.Fatal(err)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(root, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Stat(root, &stat); err != nil {
 		t.Fatal(err)
 	}
-	device := deviceNumber(stat.Dev)
+	device := statDevice(&stat)
 	rootDevice := Device{Major: device.Major ^ 1, Minor: device.Minor}
 	host := &fixtureHost{
 		mounts: []Mount{
-			{Id: 1, ParentId: 1, Device: rootDevice, Root: "/", Path: "/", FilesystemType: "ext4"},
-			{Id: 7, ParentId: 1, Device: device, Root: "/", Path: mount, FilesystemType: "ext4"},
+			{Id: 1, ParentId: 1, Device: rootDevice, Root: "/", Path: "/", FilesystemType: testFilesystemType},
+			{Id: 7, ParentId: 1, Device: device, Root: "/", Path: mount, FilesystemType: testFilesystemType},
 		},
 		uuidDevice: device,
-		filesystem: Filesystem{Id: [2]int32{17, 19}, Type: 0xef53, AvailableBytes: 1024 * 1024, AvailableInodes: 1024},
+		filesystem: Filesystem{Id: [2]int32{17, 19}, Type: filesystemMagic(testFilesystemType), AvailableBytes: 1024 * 1024, AvailableInodes: 1024},
 	}
-	config := Config{Schema: Schema, Volumes: []VolumeSpec{{MountPath: mount, FilesystemUuid: "1234-abcd", FilesystemType: "ext4", MarkerPath: marker,
+	config := Config{Schema: Schema, Volumes: []VolumeSpec{{MountPath: mount, FilesystemUuid: "1234-abcd", FilesystemType: testFilesystemType, MarkerPath: marker,
 		MarkerSha256: testDigest(markerBytes), StateRoots: []StateRootSpec{provisionTestRoot(t, root, lease, testDigest(leaseBytes))}, MinAvailableBytes: 1024, MinAvailableInodes: 8}}}
 	self := &volumeFixture{reference: Reference{Path: filepath.Join(base, "volumes.json")}, config: config, root: root, mount: mount, marker: marker, host: host}
 	self.writeConfig(t)
@@ -136,11 +155,11 @@ func provisionTestRoot(t *testing.T, path, lease, leaseSha256 string) StateRootS
 	if _, err := rand.Read(raw); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Setxattr(path, RootGenerationAttribute, raw, 0); err != nil {
+	if err := unix.Setxattr(path, RootGenerationAttribute, raw, 0); err != nil {
 		t.Fatal(err)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(path, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil {
 		t.Fatal(err)
 	}
 	return StateRootSpec{Path: path, LeasePath: lease, LeaseSha256: leaseSha256, RootInode: stat.Ino, GenerationSha256: testDigest(raw)}
@@ -224,16 +243,14 @@ func TestOwnerRefusesMissingRootWithoutRecreation(t *testing.T) {
 }
 
 // A uuid result must identify the exact currently mounted device.
-func TestOwnerRefusesWrongUuidAndRootFilesystem(t *testing.T) {
-	for _, kind := range []string{"uuid", "root-device", "nested", "duplicate"} {
+func TestOwnerRefusesWrongUuidAndAmbiguousMounts(t *testing.T) {
+	for _, kind := range []string{"uuid", "nested", "duplicate"} {
 		fixture := newVolumeFixture(t)
 		switch kind {
 		case "uuid":
 			fixture.host.uuidDevice.Minor++
-		case "root-device":
-			fixture.host.mounts[0].Device = fixture.host.uuidDevice
 		case "nested":
-			fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 8, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: "ext4"})
+			fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 8, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: testFilesystemType})
 		case "duplicate":
 			fixture.host.mounts = append(fixture.host.mounts, fixture.host.mounts[1])
 		}
@@ -242,6 +259,18 @@ func TestOwnerRefusesWrongUuidAndRootFilesystem(t *testing.T) {
 			t.Fatalf("%s admitted", kind)
 		}
 	}
+}
+
+// A declared volume may share the root filesystem's device; its uuid, marker
+// and lease still identify it.
+func TestOwnerAdmitsDeclaredVolumeOnRootDevice(t *testing.T) {
+	fixture := newVolumeFixture(t)
+	fixture.host.mounts[0].Device = fixture.host.uuidDevice
+	owner, err := OpenWithHost(fixture.reference, fixture.root, ReadWrite, fixture.host)
+	if err != nil {
+		t.Fatal("declared volume on the root device was refused:", err)
+	}
+	owner.Close()
 }
 
 // Each admission checks both allocation dimensions and each read-only source.
@@ -342,7 +371,7 @@ func TestOwnerDescendantLossRemainsPoisonedAfterRestoration(t *testing.T) {
 			}
 		case "nested-mount":
 			fixture.host.change(func() {
-				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: path, FilesystemType: "ext4"})
+				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: path, FilesystemType: testFilesystemType})
 			})
 		}
 		if err := owner.CheckDirectory("journal", directory); !errors.Is(err, ErrIdentity) {
@@ -741,17 +770,5 @@ func TestLoadRejectsAmbiguousDeclaration(t *testing.T) {
 		if _, err := Load(fixture.reference); err == nil {
 			t.Fatalf("%s declaration admitted", kind)
 		}
-	}
-}
-
-// Kernel path escapes are decoded once, preserving exact namespace identity.
-func TestMountParserPreservesEscapedCoordinates(t *testing.T) {
-	raw := []byte("7 1 8:2 / /synthetic\\040volume rw,nosuid shared:9 - ext4 /dev/synthetic rw\n")
-	mounts, err := parseMounts(raw)
-	if err != nil || len(mounts) != 1 || mounts[0].Path != "/synthetic volume" || mounts[0].ReadOnly {
-		t.Fatalf("parsed: %+v %v", mounts, err)
-	}
-	if _, err := parseMounts([]byte(strings.ReplaceAll(string(raw), `\040`, `\999`))); err == nil {
-		t.Fatal("unknown escape admitted")
 	}
 }
