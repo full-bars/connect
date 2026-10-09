@@ -1067,9 +1067,9 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		EvictionNotice:           true,
 		ReceiveQueueMinByteCount: kib(320),
 		AllowLegacyNack:          true,
-		// THROUGHPUTFIX §39.1. Four open receive contracts is already the
-		// window a reorder needs; an announced successor occupies one of them
-		// for at most the tail of its predecessor.
+		// Four contracts cover the receive reorder window. Accepted successors
+		// remain stored until activation; that transition trims predecessors
+		// without closing the current contract or newer announcements.
 		AcceptContractAhead:    true,
 		MaxOpenReceiveContract: 4,
 		ProtocolVersion:        DefaultProtocolVersion,
@@ -1536,6 +1536,9 @@ type ClientSettings struct {
 	// Optional lifecycle-only memory accounting. Nil leaves it disabled. The
 	// pointer is captured at construction; do not mutate settings concurrently.
 	MemoryOwnerLedger *TransferMemoryOwnerLedger
+	// Optional payload lifetime charges; nil disables packet-path accounting.
+	// Captured at construction independently from the worker ledger above.
+	PayloadOwnerLedger *TransferPayloadOwnerLedger
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1878,8 +1881,9 @@ type Client struct {
 
 	log Logger
 
-	settings          *ClientSettings
-	memoryOwnerLedger *TransferMemoryOwnerLedger
+	settings           *ClientSettings
+	memoryOwnerLedger  *TransferMemoryOwnerLedger
+	payloadOwnerLedger *TransferPayloadOwnerLedger
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
@@ -2120,6 +2124,7 @@ func NewClientWithTag(
 		log:                          log,
 		settings:                     settings,
 		memoryOwnerLedger:            settings.MemoryOwnerLedger,
+		payloadOwnerLedger:           settings.PayloadOwnerLedger,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
 		subprotocols:                 newSubprotocolRegistry(),
@@ -2997,6 +3002,14 @@ type NetworkPeer struct {
 
 func (self *Client) PeerManager() *PeerManager {
 	return self.peerManager
+}
+
+// WebRtcManager is the peer connection manager of this client, which the
+// peer-to-peer webrtc extender carrier signals through: an extender role
+// installs its answerer on it, and a dialer takes its exchanger for one
+// extender from it (EXTENDER.md S).
+func (self *Client) WebRtcManager() *WebRtcManager {
+	return self.webRtcManager
 }
 
 // NetworkPeers enumerates the connected peers and the count of
@@ -5702,7 +5715,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if self.closed {
+	if self.closed || sendPack.Ctx.Err() != nil {
 		return nil
 	}
 	if sendSequence, ok := self.sendSequences[id]; ok {
@@ -8096,6 +8109,7 @@ func (self *noAckFastPathSnapshot) reserve(byteCount ByteCount) bool {
 		return true
 	}
 	if !self.contract.acquireNoAckWriter() {
+		self.notifySettled()
 		return false
 	}
 	effective := self.effectiveByteCount(byteCount)
@@ -8152,7 +8166,7 @@ func (self *SendSequence) publishNoAckFastPath() {
 			return
 		}
 		contract = self.sendContract
-		if contract.noAckWriterState.Load()&noAckContractRetired != 0 {
+		if contract.expired() || contract.noAckWriterState.Load()&noAckContractRetired != 0 {
 			self.retireNoAckFastPath()
 			return
 		}
@@ -8850,6 +8864,10 @@ sendSequenceLoop:
 				// item's timeout backoff; a lost recovery returns to its prior
 				// ordinary cadence. Any resend awaits fresh acknowledgement state.
 				recoveryKind := item.recoveryKind
+				// Attribute the hole before a successful retry can change the
+				// item's carrier. Recovery on a direct lane does not make an
+				// earlier relay-carried hole a direct-lane loss.
+				holeCarrier := gapHoleCarrierOf(item)
 				item.recoveryKind = sendRecoveryNone
 				// §34.3: what this firing means is decided by this item's own
 				// lane and by its position in it. Anything acknowledged above
@@ -8986,11 +9004,10 @@ sendSequenceLoop:
 						self.recordSendSequenceExit("head_rewrite", item, time.Time{}, err)
 						return
 					}
-					MessagePoolReturn(item.transferFrameBytes)
+					self.replaceSendItemFrame(item, transferFrameBytes)
 					item.head = true
 					item.hasContractFrame = hasContractFrame
 					item.promotedHead = true
-					item.transferFrameBytes = transferFrameBytes
 				} else {
 					// var err error
 					// transferFrameBytes, err = self.setTag(item)
@@ -9060,7 +9077,7 @@ sendSequenceLoop:
 				if recoveryKind == sendRecoverySelectiveGap && 0 < item.timeoutDeferCount {
 					// a recovery the deferred retransmit declined to write
 					// and the scoreboard wrote instead (FLIGHTGATEFIX §23.3)
-					self.client.selectiveGapWritesOfDeferredItems[gapHoleCarrierOf(item)].Add(1)
+					self.client.selectiveGapWritesOfDeferredItems[holeCarrier].Add(1)
 				}
 				if recoveryKind == sendRecoverySelectiveGap &&
 					self.scheduleGapRecoveryProbe(
@@ -9810,11 +9827,19 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		}
 
 		if self.sendContract != nil {
-			// there should be a queued up contract
-			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, retryInterval)) {
+			// Expired prefetches cannot become usable while we wait. Poll once
+			// for a live successor, then request renewal without spending the
+			// caller's admission timeout on the ordinary exhaustion retry.
+			initialWait := min(self.sendBufferSettings.CreateContractTimeout, retryInterval)
+			if self.sendContract.expired() {
+				initialWait = 0
+			}
+			if traceNextContract(initialWait) {
 				return true
 			}
-			retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
+			if 0 < initialWait {
+				retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
+			}
 		}
 
 		for {
@@ -9960,6 +9985,9 @@ func (self *SendSequence) sendContractRemainingByteCount() ByteCount {
 // has stopped advertising it, a successor is already announced, or the
 // destination queue has no contract ready. Nothing here blocks.
 func (self *SendSequence) maybeAnnounceContractAhead() {
+	if self.aheadSendContract != nil && self.aheadSendContract.expired() {
+		self.discardAheadContract()
+	}
 	if self.sendContract == nil || self.aheadSendContract != nil {
 		return
 	}
@@ -10025,6 +10053,7 @@ func (self *SendSequence) announceContractAhead() {
 	// the successor's own opening debit, the same one `setNextContract` makes,
 	// so the contract that becomes current is accounted identically
 	if !aheadContract.update(0) {
+		self.sendContract.rollbackUnwritten(0)
 		self.client.ContractManager().CloseContract(aheadContract.contractId, 0, 0)
 		return
 	}
@@ -10083,13 +10112,14 @@ func (self *SendSequence) setAheadContract(messageByteCount ByteCount) bool {
 		return false
 	}
 	metadata := self.contractMetadata()
-	if self.aheadSendContractMetadataGeneration != metadata.generation {
-		// the contract path changed under it; it is still tracked in
-		// `openSendContracts` and closes on its acknowledgements
-		self.aheadSendContract = nil
+	if self.aheadSendContractMetadataGeneration != metadata.generation || aheadContract.expired() {
+		self.discardAheadContract()
 		return false
 	}
 	if !aheadContract.update(messageByteCount) {
+		if aheadContract.expired() {
+			self.discardAheadContract()
+		}
 		return false
 	}
 	self.aheadSendContract = nil
@@ -10408,7 +10438,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
 		}
 		item.acks.invoke(admissionErr)
-		item.messagePoolReturn()
+		self.returnSendItem(item)
 		return
 	}
 	compactContractHead := head && self.sendContract != nil &&
@@ -10593,6 +10623,9 @@ func (self *SendSequence) sendWithSetContractRecords(
 	self.client.initialSendFrameCount.Add(uint64(len(sendFrames)))
 	self.client.initialSendMessageByteCount.Add(uint64(messageByteCount))
 	if ack {
+		if ledger := self.client.payloadOwnerLedger; ledger != nil {
+			ledger.update(transferPayloadOwnerSendAck, self.sequenceId[15], 1, int64(cap(item.transferFrameBytes)))
+		}
 		// Publish acknowledgement identity before any observer or route can expose
 		// the bytes to the peer. A direct route can return its Ack synchronously
 		// inside the write; validation must find the item instead of discarding that
@@ -10675,7 +10708,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			self.ackItem(item)
 		} else {
 			item.acks.invoke(err)
-			item.messagePoolReturn()
+			self.returnSendItem(item)
 		}
 	}
 }
@@ -10784,8 +10817,7 @@ func (self *SendSequence) receiveContractMissing(
 		)
 		return false
 	}
-	MessagePoolReturn(item.transferFrameBytes)
-	item.transferFrameBytes = transferFrameBytes
+	self.replaceSendItemFrame(item, transferFrameBytes)
 	item.head = true
 	item.hasContractFrame = hasContractFrame
 	item.sendTime = time.Now()
@@ -12205,7 +12237,7 @@ func (self *SendSequence) ackItem(item *sendItem) {
 		}
 	}
 	item.acks.invoke(nil)
-	item.messagePoolReturn()
+	self.returnSendItem(item)
 }
 
 func (self *SendSequence) releaseRetainedSendItems(err error) {
@@ -12218,14 +12250,14 @@ func (self *SendSequence) releaseRetainedSendItems(err error) {
 		if item != nil {
 			self.resendQueue.RemoveByMessageId(item.messageId)
 			item.acks.invoke(err)
-			item.messagePoolReturn()
+			self.returnSendItem(item)
 		}
 	}
 	self.sendItems = nil
 	// Also support direct/test queue construction without an identity list.
 	for _, item := range self.resendQueue.Clear() {
 		item.acks.invoke(err)
-		item.messagePoolReturn()
+		self.returnSendItem(item)
 	}
 }
 
@@ -16045,6 +16077,16 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		})
 		return errors.New("Contract path does not match receive path.")
 	}
+	// A valid signature cannot extend its signed admission deadline. Late
+	// traffic is refused without treating an ordinary expiry as a trust fault.
+	if nextReceiveContract.expired() {
+		if item.contractAhead {
+			// Ignore stale successor metadata. The enclosing control Pack
+			// still needs an unexpired current contract for its own debit.
+			return nil
+		}
+		return errContractExpired
+	}
 
 	// THROUGHPUTFIX §39.1. An announced successor is verified exactly as an
 	// opening contract is — the same hmac, the same path check above — and
@@ -16058,6 +16100,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	// early path finds the id already open and makes it current.
 	if item.contractAhead {
 		if err := self.registerContractAhead(nextReceiveContract); err != nil {
+			if errors.Is(err, errContractExpired) {
+				return nil
+			}
 			self.rejectRetransmits = true
 			self.peerAudit.Update(func(a *PeerAudit) {
 				a.badContract()
@@ -16067,6 +16112,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		return nil
 	}
 	if err := self.setContract(nextReceiveContract); err != nil {
+		if errors.Is(err, errContractExpired) {
+			return err
+		}
 		self.rejectRetransmits = true
 		// the next contract has already been used
 		// bad contract
@@ -16113,7 +16161,13 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 func (self *ReceiveSequence) registerContractAhead(
 	aheadReceiveContract *sequenceContract,
 ) error {
+	if aheadReceiveContract.expired() {
+		return errContractExpired
+	}
 	if existing, ok := self.openReceiveContracts[aheadReceiveContract.contractId]; ok {
+		if existing.expired() {
+			return errContractExpired
+		}
 		// a retransmitted announcement: idempotent, and the stored contract
 		// keeps whatever it has already accounted
 		if existing != aheadReceiveContract {
@@ -16133,12 +16187,21 @@ func (self *ReceiveSequence) registerContractAhead(
 }
 
 func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) error {
+	if nextReceiveContract.expired() {
+		return errContractExpired
+	}
 	// contract already set
 	if self.receiveContract != nil && self.receiveContract.contractId == nextReceiveContract.contractId {
+		if self.receiveContract.expired() {
+			return errContractExpired
+		}
 		return nil
 	}
 
 	if receiveContract, ok := self.openReceiveContracts[nextReceiveContract.contractId]; ok {
+		if receiveContract.expired() {
+			return errContractExpired
+		}
 		// switch to the current contract
 		superseded := self.receiveContract
 		self.receiveContract = receiveContract
@@ -16150,6 +16213,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		if superseded != nil && superseded != receiveContract {
 			self.client.ContractManager().closeContractStats(superseded.contractId)
 		}
+		self.trimReceiveContracts()
 		return nil
 	}
 
@@ -16182,6 +16246,15 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		self.client.ContractManager().closeContractStats(superseded.contractId)
 	}
 
+	self.trimReceiveContracts()
+	return nil
+}
+
+// Announced successors also need the existing retirement window when activated.
+// Keep the current contract and any newer accepted announcements: activation
+// may retire predecessors, but must not close a successor before its first use.
+// An excess of not-yet-activated announcements can still exceed the window.
+func (self *ReceiveSequence) trimReceiveContracts() {
 	if d := len(self.openReceiveContracts) - self.receiveBufferSettings.MaxOpenReceiveContract; 0 < d {
 		// remove the least recently added
 		orderedReceiveContracts := slices.Collect(maps.Values(self.openReceiveContracts))
@@ -16190,7 +16263,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 			return a.localId.Cmp(b.localId)
 		})
 		for _, receiveContract := range orderedReceiveContracts[:d] {
-			if receiveContract != self.receiveContract {
+			if receiveContract.localId.Cmp(self.receiveContract.localId) < 0 {
 				self.client.ContractManager().CloseContract(
 					receiveContract.contractId,
 					receiveContract.ackedByteCount,
@@ -16200,8 +16273,6 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 			}
 		}
 	}
-
-	return nil
 }
 
 // Tracks the verified stream that can carry destination-only ACK traffic back
@@ -16242,12 +16313,22 @@ func (self *ReceiveSequence) updateContract(item *receiveItem) bool {
 	// always use a contract if present
 	// the sender may send contracts even if `receiveNoContract` is set locally
 	if item.contractId != nil {
-		if receiveContract, ok := self.openReceiveContracts[*item.contractId]; ok && receiveContract.update(item.messageByteCount) {
+		if receiveContract, ok := self.openReceiveContracts[*item.contractId]; ok {
+			if receiveContract.expired() {
+				return false
+			}
+			if receiveContract.update(item.messageByteCount) {
+				return true
+			}
+		}
+	} else if self.receiveContract != nil {
+		if self.receiveContract.expired() {
+			return false
+		}
+		if self.receiveContract.update(item.messageByteCount) {
+			item.contractId = &self.receiveContract.contractId
 			return true
 		}
-	} else if self.receiveContract != nil && self.receiveContract.update(item.messageByteCount) {
-		item.contractId = &self.receiveContract.contractId
-		return true
 	}
 	// `receiveNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
@@ -16437,6 +16518,7 @@ type sequenceContract struct {
 	transferByteCount          ByteCount
 	effectiveTransferByteCount ByteCount
 	provideMode                protocol.ProvideMode
+	expirationTimeUnixMilli    *int64
 
 	minUpdateByteCount ByteCount
 
@@ -16564,6 +16646,7 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		transferByteCount:                        ByteCount(storedContract.TransferByteCount),
 		effectiveTransferByteCount:               ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
 		provideMode:                              contract.ProvideMode,
+		expirationTimeUnixMilli:                  storedContract.ExpirationTimeUnixMilli,
 		minUpdateByteCount:                       minUpdateByteCount,
 		path:                                     path,
 		ackedByteCount:                           ByteCount(0),
@@ -16577,6 +16660,9 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 }
 
 func (self *sequenceContract) update(byteCount ByteCount) bool {
+	if self.expired() {
+		return false
+	}
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
 
 	fits := self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
@@ -16624,7 +16710,7 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 // can push an otherwise-small batch over the transport message limit.
 func (self *sequenceContract) canUpdate(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
-	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount &&
+	return !self.expired() && self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount &&
 		(!self.noAckBudgetPublished || int64(effectiveByteCount) <= self.noAckRemainingByteCount.Load())
 }
 
@@ -16733,7 +16819,7 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		if self.closed {
+		if self.closed || forwardPack.Ctx.Err() != nil {
 			return nil
 		}
 		forwardSequence, ok := self.forwardSequences[forwardPack.Destination]
@@ -16931,7 +17017,7 @@ func NewForwardSequence(
 }
 
 // success, error
-func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duration) (bool, error) {
+func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duration) (success bool, err error) {
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
 
@@ -16947,6 +17033,18 @@ func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duratio
 		return false, errors.New("Done.")
 	}
 	defer self.idleCondition.UpdateClose()
+
+	if ledger := self.client.payloadOwnerLedger; ledger != nil {
+		// Charge before publication: the worker may return the payload before
+		// this sender resumes. A pending offer is included until refused.
+		bytes := int64(cap(forwardPack.TransferFrameBytes))
+		ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], 1, bytes)
+		defer func() {
+			if !success {
+				ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], -1, -bytes)
+			}
+		}()
+	}
 
 	// fast path without arming a timer
 	select {
@@ -17012,8 +17110,11 @@ func (self *ForwardSequence) Run() {
 					transferFrameBytes = MessagePoolCopy(forwardPack.TransferFrameBytes)
 					// the write proceeds on the copy; the original is done here
 					MessagePoolReturn(forwardPack.TransferFrameBytes)
+					if ledger := self.client.payloadOwnerLedger; ledger != nil {
+						ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], 0, int64(cap(transferFrameBytes)-cap(forwardPack.TransferFrameBytes)))
+					}
 				}
-				defer MessagePoolReturn(transferFrameBytes)
+				defer self.returnForwardPayload(transferFrameBytes)
 				shared := MessagePoolShareReadOnly(transferFrameBytes)
 				err := self.multiRouteWriter.Write(
 					self.ctx,
@@ -17099,7 +17200,7 @@ func (self *ForwardSequence) Close() {
 				if !ok {
 					return
 				}
-				MessagePoolReturn(forwardPack.TransferFrameBytes)
+				self.returnForwardPayload(forwardPack.TransferFrameBytes)
 			default:
 				return
 			}

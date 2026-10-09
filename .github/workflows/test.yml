@@ -87,10 +87,10 @@ jobs:
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. the root package (the data path) takes 30 to 35 min
       # on a runner (1750 s and 2110 s measured on 2026-10-04), so 20 min
-      # stopped it partway. Three tests are skipped here and reported in the
+      # stopped it partway. Five tests are skipped here and reported in the
       # non-blocking steps below.
       - name: Test
-        run: go test -count=1 -timeout 60m -skip '^(TestUpstreamTcpSendBufferGrowsUnderLoad|TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget|TestOriginalInventoryActualCleanupRotationAndIndependentContracts)$' $(go list ./... | grep -v '/extender$')
+        run: go test -count=1 -timeout 60m -skip '^(TestUpstreamTcpSendBufferGrowsUnderLoad|TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget|TestOriginalInventoryActualCleanupRotationAndIndependentContracts|TestConnectDoesNotImportItsOwnSubpackages|TestPinnedToolchain)$' $(go list ./... | grep -v '/extender$')
 
       # TestUpstreamTcpSendBufferGrowsUnderLoad waits for the kernel to grow a
       # loopback socket's send buffer to tcp_wmem's maximum. Run 20 times on one
@@ -123,14 +123,23 @@ jobs:
       # warning once a test starts passing again; ANY other failure gates.
       # Both carry in the upstream-forward brief (connect-upstream-forward.md).
       # Remove the quarantine once upstream fixes them.
+      #
+      # Two more, reproduced 2026-10-09 on a pristine checkout of upstream
+      # 01266656 with no fork content: TestConnectDoesNotImportItsOwnSubpackages
+      # fails because upstream's own new conformance tests
+      # (net_quic_initial_conformance_test.go, net_tls_hello_conformance_test.go)
+      # import the fingerprint subpackage, which its layering gate forbids; and
+      # mls's TestPinnedToolchain wants go1.26.5 while upstream's go.mod names
+      # toolchain go1.27.1.
       - name: Test upstream-broken cause/inventory tests (documented signatures only)
         run: |
           run_documented() {
             local name="$1"
             local pattern="$2"
+            local pkg="${3:-.}"
             local out
             local rc=0
-            out=$(go test -count=1 -timeout 10m -run "^${name}$" . 2>&1) || rc=$?
+            out=$(go test -count=1 -timeout 10m -run "^${name}$" "$pkg" 2>&1) || rc=$?
             if [ $rc -eq 0 ]; then
               echo "::warning::${name} now passes; remove its quarantine"
               return 0
@@ -146,4 +155,6 @@ jobs:
           rc=0
           run_documented TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget 'absent branches escaped shared admission: visits=3 retained=2 incomplete=1 overflow=true' || rc=1
           run_documented TestOriginalInventoryActualCleanupRotationAndIndependentContracts 'client key manager closed' || rc=1
+          run_documented TestConnectDoesNotImportItsOwnSubpackages 'which CODESTYLE section Package layering forbids' . || rc=1
+          run_documented TestPinnedToolchain 'want go1.26.5' ./mls || rc=1
           exit $rc

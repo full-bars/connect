@@ -1108,7 +1108,14 @@ type Auth struct {
 	// 4 or 6. Zero (absent) is a legacy family-agnostic transport, which the
 	// platform counts as v4. The platform ignores the intent unless the
 	// family it observed the connection arrive on agrees.
-	IpFamily      int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	IpFamily int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	// the client intends to provide publicly on this connection. The platform
+	// then judges the client as a provider instead of counting it toward the
+	// network's concurrent client limit. This is the frame form of the H1
+	// `X-UR-Provide-Intent: 1` header, for transports that authenticate with
+	// this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
+	// server ignores the unknown field, which counts as no intent.
+	ProvideIntent bool `protobuf:"varint,7,opt,name=provide_intent,json=provideIntent,proto3" json:"provide_intent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1183,6 +1190,13 @@ func (x *Auth) GetIpFamily() int32 {
 		return x.IpFamily
 	}
 	return 0
+}
+
+func (x *Auth) GetProvideIntent() bool {
+	if x != nil {
+		return x.ProvideIntent
+	}
+	return false
 }
 
 type Provide struct {
@@ -1635,8 +1649,16 @@ type ExchangeSignals struct {
 	// initial WaitingForSdpOffer from a newly restarted passive association.
 	// Older peers omit/ignore it and retain the legacy compatibility path.
 	SenderGenerationId []byte `protobuf:"bytes,4,opt,name=sender_generation_id,json=senderGenerationId,proto3" json:"sender_generation_id,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// True for the signaling of the peer-to-peer webrtc extender carrier
+	// (EXTENDER.md S): a dialer's SDP offer to an extender and the extender's
+	// SDP answer, keyed by stream_id like a p2p negotiation but never bound
+	// to a transport peer connection. A receiver that predates the field
+	// sees an offer for a stream it has no peer connection for and drops it,
+	// which is the compatibility path: an old extender simply does not
+	// answer.
+	ExtenderCarrier bool `protobuf:"varint,5,opt,name=extender_carrier,json=extenderCarrier,proto3" json:"extender_carrier,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ExchangeSignals) Reset() {
@@ -1695,6 +1717,13 @@ func (x *ExchangeSignals) GetSenderGenerationId() []byte {
 		return x.SenderGenerationId
 	}
 	return nil
+}
+
+func (x *ExchangeSignals) GetExtenderCarrier() bool {
+	if x != nil {
+		return x.ExtenderCarrier
+	}
+	return false
 }
 
 // signals are sent in real time to the destination of the peer pair
@@ -2084,9 +2113,13 @@ type StoredContract struct {
 	// identity principal assigned to the source client at creation.
 	// Sealed into the platform-signed contract bytes. Set only when
 	// `provide_mode` is `Network`; empty for all other provide modes.
-	Principal     string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Principal string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
+	// Absolute admission deadline, sealed into the platform-signed bytes.
+	// Missing preserves legacy contracts without a time limit. At or after
+	// this Unix millisecond timestamp no new transfer bytes may be debited.
+	ExpirationTimeUnixMilli *int64 `protobuf:"varint,12,opt,name=expiration_time_unix_milli,json=expirationTimeUnixMilli,proto3,oneof" json:"expiration_time_unix_milli,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *StoredContract) Reset() {
@@ -2194,6 +2227,13 @@ func (x *StoredContract) GetPrincipal() string {
 		return x.Principal
 	}
 	return ""
+}
+
+func (x *StoredContract) GetExpirationTimeUnixMilli() int64 {
+	if x != nil && x.ExpirationTimeUnixMilli != nil {
+		return *x.ExpirationTimeUnixMilli
+	}
+	return 0
 }
 
 // control message
@@ -2898,7 +2938,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
 	"\x1a_receiver_ack_delay_micros\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xed\x01\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x94\x02\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
@@ -2907,7 +2947,8 @@ const file_transfer_proto_rawDesc = "" +
 	"instanceId\x12.\n" +
 	"\x13h3_datagram_version\x18\x04 \x01(\rR\x11h3DatagramVersion\x12?\n" +
 	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\x12\x1b\n" +
-	"\tip_family\x18\x06 \x01(\x05R\bipFamily\"4\n" +
+	"\tip_family\x18\x06 \x01(\x05R\bipFamily\x12%\n" +
+	"\x0eprovide_intent\x18\a \x01(\bR\rprovideIntent\"4\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\"f\n" +
 	"\n" +
@@ -2939,12 +2980,13 @@ const file_transfer_proto_rawDesc = "" +
 	"\x10_disconnect_time\"\x13\n" +
 	"\x11NetworkPeersReset\"B\n" +
 	"\x12NetworkPeersUpdate\x12,\n" +
-	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xba\x01\n" +
+	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xe5\x01\n" +
 	"\x0fExchangeSignals\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12#\n" +
 	"\rreset_signals\x18\x02 \x01(\bR\fresetSignals\x123\n" +
 	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\x120\n" +
-	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\"\xa3\x01\n" +
+	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\x12)\n" +
+	"\x10extender_carrier\x18\x05 \x01(\bR\x0fextenderCarrier\"\xa3\x01\n" +
 	"\x0eExchangeSignal\x126\n" +
 	"\vsignal_type\x18\x03 \x01(\x0e2\x15.bringyour.SignalTypeR\n" +
 	"signalType\x12\x15\n" +
@@ -2979,7 +3021,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
 	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
 	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
-	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\xbe\x04\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x9f\x05\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -2993,13 +3035,15 @@ const file_transfer_proto_rawDesc = "" +
 	"-destination_client_key_signed_tls_certificate\x18\t \x01(\fR(destinationClientKeySignedTlsCertificate\x12\x14\n" +
 	"\x05roles\x18\n" +
 	" \x03(\tR\x05roles\x12\x1c\n" +
-	"\tprincipal\x18\v \x01(\tR\tprincipalB\f\n" +
+	"\tprincipal\x18\v \x01(\tR\tprincipal\x12@\n" +
+	"\x1aexpiration_time_unix_milli\x18\f \x01(\x03H\x04R\x17expirationTimeUnixMilli\x88\x01\x01B\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\x9d\x02\n" +
+	"\t_priorityB\x1d\n" +
+	"\x1b_expiration_time_unix_milli\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +

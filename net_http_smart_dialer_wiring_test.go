@@ -50,6 +50,34 @@ func wiredStrategy(t *testing.T, dialers ...*clientDialer) *ClientStrategy {
 		strategy.dialers[dialer] = true
 	}
 	strategy.mutex.Unlock()
+	// Serial candidacy requires delivery evidence (dialerDelivered), which a
+	// fresh strategy does not have, so seed one verdict per dialer through the
+	// same record the production path reads and writes. Both are then serial
+	// candidates and only their ORDER is under test here.
+	for _, dialer := range dialers {
+		info := strategy.dialerInfo(dialer)
+		if info == nil || info.delivery == nil {
+			t.Fatalf("dialer %s has no delivery record to seed", dialer.description)
+		}
+		strategy.scores.recordVerdict(info.delivery.networkId, info.delivery.dialerKey, verdictDelivered)
+	}
+	return strategy
+}
+
+// wiredUnseededStrategy builds the same pool WITHOUT delivery evidence: the
+// state of a brand-new strategy, which upstream treats as having no proven
+// route.
+func wiredUnseededStrategy(t *testing.T, dialers ...*clientDialer) *ClientStrategy {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	strategy := NewClientStrategyWithDefaults(ctx)
+	strategy.mutex.Lock()
+	strategy.dialers = map[*clientDialer]bool{}
+	for _, dialer := range dialers {
+		strategy.dialers[dialer] = true
+	}
+	strategy.mutex.Unlock()
 	return strategy
 }
 
@@ -199,5 +227,59 @@ func TestSmartDialerWebSocketDialFeedsConnectSamples(t *testing.T) {
 
 	if _, samples := dialer.measuredLatency(); samples < 1 {
 		t.Fatalf("no connect sample after a fresh websocket connection")
+	}
+}
+
+// With no delivery evidence nothing is a serial candidate, so a fresh strategy
+// races the routes instead of trying one in priority order. This pins
+// upstream's selection semantics, independent of the smart dialer.
+func TestFreshStrategyHasNoSerialCandidates(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		withSmartDialer(t, on)
+		var fragmentCarried, normalCarried atomic.Int32
+		fragment := wiredDialer("fragment", 0, 600*time.Millisecond, &fragmentCarried)
+		normal := wiredDialer("normal", 25, 80*time.Millisecond, &normalCarried)
+		strategy := wiredUnseededStrategy(t, fragment, normal)
+
+		if _, err := strategy.HttpParallel(getRequest(t)); err != nil {
+			t.Fatalf("smart=%v: %v", on, err)
+		}
+		if normalCarried.Load() < 1 || fragmentCarried.Load() < 1 {
+			t.Fatalf("smart=%v: a fresh strategy must race both routes, normal carried %d, fragment carried %d",
+				on, normalCarried.Load(), fragmentCarried.Load())
+		}
+	}
+}
+
+// The latency factor must reach the weights of a REAL strategy, whose base
+// weight is each dialer's minimum and whose scores multiply it. A bare
+// strategy with no scores took a different path, which is why the existing
+// scaling test did not notice the weighting going dead.
+func TestSmartDialerWeightsDampTheSlowRouteOnAScoredStrategy(t *testing.T) {
+	var carried atomic.Int32
+	fast := wiredDialer("fast", 0, 200*time.Millisecond, &carried)
+	slow := wiredDialer("slow", 25, 20*time.Second, &carried)
+	// Unseeded on purpose: a route with no delivery evidence has a neutral
+	// score of exactly 1.0, which leaves the base weight at the dialer's
+	// minimum. A seeded score above 1 would lift the damped weight over the
+	// minimum and hide a floor that flattens the latency factor.
+	strategy := wiredUnseededStrategy(t, fast, slow)
+	if strategy.scores == nil {
+		t.Fatal("a real strategy must carry delivery scores")
+	}
+
+	withSmartDialer(t, false)
+	off := strategy.dialerWeights(false)
+	withSmartDialer(t, true)
+	on := strategy.dialerWeights(false)
+
+	if !(on[slow] < off[slow]) {
+		t.Fatalf("smart on must damp the slow route below its unscaled weight: off %v, on %v", off[slow], on[slow])
+	}
+	if !(on[slow] < on[fast]) {
+		t.Fatalf("smart on must weight the fast route above the slow one: fast %v, slow %v", on[fast], on[slow])
+	}
+	if on[slow] <= 0 {
+		t.Fatalf("a damped route must stay in the rotation, got %v", on[slow])
 	}
 }
