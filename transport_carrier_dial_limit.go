@@ -13,10 +13,10 @@ const (
 )
 
 // carrierDialLimiter implements a token bucket rate limiter for carrier dials.
-// It uses an injectable clock and an injectable-timer-free design: caller paths
-// compute the wait duration and wait on a timer created at the wait site.
-// Wait does not hold a lock while sleeping, and every admitted reservation
-// is granted a finite delay so no goroutine starves forever.
+// It uses an injectable clock; callers block in Wait, which computes the wait
+// and creates its own timer without holding the lock while sleeping, and every
+// admitted reservation is granted a finite delay so no goroutine starves
+// forever.
 type carrierDialLimiter struct {
 	mu          sync.Mutex
 	rate        float64
@@ -73,9 +73,10 @@ func (l *carrierDialLimiter) refillLocked(now time.Time) {
 	}
 }
 
-// computeWait calculates how long a caller must wait for 1 token at now
-// without consuming any tokens.
-func (l *carrierDialLimiter) computeWait(now time.Time) time.Duration {
+// computeWaitForTest calculates how long a caller must wait for 1 token at
+// now without consuming any tokens. Test-only: production gating goes through
+// reserve/Wait, which compute and reserve atomically.
+func (l *carrierDialLimiter) computeWaitForTest(now time.Time) time.Duration {
 	if l == nil || l.disabled {
 		return 0
 	}
@@ -119,13 +120,16 @@ func (l *carrierDialLimiter) reserve(now time.Time) (time.Duration, func()) {
 
 	var canceled bool
 	cancel := func() {
+		// Sample the clock before taking the lock: a caller-supplied clock
+		// may synchronize with its own mutex, and holding l.mu across the
+		// clock call would invert the order against Wait's unlocked read.
+		cNow := l.clock()
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		if canceled {
 			return
 		}
 		canceled = true
-		cNow := l.clock()
 		l.refillLocked(cNow)
 		l.tokens = min(l.burst, l.tokens+1.0)
 	}

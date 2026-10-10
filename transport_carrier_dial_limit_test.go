@@ -39,7 +39,7 @@ func TestCarrierDialLimiter_17thWaitsComputedDuration(t *testing.T) {
 	}
 
 	// 17th call computed wait
-	computed := limiter.computeWait(now)
+	computed := limiter.computeWaitForTest(now)
 	wantWait := 125 * time.Millisecond // 1/8 second
 	if computed != wantWait {
 		t.Fatalf("computeWait for 17th call = %v, want %v", computed, wantWait)
@@ -156,7 +156,7 @@ func TestCarrierDialLimiter_DisabledNeverWaits(t *testing.T) {
 		if !limiter.Wait(ctx) {
 			t.Fatalf("disabled limiter call %d should admit immediately", i)
 		}
-		if wait := limiter.computeWait(time.Now()); wait != 0 {
+		if wait := limiter.computeWaitForTest(time.Now()); wait != 0 {
 			t.Fatalf("disabled limiter computeWait should be 0, got %v", wait)
 		}
 	}
@@ -323,5 +323,156 @@ func TestRunH3_CarrierDialSlot_Integration(t *testing.T) {
 
 	if limiterCalls.Load() != 1 {
 		t.Fatalf("expected waitCarrierDialSlot to be called exactly once, got %d", limiterCalls.Load())
+	}
+}
+
+// TestCarrierDialLimiter_DefaultLimiterIsSharedAcrossTransports: two
+// transports built with default settings share the one process-wide limiter,
+// and draining it through one paces the other. The shared limiter's state is
+// saved and restored so the drain cannot leak into other tests.
+func TestCarrierDialLimiter_DefaultLimiterIsSharedAcrossTransports(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	newDefaultTransport := func() *PlatformTransport {
+		transport := NewPlatformTransportWithTargetMode(
+			ctx,
+			NewClientStrategyWithDefaults(ctx),
+			NewRouteManager(ctx, "carrier-dial"),
+			"https://example.invalid",
+			&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+			TransportModeH3,
+			DefaultPlatformTransportSettings(),
+		)
+		t.Cleanup(transport.Close)
+		return transport
+	}
+	t1 := newDefaultTransport()
+	t2 := newDefaultTransport()
+	if t1.carrierDialLimiter != defaultCarrierDialLimiter || t2.carrierDialLimiter != defaultCarrierDialLimiter {
+		t.Fatalf("default transports must share defaultCarrierDialLimiter (got %p / %p, want %p)",
+			t1.carrierDialLimiter, t2.carrierDialLimiter, defaultCarrierDialLimiter)
+	}
+
+	def := defaultCarrierDialLimiter
+	def.mu.Lock()
+	origTokens, origLast := def.tokens, def.lastTime
+	def.mu.Unlock()
+	t.Cleanup(func() {
+		def.mu.Lock()
+		def.tokens, def.lastTime = origTokens, origLast
+		def.mu.Unlock()
+	})
+
+	// Exhaust the shared bucket through t1 (background transport activity may
+	// have consumed some tokens already, so drain until the limiter reports a
+	// wait), then confirm the same object paces t2. A past-dated now keeps
+	// the refill out of the arithmetic.
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	exhausted := false
+	for i := 0; i < int(def.burst)+2; i++ {
+		if wait, _ := t1.carrierDialLimiter.reserve(now); wait > 0 {
+			exhausted = true
+			break
+		}
+	}
+	if !exhausted {
+		t.Fatal("the shared limiter never reported a wait after a full burst of reservations")
+	}
+	if wait, _ := t2.carrierDialLimiter.reserve(now); wait == 0 {
+		t.Fatal("t2 was not paced after t1 exhausted the shared limiter: the default limiter is not shared")
+	}
+}
+
+// TestCarrierDialLimiter_SettingsMinusOneDisables: CarrierDialRate=-1 wires a
+// disabled limiter that admits immediately.
+func TestCarrierDialLimiter_SettingsMinusOneDisables(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultPlatformTransportSettings()
+	settings.CarrierDialRate = -1
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		NewClientStrategyWithDefaults(ctx),
+		NewRouteManager(ctx, "carrier-dial-off"),
+		"https://example.invalid",
+		&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+		TransportModeH3,
+		settings,
+	)
+	t.Cleanup(transport.Close)
+	if transport.carrierDialLimiter == nil || !transport.carrierDialLimiter.disabled {
+		t.Fatalf("CarrierDialRate=-1 must wire a disabled limiter, got %+v", transport.carrierDialLimiter)
+	}
+	if !transport.carrierDialLimiter.Wait(ctx) {
+		t.Fatal("a disabled limiter must admit immediately")
+	}
+}
+
+// TestCarrierDialLimiter_CancelWhileWaitingRefundsOnce exercises the
+// in-flight cancellation arm: a waiter sleeping on its timer returns false
+// and refunds its token exactly once; a second refund is a no-op.
+func TestCarrierDialLimiter_CancelWhileWaitingRefundsOnce(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	limiter := newCarrierDialLimiterWithClock(8, 16, clock)
+	for i := 0; i < 16; i++ {
+		limiter.reserve(clock())
+	}
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+	done := make(chan bool, 1)
+	go func() { done <- limiter.Wait(ctx) }()
+
+	// Wait until the goroutine has reserved its token (tokens go to -1) and
+	// is sleeping on the real timer; the fake clock never advances, so only
+	// the ctx arm can end the wait early.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		limiter.mu.Lock()
+		tokens := limiter.tokens
+		limiter.mu.Unlock()
+		if tokens == -1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never reserved a token")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelCtx()
+	select {
+	case admitted := <-done:
+		if admitted {
+			t.Fatal("Wait returned true after cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after cancellation")
+	}
+	limiter.mu.Lock()
+	tokens := limiter.tokens
+	limiter.mu.Unlock()
+	if tokens != 0 {
+		t.Fatalf("tokens after the cancel refund = %v, want 0 (exactly one refund)", tokens)
+	}
+
+	// A second refund must be a no-op.
+	wait, refund := limiter.reserve(clock())
+	if wait != 125*time.Millisecond {
+		t.Fatalf("probe wait = %v, want 125ms", wait)
+	}
+	refund()
+	refund()
+	limiter.mu.Lock()
+	tokens = limiter.tokens
+	limiter.mu.Unlock()
+	if tokens != 0 {
+		t.Fatalf("tokens after a double refund = %v, want 0 (no double refund)", tokens)
 	}
 }

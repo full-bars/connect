@@ -637,10 +637,11 @@ type PlatformTransportSettings struct {
 	// Nil gives the transport a counter of its own.
 	ExtenderIpsMonitor *MonitorValue[uint64]
 
-	// CarrierDialRate caps process-wide carrier dial attempts per second across
-	// all runH3 modes (H3, H3Dns, H3DnsPump). Zero or negative uses the default
-	// (8 dials/second). A negative CarrierDialRate set explicitly to -1 disables
-	// dial limiting.
+	// CarrierDialRate caps carrier dial attempts per second across all runH3
+	// modes (H3, H3Dns, H3DnsPump). Zero (or any negative value other than -1)
+	// uses the default 8 dials/second, which is the shared process-wide
+	// limiter; setting a positive rate creates a per-transport limiter with
+	// that rate instead. Setting CarrierDialRate to -1 disables dial limiting.
 	CarrierDialRate float64
 	// CarrierDialBurst caps the token bucket burst size for carrier dials. Zero
 	// or negative uses the default (16).
