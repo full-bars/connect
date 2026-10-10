@@ -32,6 +32,37 @@ type carrierDialLimiter struct {
 // configured for 8 dials/second with a burst of 16.
 var defaultCarrierDialLimiter = newCarrierDialLimiter(defaultCarrierDialRate, defaultCarrierDialBurst)
 
+// carrierDialLimiterKey identifies a limiter by its effective settings. Two
+// transports configured with the same pair share one bucket.
+type carrierDialLimiterKey struct {
+	rate  float64
+	burst int
+}
+
+// carrierDialLimiterRegistry maps a settings pair to the single limiter that
+// enforces it process-wide.
+//
+// WHY THIS EXISTS: the settings are documented as a PROCESS-WIDE cap on carrier
+// dials, but each PlatformTransport used to build its own limiter from the same
+// settings. The multi-client window copies one settings value into every
+// transport (up to 3 per client in a family group), so an operator who set the
+// default explicitly multiplied the cap by the transport count: rate=4 with 16
+// transports admitted 64/s. Keying the limiter by its effective settings makes
+// the cap what it says it is, and makes an explicit default share the same
+// bucket as leaving it unset.
+var carrierDialLimiterRegistry sync.Map // carrierDialLimiterKey -> *carrierDialLimiter
+
+// sharedCarrierDialLimiter returns the process-wide limiter for these
+// settings, creating it on first use.
+func sharedCarrierDialLimiter(rate float64, burst int) *carrierDialLimiter {
+	key := carrierDialLimiterKey{rate: rate, burst: burst}
+	if l, ok := carrierDialLimiterRegistry.Load(key); ok {
+		return l.(*carrierDialLimiter)
+	}
+	actual, _ := carrierDialLimiterRegistry.LoadOrStore(key, newCarrierDialLimiter(rate, burst))
+	return actual.(*carrierDialLimiter)
+}
+
 func newCarrierDialLimiter(rate float64, burst int) *carrierDialLimiter {
 	return newCarrierDialLimiterWithClock(rate, burst, time.Now)
 }
@@ -40,9 +71,12 @@ func newCarrierDialLimiterWithClock(rate float64, burst int, clock func() time.T
 	if clock == nil {
 		clock = time.Now
 	}
-	if rate == -1 {
+	// ANY negative rate disables the limit, not just an exact -1. Matching -1
+	// exactly meant -2 silently fell through to the default limiter, which is
+	// the opposite of what an operator who typed a negative number asked for.
+	if rate < 0 {
 		return &carrierDialLimiter{
-			rate:     -1,
+			rate:     rate,
 			disabled: true,
 			clock:    clock,
 		}
@@ -73,6 +107,31 @@ func (l *carrierDialLimiter) refillLocked(now time.Time) {
 	}
 }
 
+// maxCarrierDialWait bounds a single computed wait. Without it, a tiny rate
+// makes the float-to-Duration conversion overflow: on amd64 an out-of-range
+// float64 to int64 conversion yields the minimum int64, so the wait goes
+// NEGATIVE and Wait admits immediately — the limiter silently stops limiting at
+// exactly the rates where it matters most. A minute is far longer than any
+// legitimate pacing wait.
+const maxCarrierDialWait = time.Minute
+
+// waitDuration converts a token deficit into a wait, clamped so an extreme rate
+// cannot overflow the Duration conversion into a negative (i.e. instant) wait.
+func waitDuration(deficit, rate float64) time.Duration {
+	if deficit <= 0 || rate <= 0 {
+		return 0
+	}
+	d := time.Duration(math.Ceil(deficit * float64(time.Second) / rate))
+	if d < 0 {
+		// Overflow landed in the negative range: the true wait is enormous.
+		return maxCarrierDialWait
+	}
+	if d > maxCarrierDialWait {
+		return maxCarrierDialWait
+	}
+	return d
+}
+
 // computeWaitForTest calculates how long a caller must wait for 1 token at
 // now without consuming any tokens. Test-only: production gating goes through
 // reserve/Wait, which compute and reserve atomically.
@@ -93,8 +152,7 @@ func (l *carrierDialLimiter) computeWaitForTest(now time.Time) time.Duration {
 	if 1.0 <= tokens {
 		return 0
 	}
-	deficit := 1.0 - tokens
-	return time.Duration(math.Ceil(deficit * float64(time.Second) / l.rate))
+	return waitDuration(1.0-tokens, l.rate)
 }
 
 // reserve attempts to allocate 1 token at now. It returns the required wait
@@ -114,8 +172,11 @@ func (l *carrierDialLimiter) reserve(now time.Time) (time.Duration, func()) {
 		return 0, func() {}
 	}
 
-	deficit := 1.0 - l.tokens
-	wait := time.Duration(math.Ceil(deficit * float64(time.Second) / l.rate))
+	// waitDuration, not a raw conversion: at a tiny rate the float-to-Duration
+	// conversion overflows to the minimum int64, the wait goes negative, and
+	// Wait treats `wait <= 0` as "admit immediately" — the limiter silently
+	// stops limiting at exactly the rates where it matters.
+	wait := waitDuration(1.0-l.tokens, l.rate)
 	l.tokens -= 1.0
 
 	var canceled bool

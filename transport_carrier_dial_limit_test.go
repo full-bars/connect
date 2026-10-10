@@ -248,7 +248,7 @@ func TestReconnectFastPathAllowed_TruthTable(t *testing.T) {
 }
 
 // TestRunH3_SourceAnchor verifies that runH3 gates dial attempts via
-// waitCarrierDialSlot before h3Gate.Acquire, and resets hadConnection when parked.
+// after h3Gate.Acquire and the standDown recheck, and resets hadConnection when parked.
 func TestRunH3_SourceAnchor(t *testing.T) {
 	source, err := readSource("transport.go")
 	if err != nil {
@@ -259,19 +259,40 @@ func TestRunH3_SourceAnchor(t *testing.T) {
 		t.Fatalf("could not find func (self *PlatformTransport) runH3(")
 	}
 
-	// Task A check: waitCarrierDialSlot immediately precedes h3Gate.Acquire
-	slotCall := "if !self.waitCarrierDialSlot(ctx) {"
+	// Order check. The slot is taken AFTER the gate Acquire and AFTER the
+	// standDown recheck, and with attemptCtx rather than ctx: a better mode
+	// elected during the gate wait cancels attemptCtx, which refunds the
+	// reservation, so an attempt that ends in `continue` does not spend a token
+	// on a dial that never happens. The previous anchor asserted the opposite
+	// order and the plain ctx argument, and its comment claimed a tighter
+	// relationship ("immediately precedes") than the check actually enforced.
+	slotCall := "if !self.waitCarrierDialSlot(attemptCtx) {"
 	gateAcquire := "self.h3Gate.Acquire(ctx, ptMode)"
 	slotIdx := strings.Index(body, slotCall)
 	gateIdx := strings.Index(body, gateAcquire)
+	standDownIdx := strings.Index(body, "self.standDown(ptMode)")
 	if slotIdx < 0 {
-		t.Fatalf("runH3 missing waitCarrierDialSlot call: %s", slotCall)
+		t.Fatalf("runH3 missing the carrier dial slot wait: %s", slotCall)
 	}
 	if gateIdx < 0 {
 		t.Fatalf("runH3 missing h3Gate.Acquire call")
 	}
-	if slotIdx > gateIdx {
-		t.Fatalf("waitCarrierDialSlot must precede h3Gate.Acquire in runH3")
+	if standDownIdx < 0 {
+		t.Fatalf("runH3 missing the standDown recheck")
+	}
+	if slotIdx < gateIdx {
+		t.Errorf("the carrier dial slot must be taken after h3Gate.Acquire, or a token can be " +
+			"granted seconds before the dial runs and the real dial instants bunch past the burst")
+	}
+	if slotIdx < standDownIdx {
+		t.Errorf("the carrier dial slot must be taken after the standDown recheck, or a parked " +
+			"attempt spends a token on a dial that never happens")
+	}
+	// The slot must use attemptCtx, not ctx: only attemptCtx is cancelled when a
+	// better mode wins the gate, which is what triggers the refund.
+	if strings.Contains(body, "if !self.waitCarrierDialSlot(ctx) {") {
+		t.Errorf("the carrier dial slot must use attemptCtx, not ctx, so an abandoned " +
+			"reservation is refunded when a better mode is elected")
 	}
 
 	// Task B check: runH3 updates hadConnection after standDown
@@ -297,16 +318,23 @@ func TestRunH3_CarrierDialSlot_Integration(t *testing.T) {
 	settings.carrierDialLimiterForTest = limiter
 
 	strategy := NewClientStrategy(ctx, DefaultClientStrategySettings())
-	transport := &PlatformTransport{
-		log:                NewNoopLogger(),
-		settings:           settings,
-		auth:               &ClientAuth{},
-		carrierDialLimiter: limiter,
-		clientStrategy:     strategy,
-		held:               NewMonitorValue(false),
-		mode:               NewMonitorValue(TransportModeNone),
-		kickMonitor:        NewMonitor(),
-	}
+	// Built through the constructor, not a struct literal. runH3 now reaches
+	// h3Gate.Acquire BEFORE the carrier dial slot (the slot moved after the
+	// standDown recheck so an abandoned attempt refunds its token), and a
+	// hand-built transport has a nil h3Gate - so the literal form panicked with
+	// a nil dereference instead of exercising the path under test. The
+	// constructor also wires the limiter from settings, which the literal
+	// bypassed entirely.
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		NewRouteManager(ctx, "carrier-dial-slot"),
+		"https://example.invalid",
+		&ClientAuth{},
+		TransportModeH3,
+		settings,
+	)
+	t.Cleanup(transport.Close)
 
 	done := make(chan struct{})
 	go func() {
@@ -314,15 +342,32 @@ func TestRunH3_CarrierDialSlot_Integration(t *testing.T) {
 		transport.runH3(ctx, TransportModeH3, 0, 1)
 	}()
 
+	// The limiter IS consulted on the attempt. It is not a tight spin: the
+	// retry path goes back through nextDialTime, which paces the next attempt,
+	// so one call inside a short window is the expected shape. The old
+	// assertion (exactly one call, and runH3 returns promptly) encoded the
+	// pre-reorder behaviour, when a rejection ended the runner. The slot now
+	// sits AFTER the gate and the standDown recheck so an abandoned attempt
+	// refunds its token, which makes a rejection retry rather than abort — the
+	// caller's own context is what ends the runner.
 	select {
 	case <-done:
-		// Succeeded in returning promptly
-	case <-time.After(2 * time.Second):
-		t.Fatalf("runH3 did not return promptly when waitCarrierDialSlot rejected")
+		t.Fatal("runH3 returned while the limiter kept rejecting; it should retry until ctx ends")
+	case <-time.After(150 * time.Millisecond):
+		// Still running: the limiter is being consulted, not bypassed.
 	}
 
-	if limiterCalls.Load() != 1 {
-		t.Fatalf("expected waitCarrierDialSlot to be called exactly once, got %d", limiterCalls.Load())
+	if limiterCalls.Load() < 1 {
+		t.Fatal("the carrier dial slot was never consulted in runH3")
+	}
+
+	// Ending the caller's context must stop the runner promptly — that, not the
+	// limiter rejection, is what ends the loop now.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runH3 did not return after its context ended")
 	}
 }
 

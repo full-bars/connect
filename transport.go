@@ -1458,7 +1458,7 @@ func NewPlatformTransportWithTargetMode(
 	transport.h3Gate = newPlatformH3Gate(transport)
 	if settings.carrierDialLimiterForTest != nil {
 		transport.carrierDialLimiter = settings.carrierDialLimiterForTest
-	} else if settings.CarrierDialRate == -1 {
+	} else if settings.CarrierDialRate < 0 {
 		transport.carrierDialLimiter = newCarrierDialLimiter(-1, 0)
 	} else if settings.CarrierDialRate > 0 || settings.CarrierDialBurst > 0 {
 		rate := settings.CarrierDialRate
@@ -1469,7 +1469,14 @@ func NewPlatformTransportWithTargetMode(
 		if burst <= 0 {
 			burst = defaultCarrierDialBurst
 		}
-		transport.carrierDialLimiter = newCarrierDialLimiter(rate, burst)
+		// An explicit spelling of the documented default must land on the SAME
+		// bucket as leaving it unset, or the two spellings would each enforce
+		// the cap independently and the process-wide total would double.
+		if rate == defaultCarrierDialRate && burst == defaultCarrierDialBurst {
+			transport.carrierDialLimiter = defaultCarrierDialLimiter
+		} else {
+			transport.carrierDialLimiter = sharedCarrierDialLimiter(rate, burst)
+		}
 	} else {
 		transport.carrierDialLimiter = defaultCarrierDialLimiter
 	}
@@ -3040,11 +3047,6 @@ func (self *PlatformTransport) runH3(
 			case <-time.After(connectDelay):
 			}
 		}
-		if !self.waitCarrierDialSlot(ctx) {
-			releaseReconnect()
-			cancelConnect()
-			return
-		}
 		attemptCtx, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
 		if !acquired {
 			releaseReconnect()
@@ -3055,6 +3057,30 @@ func (self *PlatformTransport) runH3(
 			releaseAttempt()
 			releaseReconnect()
 			cancelConnect()
+			continue
+		}
+		// The carrier dial slot is taken AFTER the standDown recheck, and with
+		// attemptCtx rather than ctx. Two reasons, both about a token that
+		// would otherwise be spent on a dial that never happens:
+		//
+		//  - a better mode elected during the gate wait makes the recheck
+		//    `continue`, burning a token for no dial. That is normal in auto
+		//    mode, not an edge case.
+		//  - Acquire can block behind a sibling H3-family attempt for up to
+		//    that attempt's dial timeout, so a token granted before the wait
+		//    can be seconds stale by the time the dial runs, letting the real
+		//    dial instants bunch past the burst after a sibling failure.
+		//
+		// attemptCtx is cancelled when a better mode wins, so the abandoned
+		// reservation is refunded. Holding the gate across the wait costs
+		// nothing extra: the dial would hold it anyway.
+		if !self.waitCarrierDialSlot(attemptCtx) {
+			releaseAttempt()
+			releaseReconnect()
+			cancelConnect()
+			if ctx.Err() != nil {
+				return
+			}
 			continue
 		}
 
