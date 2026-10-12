@@ -8997,16 +8997,20 @@ sendSequenceLoop:
 				// The rewrite that makes an item the head re-establishes the receiver;
 				// it happens once per promotion and must never wait on the budget.
 				promotingHead := self.sendItems[0].sequenceNumber == item.sequenceNumber && !item.head
+				resendDebit := 0
 				if recoveryKind == sendRecoveryNone && !promotingHead &&
-					!resendIsFree(item.sendCount, self.sendItems[0].sequenceNumber == item.sequenceNumber) &&
-					!retryAllowed(len(item.transferFrameBytes)) {
-					recordTransferResendDeferred(len(item.transferFrameBytes))
-					item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
-					if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
-						item.resendTime = item.sendTime.Add(item.ackTimeout)
+					!resendIsFree(item.sendCount, self.sendItems[0].sequenceNumber == item.sequenceNumber) {
+					allowed, debited := retryAllowed(len(item.transferFrameBytes))
+					if !allowed {
+						recordTransferResendDeferred(len(item.transferFrameBytes))
+						item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+						if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+							item.resendTime = item.sendTime.Add(item.ackTimeout)
+						}
+						self.addResendItem(item)
+						continue
 					}
-					self.addResendItem(item)
-					continue
+					resendDebit = debited
 				}
 				reliableOnlyResend := false
 				if recoveryKind == sendRecoveryNone && item.unreliableFlightTracked {
@@ -9085,6 +9089,11 @@ sendSequenceLoop:
 							self.log.Infof("[s]resend drop = %s", resendErr)
 						}
 					}
+				}
+				if resendErr != nil {
+					// the frame did not go out (a failed write, or the item was settled
+					// while pacing): give back what it was charged
+					refundRetry(resendDebit)
 				}
 				if errors.Is(resendErr, errWindowPacingAcknowledged) || errors.Is(resendErr, errSendAckLifetime) {
 					continue sendSequenceLoop

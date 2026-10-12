@@ -137,16 +137,16 @@ func TestSendSequence_ResendsToANonAckingPeerAreBudgeted(t *testing.T) {
 func TestSendSequence_ResendBudgetIsOnlyEnforcedInEnforceMode(t *testing.T) {
 	defer setGovernModeForTest(governShadow)()
 	transferResendBudget.reset(0)
-	if !retryAllowed(1000) {
+	if allowed, _ := retryAllowed(1000); !allowed {
 		t.Fatal("shadow mode must never refuse a resend")
 	}
 	defer setGovernModeForTest(governOff)()
-	if !retryAllowed(1000) {
+	if allowed, _ := retryAllowed(1000); !allowed {
 		t.Fatal("off mode must never refuse a resend")
 	}
 	restore := setGovernModeForTest(governEnforce)
 	defer restore()
-	if retryAllowed(1000) {
+	if allowed, _ := retryAllowed(1000); allowed {
 		t.Fatal("enforce mode refuses when the budget is empty")
 	}
 }
@@ -198,7 +198,7 @@ func TestRetryBudget_ShadowSendsAndCountsWhatEnforceWouldRefuse(t *testing.T) {
 	defer setGovernModeForTest(governShadow)()
 
 	before := TransferSendStatsNow()
-	if !retryAllowed(1000) {
+	if allowed, _ := retryAllowed(1000); !allowed {
 		t.Fatal("shadow must send")
 	}
 	after := TransferSendStatsNow()
@@ -211,7 +211,7 @@ func TestRetryBudget_ShadowSendsAndCountsWhatEnforceWouldRefuse(t *testing.T) {
 
 	restore := setGovernModeForTest(governOff)
 	defer restore()
-	if !retryAllowed(1000) || TransferSendStatsNow().ResendWouldDeferFrames != after.ResendWouldDeferFrames {
+	if allowed, _ := retryAllowed(1000); !allowed || TransferSendStatsNow().ResendWouldDeferFrames != after.ResendWouldDeferFrames {
 		t.Fatal("off must neither refuse nor report")
 	}
 }
@@ -238,5 +238,49 @@ func TestRetryBudget_ReportsRefusalsOncePerInterval(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "[govern] retry budget") || !strings.Contains(lines[0], "shadow") || !strings.Contains(lines[0], "4 resends") {
 		t.Fatalf("unexpected line: %s", lines[0])
+	}
+}
+
+// retryAllowed reports what it debited so a failed write can give it back, and
+// the refund never overshoots the burst cap.
+func TestRetryBudget_RefundReturnsExactlyWhatWasDebited(t *testing.T) {
+	frozen := time.Now()
+	previousNow := transferResendBudget.now
+	transferResendBudget.now = func() time.Time { return frozen }
+	defer func() { transferResendBudget.now = previousNow }()
+	transferResendBudget.reset(5_000)
+
+	allowed, debited := retryAllowed(1_200)
+	if !allowed || debited != 1_200 {
+		t.Fatalf("allowed=%t debited=%d, want the full 1200 charged", allowed, debited)
+	}
+	if got := TransferRetryBudgetTokens(); got != 3_800 {
+		t.Fatalf("tokens after the debit = %.0f, want 3800", got)
+	}
+	refundRetry(debited)
+	if got := TransferRetryBudgetTokens(); got != 5_000 {
+		t.Fatalf("tokens after the refund = %.0f, want 5000", got)
+	}
+	refundRetry(0) // a free or uncharged resend refunds nothing
+	if got := TransferRetryBudgetTokens(); got != 5_000 {
+		t.Fatalf("a zero refund changed the balance to %.0f", got)
+	}
+	transferResendBudget.reset(retryBudgetBurstBytes)
+	refundRetry(1 << 20)
+	if got := TransferRetryBudgetTokens(); got != float64(retryBudgetBurstBytes) {
+		t.Fatalf("a refund overshot the burst cap: %.0f", got)
+	}
+
+	// off mode and a shadow resend the budget cannot pay for debit nothing
+	restore := setGovernModeForTest(governOff)
+	if allowed, debited := retryAllowed(1_000); !allowed || debited != 0 {
+		t.Fatalf("off: allowed=%t debited=%d", allowed, debited)
+	}
+	restore()
+	transferResendBudget.reset(0)
+	restore = setGovernModeForTest(governShadow)
+	defer restore()
+	if allowed, debited := retryAllowed(1_000); !allowed || debited != 0 {
+		t.Fatalf("shadow with an empty budget: allowed=%t debited=%d, want sent but nothing debited", allowed, debited)
 	}
 }
