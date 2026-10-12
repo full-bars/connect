@@ -901,7 +901,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// for the cases that release cannot see: no parked producer, and a
 		// degraded backend, when every dead destination would otherwise be
 		// rewritten every MaxResendInterval indefinitely.
-		RetainedAckTimeout: 240 * time.Second,
+		RetainedAckTimeout: retainedAckTimeoutDefault(),
 		IdleTimeout:        300 * time.Second,
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
