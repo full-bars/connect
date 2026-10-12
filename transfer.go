@@ -8989,6 +8989,22 @@ sendSequenceLoop:
 				}
 				// the deferral, if any, is over: this timeout is being written
 				item.deferralOutstanding = false
+				// Pay for a timeout resend out of what first sends earned. A resend
+				// the budget refuses is rescheduled, not sent and not counted as a
+				// send, so a slow far end cannot make us send many times what we
+				// deliver. Only timeout resends are gated; loss-driven recovery
+				// (selective gap, probes) is not the amplifier this bounds.
+				if recoveryKind == sendRecoveryNone &&
+					!resendIsFree(item.sendCount, self.sendItems[0].sequenceNumber == item.sequenceNumber) &&
+					!retryAllowed(len(item.transferFrameBytes)) {
+					recordTransferResendDeferred(len(item.transferFrameBytes))
+					item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+					if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+						item.resendTime = item.sendTime.Add(item.ackTimeout)
+					}
+					self.addResendItem(item)
+					continue
+				}
 				reliableOnlyResend := false
 				if recoveryKind == sendRecoveryNone && item.unreliableFlightTracked {
 					reliableOnlyResend = self.observeUnreliableResendTimeout(item, flightPolicy)
@@ -9079,6 +9095,7 @@ sendSequenceLoop:
 					self.observeCarrierWrite(item, resendDisposition)
 					self.resendWriteCount.Add(1)
 					self.resendWriteByteCount.Add(uint64(len(transferFrameBytes)))
+					recordTransferResend(len(transferFrameBytes), item.sendCount+1)
 				}
 				self.client.recordSendRecovery(recoveryKind, resendErr)
 				if recoveryKind == sendRecoverySelectiveGap && 0 < item.timeoutDeferCount {
@@ -10658,7 +10675,10 @@ func (self *SendSequence) sendWithSetContractRecords(
 			}
 		}
 	}
+	recordTransferFirstSend(len(item.transferFrameBytes))
 	if err == nil {
+		// only a frame that actually went out earns the right to resend later
+		transferResendBudget.earn(len(item.transferFrameBytes))
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)
