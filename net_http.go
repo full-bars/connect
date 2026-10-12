@@ -1434,6 +1434,16 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			}
 		}
 
+		// While the platform backend is failing the next round fails too, so one
+		// failed platform attempt must not cost a full pass over the dialers every
+		// round until the request deadline: that is what multiplies a backend
+		// outage into a dial flood. Only a platform dial (webSocketOnly) gives up
+		// early, and only when the governor enforces; API requests keep their
+		// retries. The caller reads the causes kept so far.
+		if webSocketOnly && singleRoundCheck() {
+			return nil
+		}
+
 		// the rate limit is important when when the connect timeout is small
 		// e.g. local closes due to disconnected network
 		select {

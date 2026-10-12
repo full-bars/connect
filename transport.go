@@ -494,7 +494,12 @@ type PlatformTransportSettings struct {
 	PingTimeout          time.Duration
 	WriteTimeout         time.Duration
 	ReadTimeout          time.Duration
-	TransportGenerator   func() (sendTransport Transport, receiveTransport Transport)
+	// FlapStableAfter is how long a platform session must live before the next
+	// reconnect is treated as ordinary. Sessions that die sooner extend the wait
+	// before the next connect (see flapGuard), when URNETWORK_GOVERN enforces.
+	// Zero uses the default, negative disables the guard.
+	FlapStableAfter    time.Duration
+	TransportGenerator func() (sendTransport Transport, receiveTransport Transport)
 	// SendRouteObserver exposes route ownership to deterministic integration
 	// harnesses. It must not block. Nil retains normal production behavior.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
@@ -2009,6 +2014,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing.
 	hadConnection := false
+	flaps := newFlapGuard(self.settings.FlapStableAfter, self.settings.ReconnectTimeout)
 
 	for {
 		// stand down while a strictly better mode is active
@@ -2032,6 +2038,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+		// what this one attempt costs: dials opened and bytes moved
+		attemptStats := self.beginGovernedAttempt()
 		// the extender the winning dialer used, zero for a direct dial (K1).
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
@@ -2046,8 +2054,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.applyIntentHeader(header)
 			}
 
+			dialCtx := self.dialContext(self.ctx)
+			if attemptStats != nil {
+				dialCtx = withAttemptStats(dialCtx, attemptStats)
+			}
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
-				self.dialContext(self.ctx),
+				dialCtx,
 				self.platformUrl,
 				header,
 				int(self.h1MaxMessageByteCount()),
@@ -2121,6 +2133,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// cancelled before the dial happens; it must NOT be called once the
 		// dial proceeds — see NextConnectTime. A pinned transport paces
 		// itself and returns no-ops for both.
+		//
+		// While the backend is failing, a disconnected proxy first waits its turn
+		// under the shared attempt budget (enforce mode only; the direct path
+		// never waits). It waits before the pacing below is reserved, so a parked
+		// proxy holds no reconnect slot.
+		if !self.admitGovernedConnect(self.ctx) {
+			return
+		}
 		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection)
 		hadConnection = false
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
@@ -2144,6 +2164,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		releaseReconnect()
+		self.recordGovernedAttempt(err, attemptStats, true)
 		if err != nil {
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
@@ -2765,6 +2786,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 
 		reconnect = NewReconnect(self.settings.ReconnectTimeout)
+		sessionStart := time.Now()
+		sessionKick := self.kickMonitor.NotifyChannel()
 		if self.log.V(2).Enabled() {
 			Trace(fmt.Sprintf("[t]connect run %s", clientId), c)
 		} else {
@@ -2772,6 +2795,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
+
+		// A session that dies young is not a success: the connect that began it
+		// already reset the failed-connect backoff and the shared failure streak,
+		// so without this wait a slow backend that accepts the websocket and then
+		// drops it makes every proxy reconnect again immediately. A session a
+		// kick (a network change, the owner's hold) cut short is our own
+		// teardown, not evidence about the platform.
+		if flapWait := sessionEndWait(self.ctx, flaps, time.Since(sessionStart), channelClosed(sessionKick), clientId.String(), self.log, true); 0 < flapWait {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.kickMonitor.NotifyChannel():
+			case <-time.After(flapWait):
+			}
+			continue
+		}
 
 		select {
 		case <-self.ctx.Done():
@@ -2810,6 +2849,9 @@ func (self *PlatformTransport) runH3(
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing.
 	hadConnection := false
+	// the same flap guard the H1 loop has: a platform that accepts the connection
+	// and then drops it must not make this transport redial the moment it ends
+	flaps := newFlapGuard(self.settings.FlapStableAfter, self.settings.ReconnectTimeout)
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -3029,6 +3071,9 @@ func (self *PlatformTransport) runH3(
 			connStream, err = connect(attemptCtx)
 		}
 		releaseReconnect()
+		// H3 is UDP, so it never goes through a proxy and carries no attempt
+		// stats. A mode beside H1 in Auto is never a health signal.
+		self.recordGovernedAttempt(err, nil, self.countsAsGovernHealth(ptMode))
 		if err != nil {
 			attemptCanceled := attemptCtx.Err() != nil
 			releaseAttempt()
@@ -3712,6 +3757,8 @@ func (self *PlatformTransport) runH3(
 			}
 		}
 		reconnect = NewReconnect(self.settings.ReconnectTimeout)
+		sessionStart := time.Now()
+		sessionKick := self.kickMonitor.NotifyChannel()
 		if self.log.V(2).Enabled() {
 			Trace(fmt.Sprintf("[t]connect run %s", clientId), c)
 		} else {
@@ -3720,6 +3767,16 @@ func (self *PlatformTransport) runH3(
 		releaseAttempt()
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
+
+		if flapWait := sessionEndWait(ctx, flaps, time.Since(sessionStart), channelClosed(sessionKick), clientId.String(), self.log, self.countsAsGovernHealth(ptMode)); 0 < flapWait {
+			select {
+			case <-ctx.Done():
+				return
+			case <-self.kickMonitor.NotifyChannel():
+			case <-time.After(flapWait):
+			}
+			continue
+		}
 
 		select {
 		case <-ctx.Done():
