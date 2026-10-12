@@ -5459,6 +5459,8 @@ type SendBuffer struct {
 	sendSequencesBySequenceId  map[Id]*SendSequence
 	sendSequencesByDestination map[Id]map[*SendSequence]bool
 	sendSequenceDestinations   map[*SendSequence]map[Id]bool
+	// destination -> *destinationYield, see transfer_dest_yield.go
+	yields sync.Map
 	// activeSendSequences retains every lifecycle worker through its final
 	// queue drain, including workers already removed from the lookup indexes.
 	activeSendSequences map[*SendSequence]bool
@@ -9107,6 +9109,7 @@ sendSequenceLoop:
 					self.observeCarrierWrite(item, resendDisposition)
 					self.resendWriteCount.Add(1)
 					self.resendWriteByteCount.Add(uint64(len(transferFrameBytes)))
+					self.noteYieldSend(len(transferFrameBytes))
 					recordTransferResend(len(transferFrameBytes), item.sendCount+1)
 				}
 				self.client.recordSendRecovery(recoveryKind, resendErr)
@@ -10689,6 +10692,12 @@ func (self *SendSequence) sendWithSetContractRecords(
 	}
 	recordTransferFirstSend(len(item.transferFrameBytes))
 	if err == nil {
+		// A write that never reached a carrier says nothing about the destination,
+		// and neither does one that asked for no acknowledgement: nothing is
+		// expected back, so its silence is not evidence the client is gone.
+		if ack {
+			self.noteYieldSend(len(item.transferFrameBytes))
+		}
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)
@@ -12132,6 +12141,8 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		item.sendTime = time.Now()
 		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
 		item.selectiveAcked = true
+		// a selective ack proves the destination is receiving
+		self.noteYieldLive()
 		self.addResendItem(item)
 		if laneHeadAcked && !item.carrierChanged && 1 < item.sendCount {
 			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
@@ -12261,6 +12272,7 @@ func (self *SendSequence) ackItemCounted(item *sendItem, countAck bool) {
 	if countAck {
 		// the far end confirmed these bytes arrived; that is what earns resend budget
 		recordTransferAckedBytes(len(item.transferFrameBytes))
+		self.noteYieldAck(len(item.transferFrameBytes))
 	}
 	self.ackLifetimes.remove(item)
 	if item.contractId != nil {
