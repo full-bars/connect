@@ -130,7 +130,9 @@ func DeadClientStatsNow() DeadClientStats {
 var deadClientProviders struct {
 	mutex     sync.Mutex
 	providers map[*RemoteUserNatProvider]bool
-	once      sync.Once
+	// stop ends the running sweeper; nil when none runs. The sweeper only
+	// lives while a provider is registered.
+	stop chan struct{}
 }
 
 func registerDeadClientProvider(provider *RemoteUserNatProvider) {
@@ -139,11 +141,13 @@ func registerDeadClientProvider(provider *RemoteUserNatProvider) {
 		deadClientProviders.providers = map[*RemoteUserNatProvider]bool{}
 	}
 	deadClientProviders.providers[provider] = true
+	if deadClientProviders.stop == nil {
+		stop := make(chan struct{})
+		deadClientProviders.stop = stop
+		go HandleError(func() { newDeadClientSweeper(registeredDeadClientProviders).run(stop) })
+	}
 	deadClientProviders.mutex.Unlock()
 
-	deadClientProviders.once.Do(func() {
-		go HandleError(newDeadClientSweeper(registeredDeadClientProviders).run)
-	})
 	// the provider context ends when the provider closes or its client does
 	context.AfterFunc(provider.ctx, func() { unregisterDeadClientProvider(provider) })
 }
@@ -152,6 +156,10 @@ func unregisterDeadClientProvider(provider *RemoteUserNatProvider) {
 	deadClientProviders.mutex.Lock()
 	defer deadClientProviders.mutex.Unlock()
 	delete(deadClientProviders.providers, provider)
+	if len(deadClientProviders.providers) == 0 && deadClientProviders.stop != nil {
+		close(deadClientProviders.stop)
+		deadClientProviders.stop = nil
+	}
 }
 
 func registeredDeadClientProviders() []*RemoteUserNatProvider {
@@ -184,11 +192,16 @@ func newDeadClientSweeper(providers func() []*RemoteUserNatProvider) *deadClient
 	}
 }
 
-func (self *deadClientSweeper) run() {
+func (self *deadClientSweeper) run(stop <-chan struct{}) {
 	ticker := time.NewTicker(deadClientSweepInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		self.sweep()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			self.sweep()
+		}
 	}
 }
 
