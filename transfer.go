@@ -8994,7 +8994,10 @@ sendSequenceLoop:
 				// send, so a slow far end cannot make us send many times what we
 				// deliver. Only timeout resends are gated; loss-driven recovery
 				// (selective gap, probes) is not the amplifier this bounds.
-				if recoveryKind == sendRecoveryNone &&
+				// The rewrite that makes an item the head re-establishes the receiver;
+				// it happens once per promotion and must never wait on the budget.
+				promotingHead := self.sendItems[0].sequenceNumber == item.sequenceNumber && !item.head
+				if recoveryKind == sendRecoveryNone && !promotingHead &&
 					!resendIsFree(item.sendCount, self.sendItems[0].sequenceNumber == item.sequenceNumber) &&
 					!retryAllowed(len(item.transferFrameBytes)) {
 					recordTransferResendDeferred(len(item.transferFrameBytes))
@@ -10677,8 +10680,6 @@ func (self *SendSequence) sendWithSetContractRecords(
 	}
 	recordTransferFirstSend(len(item.transferFrameBytes))
 	if err == nil {
-		// only a frame that actually went out earns the right to resend later
-		transferResendBudget.earn(len(item.transferFrameBytes))
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)
@@ -10719,7 +10720,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 	} else {
 		// immediately ack
 		if err == nil {
-			self.ackItem(item)
+			self.ackItemCounted(item, false)
 		} else {
 			item.acks.invoke(err)
 			item.messagePoolReturn()
@@ -12241,6 +12242,17 @@ func (self *SendSequence) receiveAckFeedbackAt(
 }
 
 func (self *SendSequence) ackItem(item *sendItem) {
+	self.ackItemCounted(item, true)
+}
+
+// ackItemCounted settles an acknowledged item. countAck is false for a send that
+// asked for no acknowledgement and is settled locally: that is not the far end
+// confirming anything, so it earns no resend budget.
+func (self *SendSequence) ackItemCounted(item *sendItem, countAck bool) {
+	if countAck {
+		// the far end confirmed these bytes arrived; that is what earns resend budget
+		recordTransferAckedBytes(len(item.transferFrameBytes))
+	}
 	self.ackLifetimes.remove(item)
 	if item.contractId != nil {
 		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
