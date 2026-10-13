@@ -66,6 +66,13 @@ func withPinnedIpFamily(ctx context.Context, ipFamily int) context.Context {
 	return context.WithValue(ctx, pinnedIpFamilyContextKey{}, ipFamily)
 }
 
+// PinnedIpFamilyFromContext is 4, 6, or 0 when the dial is not pinned. An
+// injected H3PacketConnFactory reads it to open the socket of the family the
+// calling transport is pinned to; a factory that ignores it must work for both.
+func PinnedIpFamilyFromContext(ctx context.Context) int {
+	return pinnedIpFamilyFromContext(ctx)
+}
+
 // pinnedIpFamilyFromContext is 4, 6, or 0 when the dial is not pinned.
 func pinnedIpFamilyFromContext(ctx context.Context) int {
 	if ctx == nil {
@@ -842,7 +849,9 @@ func (self *PlatformTransport) openH3PacketConn(
 	udpAddr *net.UDPAddr,
 ) (net.PacketConn, net.Addr, bool, error) {
 	if self.settings.H3PacketConnFactory != nil {
-		packetConn, err := self.settings.H3PacketConnFactory(ctx)
+		// the factory sees the pin so one injected socket source can serve a
+		// family group's v4 and v6 transports
+		packetConn, err := self.settings.H3PacketConnFactory(self.dialContext(ctx))
 		return packetConn, nil, false, err
 	}
 	// An extender-only strategy has no direct path, so reach the destination

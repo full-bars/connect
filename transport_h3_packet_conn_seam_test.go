@@ -344,3 +344,58 @@ func TestPlatformTransportH1IgnoresH3PacketConnFactory(t *testing.T) {
 		}
 	})
 }
+
+// An injected H3 packet connection factory must be able to tell which family
+// the calling transport is pinned to, so one factory can serve both transports
+// of a family group. A pinned transport reports its pin, an unpinned one 0.
+func TestPlatformTransportH3PacketConnFactorySeesThePinnedFamily(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		for _, pin := range []int{0, ipVersion} {
+			unusedEndpoint, err := net.ListenPacket(testUdpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			unusedPort := unusedEndpoint.LocalAddr().(*net.UDPAddr).Port
+			unusedEndpoint.Close()
+
+			families := make(chan int, 1)
+			settings := testingPlatformTransportSettings()
+			settings.IpFamily = pin
+			settings.H3Port = unusedPort
+			settings.resolveH3AddrsForTest = testingH3LoopbackResolver(ipVersion, settings.H3Port)
+			settings.QuicConnectTimeout = 50 * time.Millisecond
+			settings.QuicHandshakeTimeout = 50 * time.Millisecond
+			settings.ReconnectTimeout = 5 * time.Second
+			settings.H3PacketConnFactory = func(factoryCtx context.Context) (net.PacketConn, error) {
+				select {
+				case families <- PinnedIpFamilyFromContext(factoryCtx):
+				default:
+				}
+				return nil, errors.New("factory declines")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			strategy := NewDirectClientStrategy(ctx, newTestingFamilyStrategySettings(t), pin)
+			transport := NewPlatformTransportWithTargetMode(
+				ctx,
+				strategy,
+				NewRouteManager(ctx, "test"),
+				"https://"+testLoopbackHost(ipVersion),
+				&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+				TransportModeH3,
+				settings,
+			)
+			select {
+			case got := <-families:
+				if got != pin {
+					t.Fatalf("pin %d: factory saw family %d", pin, got)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("pin %d: H3 did not call the packet connection factory", pin)
+			}
+			transport.Close()
+			strategy.Close()
+			cancel()
+		}
+	})
+}
