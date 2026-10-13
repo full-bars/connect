@@ -298,6 +298,11 @@ type ProxySettings struct {
 
 func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dialer) DialContextFunction {
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		// one dial of the connect attempt that carries these stats, if any
+		attempt := attemptStatsFrom(ctx)
+		if attempt != nil {
+			attempt.dials.Add(1)
+		}
 		proxyDialer, err := proxy.SOCKS5(
 			self.Network,
 			self.Address,
@@ -317,6 +322,34 @@ func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dia
 		if err != nil {
 			return nil, err
 		}
+		if attempt != nil {
+			return &attemptConn{Conn: conn, attempt: attempt}, nil
+		}
 		return conn, nil
 	}
+}
+
+// attemptConn credits the bytes that cross a proxied connection to the connect
+// attempt that opened it (see attemptStats), handshakes of attempts that fail
+// included. Only connections dialled for a governed platform connect are
+// wrapped.
+type attemptConn struct {
+	net.Conn
+	attempt *attemptStats
+}
+
+func (self *attemptConn) Read(b []byte) (n int, err error) {
+	n, err = self.Conn.Read(b)
+	if 0 < n {
+		self.attempt.rx.Add(int64(n))
+	}
+	return
+}
+
+func (self *attemptConn) Write(b []byte) (n int, err error) {
+	n, err = self.Conn.Write(b)
+	if 0 < n {
+		self.attempt.tx.Add(int64(n))
+	}
+	return
 }

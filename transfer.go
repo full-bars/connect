@@ -895,7 +895,14 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// liveness watchdog owns early dead-exit conviction; this is only the
 		// final reliable-delivery lifetime and must not bypass those gates.
 		UnreliableAckTimeout: 90 * time.Second,
-		IdleTimeout:          300 * time.Second,
+		// twice the provider's own unreachable-source bound
+		// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout, 120s), so
+		// its full source release normally acts first. This is the backstop
+		// for the cases that release cannot see: no parked producer, and a
+		// degraded backend, when every dead destination would otherwise be
+		// rewritten every MaxResendInterval indefinitely.
+		RetainedAckTimeout: retainedAckTimeoutDefault(),
+		IdleTimeout:        300 * time.Second,
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
 		// Three distinct later deliveries are the conventional reordering-safe
@@ -4984,7 +4991,17 @@ type SendBufferSettings struct {
 	// after it has used a carrier without payload retransmission. Zero preserves
 	// AckTimeout. The extension is sticky per item across route changes.
 	UnreliableAckTimeout time.Duration
-	IdleTimeout          time.Duration
+	// Bounds a sequence that keeps items past AckTimeout because their
+	// upstream owner cannot regenerate them (provider TCP and prepared
+	// datagram returns): how long the destination may acknowledge nothing,
+	// measured from the first successful physical write after its last
+	// acknowledgement. Any acknowledgement restarts it, so a slow live peer is
+	// never cut off. When it runs out the sequence exits as an ordinary ACK
+	// timeout does and fails every retained owner. Zero keeps the historical
+	// unbounded retention, which rewrites a dead destination's whole window
+	// every MaxResendInterval until the client closes.
+	RetainedAckTimeout time.Duration
+	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
 	// The number of distinct later selectively acknowledged Packs required to
@@ -5442,6 +5459,8 @@ type SendBuffer struct {
 	sendSequencesBySequenceId  map[Id]*SendSequence
 	sendSequencesByDestination map[Id]map[*SendSequence]bool
 	sendSequenceDestinations   map[*SendSequence]map[Id]bool
+	// destination -> *destinationYield, see transfer_dest_yield.go
+	yields sync.Map
 	// activeSendSequences retains every lifecycle worker through its final
 	// queue drain, including workers already removed from the lookup indexes.
 	activeSendSequences map[*SendSequence]bool
@@ -6496,6 +6515,10 @@ type SendSequence struct {
 	serviceAckHeadSet    bool
 	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
 	lastHeadAckTime time.Time
+	// The first successful acknowledged-lane write since the destination last
+	// acknowledged an outstanding item, zero while nothing written is
+	// unanswered. Owned by the send worker; RetainedAckTimeout runs from here.
+	retainedSilenceStart time.Time
 	// what this sequence has put on the wire: first writes and recovery
 	// rewrites, counted at the write, so a destination's egress can be
 	// split into delivery and retransmission (THROUGHPUTFIX §13)
@@ -8691,6 +8714,9 @@ sendSequenceLoop:
 		if err := self.retireAckLifetimes(sendTime); err != nil {
 			return
 		}
+		if self.retainedDestinationSilent(sendTime) {
+			return
+		}
 		// before the recovery scans, so an evicted item is due on this pass
 		self.resendEvicted(self.takePendingEvictions())
 		if flightPolicyChanged {
@@ -8965,6 +8991,29 @@ sendSequenceLoop:
 				}
 				// the deferral, if any, is over: this timeout is being written
 				item.deferralOutstanding = false
+				// Pay for a timeout resend out of what first sends earned. A resend
+				// the budget refuses is rescheduled, not sent and not counted as a
+				// send, so a slow far end cannot make us send many times what we
+				// deliver. Only timeout resends are gated; loss-driven recovery
+				// (selective gap, probes) is not the amplifier this bounds.
+				// The rewrite that makes an item the head re-establishes the receiver;
+				// it happens once per promotion and must never wait on the budget.
+				promotingHead := self.sendItems[0].sequenceNumber == item.sequenceNumber && !item.head
+				resendDebit := 0
+				if recoveryKind == sendRecoveryNone && !promotingHead &&
+					!resendIsFree(item.sendCount, self.sendItems[0].sequenceNumber == item.sequenceNumber) {
+					allowed, debited := retryAllowed(len(item.transferFrameBytes))
+					if !allowed {
+						recordTransferResendDeferred(len(item.transferFrameBytes))
+						item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+						if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+							item.resendTime = item.sendTime.Add(item.ackTimeout)
+						}
+						self.addResendItem(item)
+						continue
+					}
+					resendDebit = debited
+				}
 				reliableOnlyResend := false
 				if recoveryKind == sendRecoveryNone && item.unreliableFlightTracked {
 					reliableOnlyResend = self.observeUnreliableResendTimeout(item, flightPolicy)
@@ -9043,6 +9092,11 @@ sendSequenceLoop:
 						}
 					}
 				}
+				if resendErr != nil {
+					// the frame did not go out (a failed write, or the item was settled
+					// while pacing): give back what it was charged
+					refundRetry(resendDebit)
+				}
 				if errors.Is(resendErr, errWindowPacingAcknowledged) || errors.Is(resendErr, errSendAckLifetime) {
 					continue sendSequenceLoop
 				}
@@ -9055,6 +9109,8 @@ sendSequenceLoop:
 					self.observeCarrierWrite(item, resendDisposition)
 					self.resendWriteCount.Add(1)
 					self.resendWriteByteCount.Add(uint64(len(transferFrameBytes)))
+					self.noteYieldSend(len(transferFrameBytes))
+					recordTransferResend(len(transferFrameBytes), item.sendCount+1)
 				}
 				self.client.recordSendRecovery(recoveryKind, resendErr)
 				if recoveryKind == sendRecoverySelectiveGap && 0 < item.timeoutDeferCount {
@@ -9491,6 +9547,9 @@ sendSequenceLoop:
 			}
 			return
 		} else if !deadline.IsZero() {
+			timeout = min(timeout, time.Until(deadline))
+		}
+		if deadline, ok := self.retainedSilenceDeadline(); ok {
 			timeout = min(timeout, time.Until(deadline))
 		}
 		idleTimer.Reset(timeout)
@@ -10631,7 +10690,14 @@ func (self *SendSequence) sendWithSetContractRecords(
 			}
 		}
 	}
+	recordTransferFirstSend(len(item.transferFrameBytes))
 	if err == nil {
+		// A write that never reached a carrier says nothing about the destination,
+		// and neither does one that asked for no acknowledgement: nothing is
+		// expected back, so its silence is not evidence the client is gone.
+		if ack {
+			self.noteYieldSend(len(item.transferFrameBytes))
+		}
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)
@@ -10672,7 +10738,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 	} else {
 		// immediately ack
 		if err == nil {
-			self.ackItem(item)
+			self.ackItemCounted(item, false)
 		} else {
 			item.acks.invoke(err)
 			item.messagePoolReturn()
@@ -10842,6 +10908,10 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	// A written item awaits an answer; silence runs until any acknowledgement.
+	if self.retainedSilenceStart.IsZero() {
+		self.retainedSilenceStart = time.Now()
+	}
 	departedLane := uint32(0)
 	if item.carrierRoute != nil && item.carrierRoute != disposition.route {
 		// A changed-carrier item no longer owns its old lane's probe. Read
@@ -12025,6 +12095,8 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		// message not pending ack
 		return
 	}
+	// Any acknowledgement of an outstanding item proves the destination live.
+	self.retainedSilenceStart = time.Time{}
 
 	if !receiverTiming {
 		self.observeAckRtt(item, tag)
@@ -12069,6 +12141,8 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		item.sendTime = time.Now()
 		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
 		item.selectiveAcked = true
+		// a selective ack proves the destination is receiving
+		self.noteYieldLive()
 		self.addResendItem(item)
 		if laneHeadAcked && !item.carrierChanged && 1 < item.sendCount {
 			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
@@ -12188,6 +12262,18 @@ func (self *SendSequence) receiveAckFeedbackAt(
 }
 
 func (self *SendSequence) ackItem(item *sendItem) {
+	self.ackItemCounted(item, true)
+}
+
+// ackItemCounted settles an acknowledged item. countAck is false for a send that
+// asked for no acknowledgement and is settled locally: that is not the far end
+// confirming anything, so it earns no resend budget.
+func (self *SendSequence) ackItemCounted(item *sendItem, countAck bool) {
+	if countAck {
+		// the far end confirmed these bytes arrived; that is what earns resend budget
+		recordTransferAckedBytes(len(item.transferFrameBytes))
+		self.noteYieldAck(len(item.transferFrameBytes))
+	}
 	self.ackLifetimes.remove(item)
 	if item.contractId != nil {
 		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
