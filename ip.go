@@ -9434,6 +9434,21 @@ func (self *RemoteUserNatProvider) Receive(
 // Returns one public/shared packet with a nonblocking disposition.
 //
 // Borrows the packet, as Receive does.
+// refreshEgressFlow keeps the egress payload detector's idle clock fresh from
+// the return direction: a flow that is receiving but whose client has not sent
+// for a while must not be reclaimed as idle, because a reclaimed flow restarts
+// payload inspection mid-stream. The path here is in the flow's own
+// orientation. Network mode packets bypass the detector on the egress side, so
+// no flow exists for them.
+func (self *RemoteUserNatProvider) refreshEgressFlow(provideMode protocol.ProvideMode, ipPath *IpPath) {
+	if protocol.ProvideMode_Network == provideMode || ipPath == nil {
+		return
+	}
+	if toucher, ok := self.securityPolicy.(dmcaFlowToucher); ok {
+		toucher.touchFlow(ipPath)
+	}
+}
+
 func (self *RemoteUserNatProvider) receiveTransfer(
 	source TransferPath,
 	transferKey TransferKey,
@@ -9447,6 +9462,10 @@ func (self *RemoteUserNatProvider) receiveTransfer(
 	if self.memoryOperations != nil {
 		defer self.memoryOperations.finish()
 	}
+	// report the flow to the egress payload detector before the packet is
+	// handed off, so a flow that is receiving while its client is silent is
+	// not reclaimed as idle mid-stream
+	self.refreshEgressFlow(provideMode, ipPath)
 	source = source.LocalMask()
 	sourceLifecycle := self.acquireSourceLifecycle(source.SourceId)
 	if sourceLifecycle == nil {
@@ -10423,7 +10442,12 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 					ipPath, parseErr := ParseIpPath(result.packet)
 					if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
 						self.smtpEgressGuard.retireReturn(ipPath)
-						self.securityPolicy.RefreshIngress(ipPath)
+						// keep the egress payload detector's flow clock fresh from
+						// the return direction; network mode bypasses the detector
+						// on the egress side, so no flow exists to refresh
+						if protocol.ProvideMode_Network != peer.ProvideMode {
+							self.securityPolicy.RefreshIngress(ipPath)
+						}
 						for _, fragment := range result.fragments {
 							fragment := fragment
 							HandleError(func() {
@@ -10444,7 +10468,12 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			ipPath, err := ParseIpPath(packet)
 			if err == nil {
 				self.smtpEgressGuard.retireReturn(ipPath)
-				self.securityPolicy.RefreshIngress(ipPath)
+				// keep the egress payload detector's flow clock fresh from the
+				// return direction; network mode bypasses the detector on the
+				// egress side, so no flow exists to refresh
+				if protocol.ProvideMode_Network != peer.ProvideMode {
+					self.securityPolicy.RefreshIngress(ipPath)
+				}
 				// Deliberate device-TUN exception from CODESTYLE.md: Transfer
 				// acknowledges only after this borrowed packet returns, so the
 				// synchronous final injection is its receive-side flow control.

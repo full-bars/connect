@@ -650,6 +650,20 @@ func (self *securityPolicy) RefreshIngress(ipPath *IpPath) {
 	}
 }
 
+// dmcaFlowToucher is implemented by the egress security policy for callers that
+// hold the flow's own (client to server) path, as the provider's return path
+// does. A packet-oriented touch would reverse the path and match nothing.
+type dmcaFlowToucher interface {
+	touchFlow(ipPath *IpPath)
+}
+
+// touchFlow is touchIngress for a path in the flow's own orientation.
+func (self *securityPolicy) touchFlow(ipPath *IpPath) {
+	if ipPath != nil {
+		self.dmca.touchFlow(ipPath)
+	}
+}
+
 func (self *securityPolicy) retireEgressFlowForSender(senderClientId Id, ipPath *IpPath) {
 	self.dmca.retireEgressForSender(senderClientId, ipPath)
 }
