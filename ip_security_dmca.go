@@ -199,6 +199,10 @@ type dmcaFlowState struct {
 	terminalReason int32
 
 	key dmcaFlowKey
+	// resumedAfterReclaim marks a flow created for a path that was idle
+	// reclaimed inside the recent window; read once when the terminal verdict
+	// publishes (set before the flow is published to the shard).
+	resumedAfterReclaim bool
 	// These identify the TCP generation that created the state. They are set
 	// before publication and remain immutable.
 	synSeen     bool
@@ -241,6 +245,10 @@ func (self *dmcaFlowState) Cancel() {
 func (self *dmcaFlowState) setTerminal(v dmcaVerdict, reason SecurityPolicyReason) (dmcaVerdict, SecurityPolicyReason, bool) {
 	atomic.StoreInt32(&self.terminalReason, int32(reason))
 	atomic.StoreInt32(&self.terminal, int32(v))
+	noteDmcaVerdict(v, self.key.ip6Path.Protocol)
+	if self.resumedAfterReclaim && v != dmcaAllow && v != dmcaInspecting {
+		dmcaResumedDroppedTotal[dmcaProtocolBucket(self.key.ip6Path.Protocol)].Add(1)
+	}
 	return v, reason, true
 }
 
@@ -515,14 +523,27 @@ func (self *dmcaDetector) run(ctx context.Context) {
 	if scanInterval < 5*time.Second {
 		scanInterval = 5 * time.Second
 	}
+	// a ticker, not time.After per iteration: a canceled scan must not leave a
+	// pending timer behind
+	ticker := time.NewTicker(scanInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(scanInterval):
-			self.evictIdle(time.Now())
+		case <-ticker.C:
+			self.scanOnce()
 		}
 	}
+}
+
+// scanOnce is one FlowTtl scan pass with its metrics; split from the scan loop
+// so tests can drive it deterministically.
+func (self *dmcaDetector) scanOnce() {
+	dmcaIdleScanRunsTotal.Add(1)
+	scanStart := time.Now()
+	self.evictIdle(scanStart)
+	dmcaIdleScanLastNanos.Store(int64(time.Since(scanStart)))
 }
 
 // evictIdle drops every flow whose last activity is older than FlowTtl.
@@ -537,6 +558,9 @@ func (self *dmcaDetector) evictIdle(now time.Time) {
 		for key, st := range shard.flows {
 			if st.LastActivityTime().Before(cutoff) {
 				delete(shard.flows, key)
+				dmcaFlowsTracked.Add(-1)
+				dmcaIdleReclaimedTotal.Add(1)
+				noteDmcaRecentReclaim(key.ip6Path, now)
 			}
 		}
 		shard.mu.Unlock()
@@ -636,7 +660,7 @@ func (self *dmcaDetector) touchIngress(ipPath *IpPath) {
 // touchIngressForSender maps a sender-owned return packet back to its outbound
 // flow. Either direction's TCP teardown retires the state immediately.
 func (self *dmcaDetector) touchIngressForSender(senderClientId Id, ipPath *IpPath) {
-	if !self.settings.Enabled {
+	if !self.settings.Enabled || ipPath == nil {
 		return
 	}
 	switch ipPath.Protocol {
@@ -657,6 +681,25 @@ func (self *dmcaDetector) touchIngressForSender(senderClientId Id, ipPath *IpPat
 	self.refresh(key)
 }
 
+// touchFlow refreshes a flow from a path already in the flow's own
+// (client-to-server) orientation, as the provider's return path holds it. The
+// packet-oriented touchIngress reverses the path and would match nothing here.
+func (self *dmcaDetector) touchFlow(ipPath *IpPath) {
+	if !self.settings.Enabled || ipPath == nil {
+		return
+	}
+	switch ipPath.Protocol {
+	case IpProtocolTcp, IpProtocolUdp:
+	default:
+		return
+	}
+	// mirror the privileged-port skip in classifyDetailed
+	if ipPath.DestinationPort < 1024 {
+		return
+	}
+	self.refresh(dmcaFlowKeyForPath(Id{}, ipPath))
+}
+
 // retireEgressForSender removes state when the provider NAT closes a TCP
 // sequence without observing a wire teardown.
 func (self *dmcaDetector) retireEgressForSender(senderClientId Id, ipPath *IpPath) {
@@ -665,6 +708,17 @@ func (self *dmcaDetector) retireEgressForSender(senderClientId Id, ipPath *IpPat
 		return
 	}
 	self.remove(dmcaFlowKeyForPath(senderClientId, ipPath))
+}
+
+// noteFlowCreated records a newly published flow for the metrics and marks it
+// resumed-after-reclaim when its path was idle-reclaimed inside the recent
+// window. The caller holds shard.mu for writing.
+func (self *dmcaDetector) noteFlowCreated(key dmcaFlowKey, st *dmcaFlowState) {
+	dmcaFlowsTracked.Add(1)
+	if resumed, protocol := dmcaRecentlyReclaimed(key.ip6Path, time.Now()); resumed {
+		dmcaResumedAfterReclaimTotal[protocol].Add(1)
+		st.resumedAfterReclaim = true
+	}
 }
 
 func dmcaShardIndex(key dmcaFlowKey) int {
@@ -766,6 +820,7 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 				self.evictWithLock(shard)
 			}
 			shard.flows[key] = state
+			self.noteFlowCreated(key, state)
 		}
 		shard.mu.Unlock()
 	} else {
@@ -780,6 +835,7 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 				state = createState()
 				self.evictWithLock(shard)
 				shard.flows[key] = state
+				self.noteFlowCreated(key, state)
 			}
 			shard.mu.Unlock()
 		}
@@ -820,6 +876,8 @@ func (self *dmcaDetector) evictWithLock(shard *dmcaFlowShard) {
 	}
 	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key dmcaFlowKey, st *dmcaFlowState) bool {
 		delete(shard.flows, key)
+		dmcaFlowsTracked.Add(-1)
+		dmcaCapacityEvictionsTotal.Add(1)
 		return true
 	})
 }
