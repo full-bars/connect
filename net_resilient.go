@@ -91,6 +91,7 @@ func newResilientDialTlsContext(
 	nextProtos []string,
 ) DialTlsContextFunction {
 	baseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
+	tlsPath := resilientTlsPath(fragment, reorder, false)
 	return func(
 		ctx context.Context,
 		network string,
@@ -125,6 +126,7 @@ func newResilientDialTlsContext(
 				defer tlsCancel()
 				err = tlsConn.HandshakeContext(tlsCtx)
 			}()
+			noteTlsHandshake(tlsPath, host, tlsConn.ConnectionState(), err)
 			if err != nil {
 				tlsConn.Close()
 				return nil, err

@@ -337,9 +337,11 @@ func newNormalDialTlsContext(
 			tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
 			defer tlsCancel()
 			if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
+				noteTlsHandshake(tlsPathNormal, host, tlsConn.ConnectionState(), err)
 				tlsConn.Close()
 				return nil, err
 			}
+			noteTlsHandshake(tlsPathNormal, host, tlsConn.ConnectionState(), nil)
 			return tlsConn, nil
 		}
 		// DialContext preserves injected userspace networks in tests and proxy
