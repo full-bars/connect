@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -378,12 +379,17 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 
 			switch v := message.(type) {
 			case *protocol.StreamOpen:
+				// counted here and not inside streamOpen, which a reset also
+				// calls once per stream it re-opens, so a reset's entries are
+				// not miscounted as platform opens
+				streamMetrics.openFrames.Add(1)
 				err := streamOpen(v)
 				if err != nil {
 					return err
 				}
 
 			case *protocol.StreamClose:
+				streamMetrics.closeFrames.Add(1)
 				streamId, err := IdFromBytes(v.StreamId)
 				if err != nil {
 					return err
@@ -398,6 +404,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				self.streamBuffer.CloseStream(streamId)
 
 			case *protocol.StreamReset:
+				streamMetrics.resetFrames.Add(1)
 				// reconcile instead of tear down:
 				// keep the sequences of relisted streams so that their state
 				// (including p2p transports) survives a resident migration.
@@ -915,6 +922,7 @@ func (self *StreamBuffer) prepareOpenRequest(
 	if streamSequence != nil && streamSequence != skipped {
 		self.mutex.Unlock()
 		self.managementStateLock.Unlock()
+		streamMetrics.openRequests[streamOpenExisting].Add(1)
 		return streamSequence, nil, true
 	}
 	if streamSequence != nil {
@@ -927,6 +935,7 @@ func (self *StreamBuffer) prepareOpenRequest(
 	self.mutex.Unlock()
 	self.managementStateLock.Unlock()
 	if retired != nil {
+		streamMetrics.openRequests[streamOpenReplaced].Add(1)
 		return nil, retired, true
 	}
 
@@ -968,6 +977,7 @@ func (self *StreamBuffer) prepareOpenRequest(
 		self.mutex.Unlock()
 		self.managementStateLock.Unlock()
 		streamSequence.Cancel()
+		streamMetrics.openRequests[streamOpenReplaced].Add(1)
 		return nil, existing, true
 	}
 	if maxLiveStreamSequences <= len(self.streamSequencesByStreamId) {
@@ -986,6 +996,9 @@ func (self *StreamBuffer) prepareOpenRequest(
 	self.streamSequencesByStreamId[request.streamId] = streamSequence
 	self.mutex.Unlock()
 	self.managementStateLock.Unlock()
+	kind := streamKindOf(request.sourceId, request.destinationId)
+	streamMetrics.opened[kind].Add(1)
+	startedAt := time.Now()
 	if self.afterStreamSequencePublishForTest != nil {
 		self.afterStreamSequencePublishForTest(streamSequence)
 	}
@@ -996,12 +1009,19 @@ func (self *StreamBuffer) prepareOpenRequest(
 			self.mutex.Lock()
 			self.removeStreamSequenceWithLock(streamSequence)
 			self.mutex.Unlock()
+			reason := streamEndCancelled
+			if streamSequence.endedByTransport.Load() {
+				reason = streamEndTransportEnded
+			}
+			streamMetrics.closed[kind][reason].Add(1)
+			streamMetrics.observeLifetime(kind, time.Since(startedAt))
 			if self.afterStreamSequenceRemoveForTest != nil {
 				self.afterStreamSequenceRemoveForTest(streamSequence)
 			}
 		}()
 		streamSequence.Run()
 	})
+	streamMetrics.openRequests[streamOpenCreated].Add(1)
 	return streamSequence, nil, true
 }
 
@@ -1265,6 +1285,10 @@ type StreamSequence struct {
 	sourceId      *Id
 	destinationId *Id
 	streamId      Id
+	// endedByTransport is set when the sequence ended because its transport
+	// gave up on its own, as opposed to a close, reset, replacement or
+	// shutdown. Read by the metrics close hook after Run returns.
+	endedByTransport atomic.Bool
 	// aliasStateLock protects replacement of the endpoint scope owner. Scope
 	// callbacks are invoked after releasing it. It also protects the latest
 	// lifecycle generation attached to this live sequence.
@@ -1489,6 +1513,24 @@ func (self *StreamSequence) Run() {
 			return
 		}
 		p2pTransports = append(p2pTransports, endpointTransport)
+
+		// This transport is the sequence's only carrier. Its context is a child
+		// of self.ctx, so close, reset and replacement still cancel it first.
+		// Wait on it so a transport that gives up on its own ends the sequence
+		// here rather than parking until a close or reset that may never
+		// arrive. The both-sides branch below joins through the deferred
+		// cancel/wait instead.
+		select {
+		case <-endpointTransport.done:
+			select {
+			case <-self.ctx.Done():
+				// an external close, reset or replacement reaped it
+			default:
+				self.endedByTransport.Store(true)
+			}
+		case <-self.ctx.Done():
+		}
+		return
 	} else {
 		p2pToDestinationRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("->s(%s)", self.streamId), self.streamManager.client.log)
 		p2pToSourceRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("<-s(%s)", self.streamId), self.streamManager.client.log)

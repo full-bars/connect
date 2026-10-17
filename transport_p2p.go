@@ -741,6 +741,8 @@ func (self *p2pSetupFailureStreak) Recover() bool {
 func (self *P2pTransport) run() {
 	defer self.cancel()
 	defer close(self.done)
+	streamMetrics.p2pStarted.Add(1)
+	defer streamMetrics.p2pStopped.Add(1)
 	if self.settings.beforeRunDoneForTest != nil {
 		defer self.settings.beforeRunDoneForTest(self.streamId, self.peerType)
 	}
@@ -776,6 +778,7 @@ func (self *P2pTransport) run() {
 			return
 		}
 		if err != nil {
+			streamMetrics.p2pConnFailures.Add(1)
 			var admissionErr *peerConnectionAdmissionError
 			if errors.As(err, &admissionErr) {
 				// Admission capacity is shared by all streams, so logging the
