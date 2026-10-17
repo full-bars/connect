@@ -23,7 +23,7 @@ func newWebRtcPeerConnectionFactory(
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: settings.IceServerUrls,
+				URLs: settings.selectIceServerUrls(),
 			},
 		},
 	}
