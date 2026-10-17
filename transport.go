@@ -370,6 +370,19 @@ func shouldLogWriteErr() (bool, int64) { return writeErrThrottle.Allow(time.Now(
 // blip on an otherwise idle provider.
 var lastBackendFailNano atomic.Int64
 
+// lastPlatformSuccessNano is the time of the last success of any platform dial
+// or backend call in this process. See platformReachedRecently.
+var lastPlatformSuccessNano atomic.Int64
+
+// platformReachableWindow is how recent that success must be for a dial failure
+// to count as being about its own path, not about the platform.
+const platformReachableWindow = 2 * time.Minute
+
+func platformReachedRecently() bool {
+	last := lastPlatformSuccessNano.Load()
+	return last != 0 && time.Since(time.Unix(0, last)) < platformReachableWindow
+}
+
 // consecutiveBackendFails counts backend failures since the last success. Any
 // successful auth or OOB round-trip resets it to 0. A real platform outage
 // drives this up quickly because every attempt fails with nothing to reset it;
@@ -467,6 +480,7 @@ func noteBackendFailure() {
 // isBackendDegraded reads as "not degraded" while failures are in fact
 // accumulating.
 func noteBackendSuccess() {
+	lastPlatformSuccessNano.Store(time.Now().UnixNano())
 	backendFailMu.Lock()
 	defer backendFailMu.Unlock()
 
@@ -572,6 +586,16 @@ type PlatformTransportSettings struct {
 	// backoff after consecutive failed dials (see dialRetryAfter).
 	// Non-positive resolves to one minute.
 	ReconnectMaxTimeout time.Duration
+	// ReconnectLongAfter and ReconnectLongMaxTimeout add a second tier to that
+	// backoff: after this many consecutive failed dials while the platform was
+	// reachable (some other dial succeeded within platformReachableWindow), the
+	// wait may grow past ReconnectMaxTimeout up to ReconnectLongMaxTimeout. A
+	// success, a network change or a platform outage resets or never enters it,
+	// so a provider with many dead proxy identities stops redialing each of them
+	// every minute without slowing recovery. Zero ReconnectLongAfter disables it
+	// (the library default).
+	ReconnectLongAfter      int
+	ReconnectLongMaxTimeout time.Duration
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -1431,6 +1455,7 @@ func NewPlatformTransportWithTargetMode(
 		reconnectMaxTimeout = 60 * time.Second
 	}
 	transport.failBackoff = newDialFailureBackoff(settings.ReconnectTimeout, reconnectMaxTimeout)
+	transport.failBackoff.setLongTier(settings.ReconnectLongAfter, settings.ReconnectLongMaxTimeout)
 	if transport.ipFamily == 6 {
 		// the dns pump host publishes no AAAA record: the mode cannot work
 		// over a v6 pin, so it is not offered rather than left to fail
