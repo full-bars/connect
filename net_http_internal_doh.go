@@ -24,8 +24,8 @@ type internalDohResolver struct {
 	domains  []string
 	nextAddr atomic.Uint64
 
-	// stateLock guards the cache, which `ClientStrategy.SetInternalDohSettings`
-	// replaces on a running strategy, and closed.
+	// Guards the cache, which `ClientStrategy.SetInternalDohSettings` replaces
+	// on a running strategy, and closed.
 	stateLock sync.Mutex
 	cache     *DohCache
 	closed    bool
@@ -52,9 +52,14 @@ func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*C
 		cache:   NewDohCache(internalDohSettings(settings.DohSettings)),
 		domains: domains,
 	}
-	copied.ConnectSettings.DialContextSettings = &DialContextSettings{
-		DialContext: resolver.wrapDialContext(baseConnectSettings.DialContext),
+	// the wrapper replaces the stream dial only: an injected packet endpoint
+	// (PacketConnFactory) still opens every udp carrier's socket
+	dialContextSettings := DialContextSettings{}
+	if baseConnectSettings.DialContextSettings != nil {
+		dialContextSettings = *baseConnectSettings.DialContextSettings
 	}
+	dialContextSettings.DialContext = resolver.wrapDialContext(baseConnectSettings.DialContext)
+	copied.ConnectSettings.DialContextSettings = &dialContextSettings
 	return &copied, resolver
 }
 
@@ -144,9 +149,9 @@ func (self *internalDohResolver) getCache() *DohCache {
 	return self.cache
 }
 
-// replaceCache installs a cache and returns the one it replaced, for the
-// caller to close outside its own locks. A closed resolver installs nothing
-// and returns the new cache to be closed instead.
+// Installs a cache and returns the one it replaced, for the caller to close
+// outside its own locks. A closed resolver installs nothing and returns the new
+// cache to be closed instead.
 func (self *internalDohResolver) replaceCache(cache *DohCache) *DohCache {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -193,7 +198,7 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 			return dialContext(ctx, network, address)
 		}
 		if isRaceableDialNetwork(network) {
-			return dialDohAddrsRace(ctx, self.getCache(), network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return dialDohAddrsRace(ctx, self.getCache(), network, host, 0, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
 			})
 		}

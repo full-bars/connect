@@ -27,6 +27,25 @@ type h1DeadlineConn struct {
 	closed atomic.Bool
 }
 
+// net.Pipe reports io.ErrClosedPipe for its own closure; a native socket
+// reports net.ErrClosed. Match the native boundary only after this fixture's
+// Close, so a private probe timeout exercises the real fallback policy.
+func (c *h1DeadlineConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err == io.ErrClosedPipe && c.closed.Load() {
+		err = net.ErrClosed
+	}
+	return n, err
+}
+
+func (c *h1DeadlineConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == io.ErrClosedPipe && c.closed.Load() {
+		err = net.ErrClosed
+	}
+	return n, err
+}
+
 func (c *h1DeadlineConn) Close() error {
 	c.closed.Store(true)
 	return c.Conn.Close()
@@ -213,7 +232,7 @@ func TestH1StrategyHandshakeRTTBudgets(t *testing.T) {
 						if len(attempts) != wantAttempts || attempts[0].budget != 5*time.Second {
 							t.Fatalf("native handshake budget/attempts: %+v", attempts)
 						}
-						_, websocketSelected := conn.(*websocket.Conn)
+						_, websocketSelected := unobservedH1MessageConn(conn).(*websocket.Conn)
 						if websocketSelected != legacy {
 							t.Fatalf("carrier %T, legacy=%t", conn, legacy)
 						}

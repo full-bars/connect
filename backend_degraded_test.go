@@ -1,9 +1,14 @@
 package connect
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -160,6 +165,56 @@ func TestBackendDegraded_StreakSurvivesGapInsideWindow(t *testing.T) {
 	}
 }
 
+// A failure stamped after now is not recent. The clock stepped back since it
+// was taken, so its age is unknown, and an unknown age must not latch
+// "degraded", which only ever stops work. A synctest bubble's clock starts in
+// 2000, so inside one every failure an earlier test stamped in real time is
+// after now; read as recent, it held the windows of whichever bubbled tests
+// ran after it.
+func TestBackendDegraded_FailuresStampedAfterNowAreNotDegraded(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	for i := 0; i < backendDegradedFailThreshold; i++ {
+		noteBackendFailure()
+	}
+	if !isBackendDegraded() {
+		t.Fatal("precondition: should be degraded")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		if isBackendDegraded() {
+			t.Error("failures stamped in real time read as recent inside a synctest bubble")
+		}
+	})
+
+	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+	if isBackendDegraded() {
+		t.Error("degraded on failures stamped a minute after now")
+	}
+}
+
+// A streak stamped after now is discarded by the next failure, not extended:
+// one failure after the clock stepped back is the first of a fresh streak,
+// not the fourth of one whose age is unknown.
+func TestBackendDegraded_StreakStampedAfterNowIsNotResumedByANewFailure(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	for i := 0; i < backendDegradedFailThreshold; i++ {
+		noteBackendFailure()
+	}
+	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+
+	noteBackendFailure()
+
+	if got := consecutiveBackendFails.Load(); got != 1 {
+		t.Fatalf("consecutive failures = %d after a streak stamped after now plus one failure, want 1", got)
+	}
+	if isBackendDegraded() {
+		t.Fatal("degraded after a single failure; the streak stamped after now was resumed instead of reset")
+	}
+}
+
 // Failures and successes arrive concurrently in production: one client's auth
 // can succeed while another's contract OOB fails. The pair must never leave a
 // positive failure count with a zero timestamp, which isBackendDegraded would
@@ -204,64 +259,50 @@ func TestBackendDegraded_ConcurrentSuccessAndFailureNeverLeaveInvalidState(t *te
 }
 
 func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
-	resetBackendDegraded()
 	defer resetBackendDegraded()
 
-	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			noteBackendFailure()
-		}()
-	}
-	wg.Wait()
+	// rounds, because one round of a lost increment is a scheduling accident
+	// that a single pass can miss: a failure that read the clock before
+	// waiting for the lock found the stamp of the one that overtook it after
+	// its now, and restarted the streak
+	for round := 0; round < 50; round++ {
+		resetBackendDegraded()
 
-	if got := consecutiveBackendFails.Load(); got != 32 {
-		t.Fatalf("consecutive failures = %d after 32 concurrent failures, want 32", got)
-	}
-	if !isBackendDegraded() {
-		t.Fatal("not degraded after 32 concurrent failures")
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				noteBackendFailure()
+			}()
+		}
+		wg.Wait()
+
+		if got := consecutiveBackendFails.Load(); got != 32 {
+			t.Fatalf("round %d: consecutive failures = %d after 32 concurrent failures, want 32", round, got)
+		}
+		if !isBackendDegraded() {
+			t.Fatalf("round %d: not degraded after 32 concurrent failures", round)
+		}
 	}
 }
 
-// The auth sites must make the same local-teardown carve-out the contract OOB
-// path makes on client.Done: a canceled dial is this process shutting a
-// transport down, not the backend failing. Closing a multi-client window
-// cancels many transports at once, and without the guard that burst of
-// canceled dials trips the threshold with fresh timestamps -- so the NEXT
-// session starts gated. runH1/runH3 are connect loops that need a live server
-// to drive, so this pins the call-site shape the way the resize-pass anchors
-// do, for both transports at once.
+// Auth failure accounting must remain inside the actual local-teardown and
+// credential-refusal guards. Extra conjuncts must not break this source check.
 func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 	source, err := readSource("transport.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		fn    string
-		guard string
+		method string
+		guards []string
 	}{
-		{
-			fn:    "func (self *PlatformTransport) runH1(",
-			guard: "if self.ctx.Err() == nil {",
-		},
-		{
-			fn:    "func (self *PlatformTransport) runH3(",
-			guard: "if ctx.Err() == nil {",
-		},
+		{method: "runH1", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{method: "runH3", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
 	} {
-		body, ok := functionBody(source, test.fn)
-		if !ok {
-			t.Fatalf("could not find %s", test.fn)
-		}
-		note := strings.Index(body, "self.noteDialFailure(err)")
-		if note < 0 {
-			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", test.fn)
-		}
-		guarded := strings.Index(body, test.guard)
-		if guarded < 0 || note < guarded {
-			t.Fatalf("%s records auth failures without the local-teardown carve-out: a canceled dial would count as a backend failure", test.fn)
+		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
+			t.Errorf("%s: %v", test.method, err)
 		}
 	}
 
@@ -286,5 +327,361 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 	pinned := strings.Index(body, "if self.pinned() {")
 	if pinned < 0 || note < pinned {
 		t.Fatal("noteDialFailure counts a family-pinned transport's dial failure as a backend failure")
+	}
+}
+
+// Inspect only the platform runner's real call ancestors. A required expression
+// must be a mandatory conjunction on the true branch containing every call;
+// unrelated branches and deferred/asynchronous execution are not authority.
+func authFailureSourceGuards(source string, method string, required []string) error {
+	file, err := parser.ParseFile(token.NewFileSet(), "transport.go", source, 0)
+	if err != nil {
+		return fmt.Errorf("cannot parse transport source: %w", err)
+	}
+	var body *ast.BlockStmt
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != method || function.Recv == nil || len(function.Recv.List) != 1 {
+			continue
+		}
+		receiver := function.Recv.List[0]
+		pointer, ok := receiver.Type.(*ast.StarExpr)
+		if !ok || len(receiver.Names) != 1 || receiver.Names[0].Name != "self" {
+			continue
+		}
+		name, ok := pointer.X.(*ast.Ident)
+		if ok && name.Name == "PlatformTransport" {
+			body = function.Body
+			break
+		}
+	}
+	if body == nil || len(required) == 0 {
+		return fmt.Errorf("missing platform runner or required guards")
+	}
+	guards := make([]ast.Expr, len(required))
+	for index, condition := range required {
+		guards[index], err = parser.ParseExpr(condition)
+		if err != nil {
+			return fmt.Errorf("cannot parse required auth guard: %w", err)
+		}
+	}
+	unparen := func(expression ast.Expr) ast.Expr {
+		for {
+			parenthesized, ok := expression.(*ast.ParenExpr)
+			if !ok {
+				return expression
+			}
+			expression = parenthesized.X
+		}
+	}
+	// Only the expression shapes used by these three auth guards are accepted.
+	var sameExpression func(ast.Expr, ast.Expr) bool
+	sameExpression = func(left ast.Expr, right ast.Expr) bool {
+		left, right = unparen(left), unparen(right)
+		switch left := left.(type) {
+		case *ast.Ident:
+			right, ok := right.(*ast.Ident)
+			return ok && left.Name == right.Name
+		case *ast.BasicLit:
+			right, ok := right.(*ast.BasicLit)
+			return ok && left.Kind == right.Kind && left.Value == right.Value
+		case *ast.SelectorExpr:
+			right, ok := right.(*ast.SelectorExpr)
+			return ok && left.Sel.Name == right.Sel.Name && sameExpression(left.X, right.X)
+		case *ast.CallExpr:
+			right, ok := right.(*ast.CallExpr)
+			return ok && len(left.Args) == 0 && len(right.Args) == 0 && sameExpression(left.Fun, right.Fun)
+		case *ast.UnaryExpr:
+			right, ok := right.(*ast.UnaryExpr)
+			return ok && left.Op == right.Op && sameExpression(left.X, right.X)
+		case *ast.BinaryExpr:
+			right, ok := right.(*ast.BinaryExpr)
+			return ok && left.Op == right.Op && sameExpression(left.X, right.X) && sameExpression(left.Y, right.Y)
+		default:
+			return false
+		}
+	}
+	var mandatoryConjunct func(ast.Expr, ast.Expr) bool
+	mandatoryConjunct = func(condition ast.Expr, guard ast.Expr) bool {
+		if sameExpression(condition, guard) {
+			return true
+		}
+		conjunction, ok := unparen(condition).(*ast.BinaryExpr)
+		return ok && conjunction.Op == token.LAND &&
+			(mandatoryConjunct(conjunction.X, guard) || mandatoryConjunct(conjunction.Y, guard))
+	}
+	callCount, unsafeCount := 0, 0
+	var ancestors []ast.Node
+	ast.Inspect(body, func(node ast.Node) bool {
+		if node == nil {
+			ancestors = ancestors[:len(ancestors)-1]
+			return true
+		}
+		if call, ok := node.(*ast.CallExpr); ok {
+			selector, selected := unparen(call.Fun).(*ast.SelectorExpr)
+			if selected && selector.Sel.Name == "noteDialFailure" {
+				self, own := unparen(selector.X).(*ast.Ident)
+				if own && self.Name == "self" {
+					callCount++
+					guarded := make([]bool, len(guards))
+				ancestorsLoop:
+					for index := len(ancestors) - 1; 0 <= index; index-- {
+						switch ancestor := ancestors[index].(type) {
+						case *ast.FuncLit, *ast.GoStmt, *ast.DeferStmt:
+							break ancestorsLoop
+						case *ast.IfStmt:
+							if ancestor.Body.Pos() < call.Pos() && call.End() < ancestor.Body.End() {
+								for guardIndex, guard := range guards {
+									guarded[guardIndex] = guarded[guardIndex] || mandatoryConjunct(ancestor.Cond, guard)
+								}
+							}
+						}
+					}
+					for _, present := range guarded {
+						if !present {
+							unsafeCount++
+							break
+						}
+					}
+				}
+			}
+		}
+		ancestors = append(ancestors, node)
+		return true
+	})
+	if callCount == 0 || unsafeCount != 0 {
+		return fmt.Errorf("auth failure calls=%d without required containing guards=%d", callCount, unsafeCount)
+	}
+	return nil
+}
+
+// The old exact-brace anchor rejected the current stronger conjunction. Both
+// that form and a nested/reordered guard must retain their mandatory meaning.
+func TestAuthFailureSourceGuardAcceptsMandatoryConjuncts(t *testing.T) {
+	for _, test := range []struct {
+		name, method, body string
+		guards             []string
+	}{
+		{name: "old bare guard", method: "runH1", body: "if self.ctx.Err() == nil { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil"}},
+		{name: "current h1 guard", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{name: "reordered and parenthesized", method: "runH1", body: "if ((refusal == 0) && ((self.ctx.Err()) == (nil))) { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{name: "nested h3 attempt", method: "runH3", body: "if ctx.Err() == nil && refusal == 0 { if !attemptCanceled { self.noteDialFailure() } }", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
+		{name: "both guarded calls", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure(); self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) " + test.method + "() { " + test.body + " }\n"
+		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+	}
+}
+
+// Syntax near a call is not evidence that local teardown is excluded. These
+// controls fail deterministically without dialing, waiting, or changing runtime.
+func TestAuthFailureSourceGuardRejectsUnsafeMutants(t *testing.T) {
+	for _, test := range []struct{ name, body string }{
+		{name: "no guard", body: "self.noteDialFailure()"},
+		{name: "or allows cancellation", body: "if self.ctx.Err() == nil || refusal == 0 { self.noteDialFailure() }"},
+		{name: "unrelated earlier guard", body: "if self.ctx.Err() == nil && refusal == 0 {}; self.noteDialFailure()"},
+		{name: "else is not live", body: "if self.ctx.Err() == nil && refusal == 0 {} else { self.noteDialFailure() }"},
+		{name: "missing context", body: "if refusal == 0 { self.noteDialFailure() }"},
+		{name: "missing refusal", body: "if self.ctx.Err() == nil { self.noteDialFailure() }"},
+		{name: "second unguarded call", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }; self.noteDialFailure()"},
+		{name: "parenthesized unguarded call", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }; (self.noteDialFailure)()"},
+		{name: "late callback", body: "if self.ctx.Err() == nil && refusal == 0 { callback = func() { self.noteDialFailure() } }"},
+		{name: "spawned call", body: "if self.ctx.Err() == nil && refusal == 0 { go self.noteDialFailure() }"},
+		{name: "deferred call", body: "if self.ctx.Err() == nil && refusal == 0 { defer self.noteDialFailure() }"},
+		{name: "guard only in comment", body: "/* if self.ctx.Err() == nil && refusal == 0 { */ self.noteDialFailure()"},
+		{name: "no accounting call", body: "if self.ctx.Err() == nil && refusal == 0 {}"},
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) runH1() { " + test.body + " }\n"
+		if err := authFailureSourceGuards(source, "runH1", []string{"self.ctx.Err() == nil", "refusal == 0"}); err == nil {
+			t.Fatalf("%s admitted unsafe auth accounting", test.name)
+		}
+	}
+	for _, body := range []string{
+		"if ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }",
+		"if ctx.Err() == nil && refusal == 0 { if !attemptCanceled || other { self.noteDialFailure() } }",
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) runH3() { " + body + " }\n"
+		if err := authFailureSourceGuards(source, "runH3", []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}); err == nil {
+			t.Fatal("h3 accounting admitted a canceled attempt")
+		}
+	}
+	for _, source := range []string{
+		"package connect\nfunc (self *OtherTransport) runH1() { if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() } }",
+		"package connect\nfunc (self *PlatformTransport) other() { if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() } }",
+		"package connect\nfunc (",
+	} {
+		if err := authFailureSourceGuards(source, "runH1", []string{"self.ctx.Err() == nil", "refusal == 0"}); err == nil {
+			t.Fatal("missing or malformed runner passed the guard check")
+		}
+	}
+}
+
+// The successor-prefetch hybrid. Upstream's degraded gate applies to the
+// speculative request at take; a boundary request (the lazy due path and the
+// announce-threshold prefetch) goes out even while the backend reads degraded,
+// so the boundary switch is not starved; and the exhaustion fallback keeps its
+// gate. These drive the real call sites through the successor fixtures. The
+// gate state is package-level, so they do not run in parallel.
+
+// Degraded, due, and nothing queued: the boundary request still goes out,
+// because it is what a sequence that is actually sending needs before the
+// boundary switch.
+func TestDegradedBackendStillRequestsTheDueSuccessorAtTheBoundary(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	client, oob, sequence := newContractSuccessorTestSequence(t, false, false)
+	takeContractSuccessorTestOpening(t, client, oob, sequence)
+	requests := oob.count()
+
+	for range backendDegradedFailThreshold {
+		noteBackendFailure()
+	}
+	if !isBackendDegraded() {
+		t.Fatal("precondition: the backend must read degraded")
+	}
+
+	for range 8 {
+		if !sequence.updateContract(16 * 1024) {
+			t.Fatal("the contract refused a message it has room for")
+		}
+	}
+	if !isBackendDegraded() {
+		t.Fatal("the backend stopped reading degraded before the request was observed")
+	}
+	if !sequence.successorContractRequested {
+		t.Fatal("the due successor was not requested while degraded; the boundary switch would stall")
+	}
+	if got := oob.count(); got != requests+1 {
+		t.Errorf("%d contracts requested at the degraded boundary, want one more than the %d already made", got, requests)
+	}
+}
+
+// Degraded and eager at take: the request at take is speculative and happens
+// long before the boundary, so upstream's gate suppresses it and the sequence
+// does not keep an outage's OOB storm going.
+func TestDegradedBackendSuppressesTheSpeculativeRequestAtTake(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	client, oob, sequence := newContractSuccessorTestSequence(t, false, false)
+	sequence.sendBufferSettings.ContractPrefetchLeadTime = 0
+
+	for range backendDegradedFailThreshold {
+		noteBackendFailure()
+	}
+	// Take the opening contract the way takeContractSuccessorTestOpening does,
+	// but re-arm the degraded state inside the grant: answering the opening
+	// request is itself a successful backend round trip that clears the state,
+	// and the eager request this row is about fires after the take returns.
+	sequence.prewarmOpeningContract()
+	client.sendBuffer.beforeTakeContractForTest = func(sendSequenceId) {
+		if oob.count() == 1 && contractSuccessorTestRequestHeld(oob, 0) {
+			grantContractSuccessorTestRequest(t, client, oob, 0)
+		}
+		for range backendDegradedFailThreshold {
+			noteBackendFailure()
+		}
+	}
+	defer func() { client.sendBuffer.beforeTakeContractForTest = nil }()
+	if !sequence.updateContract(0) {
+		t.Fatal("the first message could not take the opening contract")
+	}
+
+	if !isBackendDegraded() {
+		t.Fatal("the backend stopped reading degraded at take")
+	}
+	if !sequence.successorContractEager {
+		t.Fatal("the sequence is not the eager shape this row needs")
+	}
+	if got := oob.count(); got != 1 {
+		t.Errorf("%d contracts requested by a degraded eager take, want only the opening one", got)
+	}
+}
+
+// Degraded with a successor already queued: the queue satisfies the take, so no
+// request goes out even though the boundary would bypass the gate.
+func TestDegradedBackendDoesNotRequestWithASuccessorAlreadyQueued(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	client, oob, sequence := newContractSuccessorTestSequence(t, false, false)
+	takeContractSuccessorTestOpening(t, client, oob, sequence)
+	// an answer that arrived for this queue without this sequence asking
+	client.ContractManager().CreateContract(sequence.contractMetadata().key, 1, 1024)
+	grantContractSuccessorTestRequest(t, client, oob, 1)
+	requests := oob.count()
+
+	for range backendDegradedFailThreshold {
+		noteBackendFailure()
+	}
+
+	for range 8 {
+		if !sequence.updateContract(16 * 1024) {
+			t.Fatal("the contract refused a message it has room for")
+		}
+	}
+	if !sequence.successorContractRequested {
+		t.Fatal("the rule never came due for a contract charged past its minimum at once")
+	}
+	if got := oob.count(); got != requests {
+		t.Errorf("%d more contracts requested with a successor already queued and the backend degraded", got-requests)
+	}
+}
+
+// The exhaustion fallback keeps its gate: a sequence that cannot take any
+// contract requests one while the backend is healthy, and requests none while
+// it reads degraded. The first request is coalesced against its own still-held
+// copy (`beginCreate`), so a healthy exhaustion makes exactly one request no
+// matter how many retry iterations fit in the timeout.
+func TestDegradedBackendStillGatesTheExhaustionFallback(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	requestsDuringExhaustion := func(degraded bool) int {
+		resetBackendDegraded()
+		if degraded {
+			for range backendDegradedFailThreshold {
+				noteBackendFailure()
+			}
+		}
+		_, oob, sequence := newContractSuccessorTestSequence(t, false, false)
+		// nothing is ever queued for this sequence, so the acquisition loop
+		// runs to exhaustion rather than taking a contract
+		sequence.sendBufferSettings.CreateContractTimeout = 100 * time.Millisecond
+		sequence.sendBufferSettings.CreateContractRetryInterval = 20 * time.Millisecond
+		sequence.sendBufferSettings.CreateContractRetryMaxInterval = 20 * time.Millisecond
+		before := oob.count()
+		if sequence.updateContract(0) {
+			t.Fatal("a sequence with no contract reported a successful update")
+		}
+		if !degraded && isBackendDegraded() {
+			t.Fatal("the backend read degraded after a held (not failed) request")
+		}
+		return oob.count() - before
+	}
+
+	if got := requestsDuringExhaustion(false); got != 1 {
+		t.Fatalf("a healthy exhaustion made %d contract requests, want 1", got)
+	}
+	if got := requestsDuringExhaustion(true); got != 0 {
+		t.Errorf("a degraded exhaustion made %d contract requests, want none while the backend reads degraded", got)
+	}
+}
+
+// The control: with a healthy backend the speculative request at take is
+// unchanged, so the hybrid costs the healthy path nothing.
+func TestHealthyBackendStillRequestsTheSpeculativeSuccessorAtTake(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	client, oob, sequence := newContractSuccessorTestSequence(t, false, false)
+	sequence.sendBufferSettings.ContractPrefetchLeadTime = 0
+	takeContractSuccessorTestOpening(t, client, oob, sequence)
+
+	if got := oob.count(); got != 2 {
+		t.Errorf("a healthy eager take made %d contract requests, want the opening one and its successor", got)
 	}
 }

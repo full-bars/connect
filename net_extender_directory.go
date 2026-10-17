@@ -3,10 +3,11 @@ package connect
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	mathrand "math/rand"
 	"net/netip"
 	"slices"
 	"strings"
@@ -30,12 +31,20 @@ import (
 //
 // The policy numbers are all settings so a test can pin every transition, and
 // `Now` is the only clock the policy reads, so a fake clock makes the whole
-// policy deterministic.
+// policy deterministic. A time.Now reading carries a monotonic reading beside
+// the wall one, and the monotonic clock stops while the host sleeps, so a
+// latency sample's age and when a hold or a limit lapses are judged by
+// whichever of the two clocks has moved further (extenderElapsed,
+// extenderBefore): a sleep counts toward them, and a wall clock set back does
+// not extend them.
 //
 // Methods are safe for concurrent use. The state lock is never held across a
 // call to the store or to a monitor consumer; the save runs on the internal
 // `run` goroutine started by the constructor, coalesced one save timeout after
-// a change, so a burst of applied records costs one write.
+// a change, so a burst of applied records costs one write. `Reset` writes the
+// store itself before it returns, and a save never writes a state older than
+// one already written, so the state a save read before a reset never lands
+// after it.
 
 // Where an address was learned (F2). The source is descriptive: it never
 // changes once an address is known, so an upgrade to verified keeps the origin
@@ -51,6 +60,9 @@ const (
 	// upgrades when a record naming it arrives -- and is kept distinct from
 	// `manual` so the status can say where it came from.
 	ExtenderSourceImport = "import"
+	// A record the operator released to this client's authenticated identity
+	// (Q3): the gated tier. Not a network event (K4), like a bootstrap.
+	ExtenderSourceRelease = "release"
 )
 
 // The address states reported by the status (F2), in precedence order: trust
@@ -69,6 +81,11 @@ const (
 // discarded, exactly like an unreadable one.
 const ExtenderDirectoryStoreVersion = 1
 
+// Version of the operator's stored country, a section of the envelope with a
+// version of its own (extenderDirectoryStoreCountryHint). A section of another
+// version is skipped alone: the records and addresses beside it still load.
+const extenderDirectoryStoreCountryHintVersion = 1
+
 // The bounded buffer of one Subscribe consumer (D4). A consumer that falls
 // this far behind is cut off rather than waited on.
 const ExtenderDirectorySubscribeBufferCount = 64
@@ -76,6 +93,10 @@ const ExtenderDirectorySubscribeBufferCount = 64
 // Cap of the apply-time ring (K4). The window prunes it long before this on
 // any normal feed; the cap is what bounds a flood.
 const ExtenderDirectoryEventRingCount = 1024
+
+// The answer to a record or revocation whose verification began before a
+// reset and ended after it (Reset): it is not applied.
+var errExtenderDirectoryReset = errors.New("the extender directory was reset while the message was verified")
 
 // The progress of the network client's first feed sample, which is what the
 // startup gate waits on (E4). `None` means no network client is running, so
@@ -109,6 +130,8 @@ type ExtenderDirectorySettings struct {
 	NetworkHosts []string
 
 	// Hold after a failure, doubling per consecutive failure up to the max.
+	// A hold lapses once either clock has passed it (extenderBefore), so the
+	// time the host slept counts toward it.
 	HoldTimeout    time.Duration
 	MaxHoldTimeout time.Duration
 	// Consecutive failures that make an address a warning.
@@ -164,14 +187,53 @@ type ExtenderDirectorySettings struct {
 	// (DESIGNNOTES4.md §4): the ordering stops trusting it and a probe pass
 	// measures the address again. The default is half the day the operator
 	// keeps pings for, so a provider's attested pings are renewed before the
-	// previous ones age out of what each derivation reads (GEOMAP §2.1). <= 0
-	// keeps a sample for the life of the process.
+	// previous ones age out of what each derivation reads (GEOMAP §2.1). The
+	// age counts the time the host slept (extenderElapsed). A path change, and
+	// a resume from a long sleep for the samples taken before it, keep every
+	// sample in use until a probe replaces it (RefreshLatencies,
+	// RefreshSleptLatencies). <= 0 keeps a sample until a probe replaces it.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
 	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
 	// limited address is never a failure: it orders after every healthy one
 	// until its backoff passes, and the probe pass and the feed dial skip it.
+	// A backoff passes like a hold, by either clock.
 	ExtenderLimitedBackoff time.Duration
+	// How long the operator's last country stands in once its hint is no
+	// longer current (SpoofCountryCode), by the wall clock from the operator's
+	// last answer. The country is stored, so a restart keeps it: the iOS packet
+	// tunnel extension usually ends with its tunnel, and a start where no
+	// direct hint read succeeds (a whitelist-only network) on a host that
+	// reports no network country would otherwise have none. Each answer renews
+	// it, and the operator is asked at each start, path change and refresh
+	// period, so this bounds only a client with no direct answer for that
+	// long, such as one that left the country; past it the country is never
+	// used. The default is a week: it outlasts the whitelist-only days between
+	// two answers, and it is the age at which this directory already stops
+	// trusting an address's last success (StaleSuccessRemoveTimeout). <= 0
+	// never uses the last country once its hint is stale.
+	CountryHintMaxAge time.Duration
+
+	// WebRtcCarrierEnabled lets a candidate carry the peer-to-peer webrtc
+	// carrier its record lists (EXTENDER.md S). Off by default: without a
+	// signaling path a webrtc dial can only fail, and a failure counts
+	// against the address's other carriers. The owner that installs a
+	// carrier on its connect settings turns it on, here or at run time
+	// (SetWebRtcCarrierEnabled).
+	WebRtcCarrierEnabled bool
+
+	// The secret the feed sample this directory serves is partitioned by
+	// (Q2, net_extender_directory_partition.go): which open records a feed
+	// client at one vantage is sampled from, and in what order each epoch.
+	// Nil draws one at random for the life of the directory, which is all an
+	// extender needs: a vantage is bound to one partition for as long as the
+	// process runs, and a restart deals the partitions again. Never on the
+	// wire. Tests pin it.
+	PartitionSecret []byte
+	// The epoch of the feed sample (Q2): within one epoch a vantage is
+	// served the same sample of its partition, and the next epoch another.
+	// <= 0 is one epoch forever. The default is ExtenderOpenEpochTimeout.
+	OpenEpochTimeout time.Duration
 
 	// The only clock the policy reads. Tests install a fake one.
 	Now func() time.Time
@@ -198,6 +260,8 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		EventWindowTimeout:             60 * time.Second,
 		LatencyMaxAge:                  12 * time.Hour,
 		ExtenderLimitedBackoff:         30 * time.Second,
+		CountryHintMaxAge:              7 * 24 * time.Hour,
+		OpenEpochTimeout:               ExtenderOpenEpochTimeout,
 		Now:                            time.Now,
 	}
 }
@@ -244,18 +308,21 @@ type extenderDirectoryAddress struct {
 	consecutiveFailureCount int
 	holdUntilTime           time.Time
 	lastUseTime             time.Time
-	inUseCount              int
 	// the address answered 429 and is left alone until then (A12); per
 	// process, never stored, and never a failure
 	limitedUntilTime time.Time
 
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
 	// probe pass, when it was taken and whether the target co-signed a claim
-	// of that pass (GEOMAP §2.3). Per process; never stored.
-	latency         time.Duration
-	latencyTime     time.Time
-	latencyAttested bool
-	probeCount      int
+	// of that pass (GEOMAP §2.3). Per process: never stored. A path change,
+	// and a resume from a long sleep that followed it, keep it and make it
+	// due a refresh (RefreshLatencies, RefreshSleptLatencies): it still ranks,
+	// and the probe pass measures it again, the next sample replacing it.
+	latency           time.Duration
+	latencyTime       time.Time
+	latencyAttested   bool
+	latencyRefreshDue bool
+	probeCount        int
 }
 
 // One dialable endpoint handed to the strategy and to the network client. The
@@ -269,13 +336,18 @@ type ExtenderCandidate struct {
 	// leaf is checked against it (B3, E5).
 	PublicKey []byte
 	Carriers  []string
-	TcpPort   int
-	UdpPort   int
+	// The exchange rendezvous id of the webrtc carrier the record lists
+	// (EXTENDER.md S), zero when the record carries none. Carriers names
+	// the carrier only when the directory has it enabled and the record
+	// carries this id.
+	WebRtcClientId Id
+	TcpPort        int
+	UdpPort        int
 	// The first dns port, kept for a caller that predates DnsPorts.
 	DnsPort int
-	// Every dns port the record offers, in dial order (L2): ascending, so 53
-	// is dialed before 4053 when both are listed. Empty falls back to
-	// DnsPort.
+	// Every dns port the record offers, ascending (L2). A dial tries these
+	// first and then whichever of 4053 and 53 they do not include
+	// (dnsCarrierPorts). Empty falls back to DnsPort.
 	DnsPorts    []int
 	DnsTld      string
 	CountryCode string
@@ -283,14 +355,23 @@ type ExtenderCandidate struct {
 	// for a record that predates it and for an unverified address
 	// (DESIGNNOTES4.md §2).
 	ContinentCode string
+	// The directory tier the record is signed into (Q1):
+	// ExtenderDirectoryTierOpen for a record that predates the field and for
+	// an unverified address, ExtenderDirectoryTierGated for a released one.
+	DirectoryTier int
 	// The current latency sample, zero when there is none (DESIGNNOTES4.md).
 	Latency time.Duration
 	// Whether the target co-signed a claim of the pass that took the sample
 	// (GEOMAP §2.3), which a provider's probe pass reads to find what it has
 	// no co-signed measurement of yet.
 	LatencyAttested bool
-	Source          string
-	Verified        bool
+	// Whether the sample is due a refresh: it was taken before the last path
+	// change, or before a long sleep the host resumed from (RefreshLatencies).
+	// It still ranks, and a probe pass measures it again, as it does an
+	// address with none.
+	LatencyRefreshDue bool
+	Source            string
+	Verified          bool
 	// Whether the record has expired: the candidate is one of the retained
 	// expired identities (MaxExpiredRecordCount), which only the last tier of
 	// Candidates carries.
@@ -300,27 +381,40 @@ type ExtenderCandidate struct {
 	LimitedUntil time.Time
 }
 
-// The dns carrier ports of one candidate in dial order (L2). DnsPorts when it
-// has them -- a record may offer 53 and 4053 -- else the single DnsPort, which
-// is what a candidate built before DnsPorts carries.
+// The dns carrier ports one dial of this candidate races, in launch order
+// (L2, net_extender_dns_ports.go): the ports it offers, ascending -- DnsPorts
+// when it has them, else the single DnsPort a candidate built before DnsPorts
+// carries -- and then whichever of 4053 and 53 those do not include, 4053
+// first. Every extender binds 4053 and only the sn miner also binds 53, so a
+// record that lists 4053 alone, which is every app extender's, and an
+// address with no record are both dialed on 4053 first. A candidate that
+// offers no dns port has no dns carrier to dial (E3).
 func (self *ExtenderCandidate) dnsCarrierPorts() []int {
-	if dnsPorts := orderedDnsPorts(self.DnsPorts); 0 < len(dnsPorts) {
-		return dnsPorts
+	dnsPorts := orderedDnsPorts(self.DnsPorts)
+	if len(dnsPorts) == 0 {
+		dnsPorts = orderedDnsPorts([]int{self.DnsPort})
 	}
-	if 0 < self.DnsPort {
-		return []int{self.DnsPort}
+	if len(dnsPorts) == 0 {
+		return nil
 	}
-	return nil
+	for _, dnsPort := range []int{ExtenderDnsPort, DefaultDnsPort} {
+		if !slices.Contains(dnsPorts, dnsPort) {
+			dnsPorts = append(dnsPorts, dnsPort)
+		}
+	}
+	return dnsPorts
 }
 
 // One address as the status reports it (F2).
 type ExtenderDirectoryEntry struct {
-	Ip              netip.Addr
-	IpVersion       int
-	PublicKey       []byte
-	Carriers        []string
-	CountryCode     string
-	ContinentCode   string
+	Ip            netip.Addr
+	IpVersion     int
+	PublicKey     []byte
+	Carriers      []string
+	CountryCode   string
+	ContinentCode string
+	// the directory tier of the record (Q1), open for an unverified address
+	DirectoryTier   int
 	Latency         time.Duration
 	State           string
 	Source          string
@@ -363,8 +457,32 @@ type ExtenderDirectory struct {
 	// the startup gate's rendezvous with the network client (E4)
 	initialSampleMonitor *MonitorValue[ExtenderInitialSampleState]
 
+	// orders the writes through the store: a save holds it from judging
+	// whether what it read is still the newest to the store's answer, so a
+	// save that read the state before a reset never lands after the reset's
+	// own (save). Taken before the state lock, never inside it.
+	saveLock sync.Mutex
+	// test seam only, nil otherwise: runs between a save's read of the state
+	// and its write, where a reset and its own save can land
+	saveReadHook func()
+
 	stateLock  sync.Mutex
 	rootKeySet *ExtenderRootKeySet
+	// whether candidates carry the webrtc carrier their records list
+	// (ExtenderDirectorySettings.WebRtcCarrierEnabled, SetWebRtcCarrierEnabled)
+	webRtcCarrierEnabled bool
+	// advances with every Reset, which is how a record or revocation whose
+	// verification began before a reset is told apart from one that began
+	// after it (applyVerifiedRecord)
+	resetVersion uint64
+	// test seam only, nil otherwise: runs between the verification of an
+	// applied message and its apply, where a reset can land
+	applyVerifiedHook func()
+	// the live connections through each address (SetInUse), by ip whether or
+	// not the address is known: a connection outlives a reset that dropped
+	// its address, and its release must still balance its hold once the
+	// address is known again
+	ipInUseCounts map[netip.Addr]int
 	// The apply times of the records and revocations that arrived over the
 	// feed or the mesh, oldest first from eventHead, pruned to the event
 	// window (K4). Only those two sources count: a stored record loaded at
@@ -376,6 +494,15 @@ type ExtenderDirectory struct {
 	// the continent the candidate order prefers, upper case, empty until the
 	// network client learns one (DESIGNNOTES4.md §4)
 	continentHint string
+	// the country the operator's hint last placed this client in, lower
+	// case, empty until it has placed it; when the operator last answered it,
+	// by the wall clock alone, as the store keeps it; and whether that answer
+	// is current: given on the path this client is on now, by the latest
+	// hint. A failed hint and a path change leave the country stale, and a
+	// country loaded from the store is stale from the start (SpoofCountryCode)
+	countryHint        string
+	countryHintTime    time.Time
+	countryHintCurrent bool
 	// verified identities by hex public key
 	keyHexRecords map[string]*extenderDirectoryRecord
 	// every known address
@@ -399,6 +526,9 @@ type ExtenderDirectory struct {
 	maxActiveRecordCount int
 	// the serial the next applied record takes
 	nextApplySerial uint64
+	// the secret the feed sample is partitioned by (Q2): the setting, or one
+	// drawn at construction
+	partitionSecret []byte
 }
 
 // One live subscription to the applied messages (D4). The channel is the
@@ -438,11 +568,22 @@ func NewExtenderDirectory(
 		changeMonitor:        NewMonitorValue[uint64](0),
 		initialSampleMonitor: NewMonitorValue[ExtenderInitialSampleState](ExtenderInitialSampleNone),
 		rootKeySet:           NewExtenderRootKeySet(),
+		ipInUseCounts:        map[netip.Addr]int{},
 		keyHexRecords:        map[string]*extenderDirectoryRecord{},
 		ipAddresses:          map[netip.Addr]*extenderDirectoryAddress{},
 		subscriptions:        map[*extenderDirectorySubscription]bool{},
 		keptKeyHexes:         map[string]bool{},
 		maxActiveRecordCount: settings.MaxActiveRecordCount,
+		partitionSecret:      slices.Clone(settings.PartitionSecret),
+		webRtcCarrierEnabled: settings.WebRtcCarrierEnabled,
+	}
+	if len(self.partitionSecret) == 0 {
+		// one per directory: a vantage is bound to one partition for the life
+		// of the process, and nothing outside it can compute the placement
+		self.partitionSecret = make([]byte, 32)
+		if _, err := rand.Read(self.partitionSecret); err != nil {
+			panic(err)
+		}
 	}
 	self.load()
 	// arm the save loop's subscription here, not inside the goroutine: a
@@ -545,6 +686,22 @@ func (self *ExtenderDirectory) RootKeys() *ExtenderRootKeySet {
 	return self.rootKeySet
 }
 
+// The root keys a message is verified under and the reset it is verified in,
+// read together, so the apply can tell whether a reset landed in between
+// (applyVerifiedRecord).
+func (self *ExtenderDirectory) rootKeysAndResetVersion() (*ExtenderRootKeySet, uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.rootKeySet, self.resetVersion
+}
+
+// Runs the test seam between a verification and its apply, when one is set.
+func (self *ExtenderDirectory) verified() {
+	if self.applyVerifiedHook != nil {
+		self.applyVerifiedHook()
+	}
+}
+
 // Applies one signed gossip message, verifying it under the current root keys
 // and the allowed network hosts. Records applied in this phase arrive over the
 // feed; the gossip node of phase 5a applies with its own source.
@@ -578,7 +735,7 @@ func (self *ExtenderDirectory) ApplyRecord(
 	record *protocol.ExtenderRecord,
 	source string,
 ) (changed bool, err error) {
-	keySet := self.RootKeys()
+	keySet, resetVersion := self.rootKeysAndResetVersion()
 	body, err := keySet.VerifyRecord(record)
 	if err != nil {
 		return false, err
@@ -589,19 +746,31 @@ func (self *ExtenderDirectory) ApplyRecord(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender record carries no public key")
 	}
-	return self.applyVerifiedRecord(record, body, source), nil
+	self.verified()
+	return self.applyVerifiedRecord(record, body, keySet, resetVersion, source)
 }
 
-// Applies one record whose body has been verified and whose network host is
-// allowed: what ApplyRecord does once the signature holds. Past
-// MaxActiveRecordCount a record new to the directory evicts one the directory
-// prefers less, which may be this one; the record is published to the
-// subscribers either way, whose own caps judge it.
+// Applies one record whose body has been verified under keySet and whose
+// network host is allowed: what ApplyRecord does once the signature holds.
+// Past MaxActiveRecordCount a record new to the directory evicts one the
+// directory prefers less, which may be this one; the record is published to
+// the subscribers either way, whose own caps judge it.
+//
+// The verification runs outside the lock, so SetRootKeys can replace the keys
+// between it and the store, after judging every record it held. A record
+// verified under keys that are no longer in force is judged again under the
+// lock, so it never lands after them. Keys change rarely, so the second
+// verification is rarely paid. A record verified before a reset (`resetVersion`
+// is not the directory's) is dropped: it was taken from what the reset
+// cleared -- a stream or a mesh the owner is replacing -- and landing it would
+// leave the reset incomplete.
 func (self *ExtenderDirectory) applyVerifiedRecord(
 	record *protocol.ExtenderRecord,
 	body *protocol.ExtenderRecordBody,
+	keySet *ExtenderRootKeySet,
+	resetVersion uint64,
 	source string,
-) (changed bool) {
+) (changed bool, err error) {
 	if source == "" {
 		source = ExtenderSourceFeed
 	}
@@ -622,6 +791,14 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if resetVersion != self.resetVersion {
+		return false, errExtenderDirectoryReset
+	}
+	if keySet != self.rootKeySet {
+		if _, err := self.rootKeySet.VerifyRecord(record); err != nil {
+			return false, err
+		}
+	}
 	keyRecord := self.keyHexRecords[keyHex]
 	if keyRecord == nil {
 		// the body is kept as the record's for as long as the key is, so its
@@ -632,7 +809,7 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 		self.keyHexRecords[keyHex] = keyRecord
 	} else if keyRecord.recordBody != nil && body.IssueTimeMs <= keyRecord.recordBody.IssueTimeMs {
 		// an older or identical record; the newest one already held wins
-		return false
+		return false, nil
 	}
 	keyRecord.record = record
 	keyRecord.recordBody = body
@@ -671,14 +848,17 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	self.enforceAddressCapWithLock(now)
 	self.noteEventWithLock(source, now)
 	// the message is built only for a subscriber, since a directory fed a
-	// record a millisecond pays for everything it builds per record
-	if 0 < len(self.subscriptions) {
+	// record a millisecond pays for everything it builds per record. A gated
+	// record goes to no subscriber whatever source it came from (Q1): the
+	// subscribers are the feed stream and the mesh, the open channels, and a
+	// durable record that reached them once would be enumerable from then on
+	if 0 < len(self.subscriptions) && ExtenderRecordOpen(body) {
 		self.publishWithLock(&protocol.ExtenderGossipMessage{
 			Message: &protocol.ExtenderGossipMessage_Record{Record: record},
 		})
 	}
 	self.changedWithLock()
-	return true
+	return true, nil
 }
 
 // Applies one signed revocation that arrived over the feed, which is what
@@ -696,7 +876,7 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	revocation *protocol.ExtenderRevocation,
 	source string,
 ) (changed bool, err error) {
-	keySet := self.RootKeys()
+	keySet, resetVersion := self.rootKeysAndResetVersion()
 	body, err := keySet.VerifyRevocation(revocation)
 	if err != nil {
 		return false, err
@@ -707,11 +887,36 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender revocation carries no public key")
 	}
+	self.verified()
+	return self.applyVerifiedRevocation(revocation, body, keySet, resetVersion, source)
+}
+
+// Applies one revocation whose body has been verified under keySet and whose
+// network host is allowed: what ApplyRevocationSource does once the signature
+// holds. A revocation verified under keys that SetRootKeys has replaced since
+// is judged again under the lock, and one verified before a reset is dropped,
+// as a record is (applyVerifiedRecord).
+func (self *ExtenderDirectory) applyVerifiedRevocation(
+	revocation *protocol.ExtenderRevocation,
+	body *protocol.ExtenderRevocationBody,
+	keySet *ExtenderRootKeySet,
+	resetVersion uint64,
+	source string,
+) (changed bool, err error) {
 	keyHex := hex.EncodeToString(body.PublicKey)
+	now := self.settings.Now()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if resetVersion != self.resetVersion {
+		return false, errExtenderDirectoryReset
+	}
+	if keySet != self.rootKeySet {
+		if _, err := self.rootKeySet.VerifyRevocation(revocation); err != nil {
+			return false, err
+		}
+	}
 	keyRecord := self.keyHexRecords[keyHex]
 	if keyRecord == nil {
 		// keep the revocation even with no record, so a replayed older record
@@ -725,7 +930,6 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	}
 	keyRecord.revocation = revocation
 	keyRecord.revocationBody = body
-	now := self.settings.Now()
 	self.tierUpdateWithLock(keyHex, now)
 	self.noteEventWithLock(source, now)
 	if 0 < len(self.subscriptions) {
@@ -796,39 +1000,51 @@ func (self *ExtenderDirectory) publishWithLock(message *protocol.ExtenderGossipM
 	}
 }
 
-// SampleRecords returns up to `count` signed records of active verified
-// identities in random order, with the record of `ownPublicKey` first when the
-// directory holds one (D4). The messages carry the record exactly as it was
-// received, so a relayed sample is still verifiable under the root keys.
+// SampleRecords returns up to `count` signed records of the open tier for one
+// vantage (D4, Q2), with the record of `ownPublicKey` first when the directory
+// holds one and it is open. The rest are the vantage's feed partition
+// (ExtenderPartitionMembers), in the order of the current epoch
+// (ExtenderPartitionOrder) interleaved by family, so a vantage that polls
+// forever sees its partition and no more, and two polls in one epoch see the
+// same sample. A gated record is never sampled, whatever source it arrived
+// from (Q1). The messages carry the record exactly as it was received, so a
+// relayed sample is still verifiable under the root keys. `vantage` is the
+// caller's (ExtenderVantageKeyOfAddr); nil is a vantage of its own.
 func (self *ExtenderDirectory) SampleRecords(
 	count int,
 	ownPublicKey []byte,
+	vantage []byte,
 ) []*protocol.ExtenderGossipMessage {
 	if count <= 0 {
 		return []*protocol.ExtenderGossipMessage{}
 	}
 	ownKeyHex := hex.EncodeToString(ownPublicKey)
 	now := self.settings.Now()
+	epoch := ExtenderEpoch(now, self.settings.OpenEpochTimeout)
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	var ownRecord *protocol.ExtenderRecord
-	records := []*protocol.ExtenderRecord{}
+	keyHexes := []string{}
+	keyHexRecords := map[string]*protocol.ExtenderRecord{}
 	recordBodies := map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody{}
-	for keyHex, keyRecord := range self.keyHexRecords {
-		if keyRecord.record == nil || keyRecord.recordBody == nil {
-			continue
-		}
-		if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
-			continue
-		}
+	for _, keyHex := range self.openKeyHexesWithLock(now) {
+		keyRecord := self.keyHexRecords[keyHex]
 		if 0 < len(ownPublicKey) && keyHex == ownKeyHex {
 			ownRecord = keyRecord.record
+		}
+		keyHexes = append(keyHexes, keyHex)
+		keyHexRecords[keyHex] = keyRecord.record
+		recordBodies[keyRecord.record] = keyRecord.recordBody
+	}
+	members, _, _ := ExtenderPartitionMembers(self.partitionSecret, ExtenderChannelFeed, vantage, keyHexes)
+	records := []*protocol.ExtenderRecord{}
+	for _, keyHex := range ExtenderPartitionOrder(self.partitionSecret, ExtenderChannelFeed, vantage, epoch, members) {
+		if keyHex == ownKeyHex {
 			continue
 		}
-		records = append(records, keyRecord.record)
-		recordBodies[keyRecord.record] = keyRecord.recordBody
+		records = append(records, keyHexRecords[keyHex])
 	}
 	records = balanceRecordsByIpFamily(records, recordBodies)
 	if ownRecord != nil {
@@ -847,12 +1063,58 @@ func (self *ExtenderDirectory) SampleRecords(
 	return messages
 }
 
+// The keys of the open tier the feed may serve (Q1, Q2): every held record
+// that is not revoked, not expired and not gated, in key order. The order is
+// what makes the partitions reproducible whatever order the map hands the
+// keys in.
+func (self *ExtenderDirectory) openKeyHexesWithLock(now time.Time) []string {
+	keyHexes := []string{}
+	for keyHex, keyRecord := range self.keyHexRecords {
+		if keyRecord.record == nil || keyRecord.recordBody == nil {
+			continue
+		}
+		if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
+			continue
+		}
+		if !ExtenderRecordOpen(keyRecord.recordBody) {
+			continue
+		}
+		keyHexes = append(keyHexes, keyHex)
+	}
+	slices.Sort(keyHexes)
+	return keyHexes
+}
+
+// Whether the feed may stream the record of `publicKey` to a subscriber at
+// `vantage` (Q2): it is in the open tier and in the vantage's feed partition,
+// as SampleRecords would place it now. A record outside the partition is as
+// unseen on the stream as it is in the sample, so a subscriber that stays
+// connected through a whole drip rotation still learns its partition and no
+// more. A key the directory does not hold, or holds revoked, expired or
+// gated, is not streamed.
+func (self *ExtenderDirectory) OpenPartitionContains(vantage []byte, publicKey []byte) bool {
+	keyHex := hex.EncodeToString(publicKey)
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	keyHexes := self.openKeyHexesWithLock(now)
+	if !slices.Contains(keyHexes, keyHex) {
+		return false
+	}
+	members, _, _ := ExtenderPartitionMembers(self.partitionSecret, ExtenderChannelFeed, vantage, keyHexes)
+	return slices.Contains(members, keyHex)
+}
+
 // balanceRecordsByIpFamily orders records so that taking a prefix of any length
 // yields as close to an equal number of v4-reachable and v6-reachable extenders
-// as the directory can supply.
+// as the directory can supply, keeping the relative order the caller gave
+// within each family -- the epoch's keyed order (SampleRecords), so the result
+// is as deterministic as its input.
 //
-// A plain shuffle does not do this. A directory that is mostly v4 -- which is
-// the normal case, since v4 addresses are easier to come by -- hands a v6-only
+// A plain cut does not do this. A directory that is mostly v4 -- which is the
+// normal case, since v4 addresses are easier to come by -- hands a v6-only
 // client a sample it cannot dial, and the client has no way to ask for more.
 //
 // Reachability, not exclusivity: a dual-stack extender is in both buckets and
@@ -889,13 +1151,6 @@ func balanceRecordsByIpFamily(
 			unreachable = append(unreachable, record)
 		}
 	}
-	shuffle := func(pool []*protocol.ExtenderRecord) {
-		mathrand.Shuffle(len(pool), func(i int, j int) {
-			pool[i], pool[j] = pool[j], pool[i]
-		})
-	}
-	shuffle(ipv4Capable)
-	shuffle(ipv6Capable)
 
 	balanced := make([]*protocol.ExtenderRecord, 0, len(records))
 	taken := map[*protocol.ExtenderRecord]bool{}
@@ -1074,8 +1329,11 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 // it answered with, or ExtenderLimitedBackoff when it gave none, jittered by
 // +-50 % and never past MaxHoldTimeout. A limit is not a failure: no failure
 // count, no hold, nothing toward removal. A later backoff is never shortened
-// by an earlier one. Returns when the address stops being limited, zero for an
-// address the directory does not know, which it records nothing for.
+// by an earlier one still in force; one that has passed by either clock is
+// replaced, even when the monotonic clock alone, stopped while the host slept,
+// would still place it after the new one. Returns when the address stops being
+// limited, zero for an address the directory does not know, which it records
+// nothing for.
 func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Duration) time.Time {
 	if !ip.IsValid() {
 		return time.Time{}
@@ -1095,7 +1353,8 @@ func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Dura
 		return time.Time{}
 	}
 	address.lastUseTime = now
-	if limitedUntilTime := now.Add(backoff); address.limitedUntilTime.Before(limitedUntilTime) {
+	if limitedUntilTime := now.Add(backoff); !extenderBefore(now, address.limitedUntilTime) ||
+		address.limitedUntilTime.Before(limitedUntilTime) {
 		address.limitedUntilTime = limitedUntilTime
 	}
 	if self.log.V(2).Enabled() {
@@ -1118,14 +1377,17 @@ func (self *ExtenderDirectory) AddressLimitedUntil(ip netip.Addr) time.Time {
 	defer self.stateLock.Unlock()
 
 	address := self.ipAddresses[ip]
-	if address == nil || !now.Before(address.limitedUntilTime) {
+	if address == nil || !extenderBefore(now, address.limitedUntilTime) {
 		return time.Time{}
 	}
 	return address.limitedUntilTime
 }
 
 // Adjusts the in-use count of one address, which the status reports. A
-// positive delta also stamps the last use.
+// positive delta also stamps the last use. The count is kept by ip whether or
+// not the address is known, since a connection outlives a reset that dropped
+// its address (Reset): its release balances its hold, and an address learned
+// again while it lives is reported in use.
 func (self *ExtenderDirectory) SetInUse(ip netip.Addr, delta int) {
 	if !ip.IsValid() || delta == 0 {
 		return
@@ -1136,11 +1398,16 @@ func (self *ExtenderDirectory) SetInUse(ip netip.Addr, delta int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if inUseCount := max(0, self.ipInUseCounts[ip]+delta); 0 < inUseCount {
+		self.ipInUseCounts[ip] = inUseCount
+	} else {
+		delete(self.ipInUseCounts, ip)
+	}
 	address := self.ipAddresses[ip]
 	if address == nil {
+		// nothing the status shows has changed
 		return
 	}
-	address.inUseCount = max(0, address.inUseCount+delta)
 	if 0 < delta {
 		address.lastUseTime = now
 	}
@@ -1173,12 +1440,108 @@ func (self *ExtenderDirectory) ContinentHint() string {
 	return self.continentHint
 }
 
+// Records the country the operator's hint placed this client in, current
+// until the next failed hint or path change (ExpireCountryHint). Every answer
+// renews the country and its time, which the directory stores, so the next
+// start has it (CountryHintMaxAge). An empty answer is an operator that could
+// not place the client, or one that predates the country: it leaves the last
+// country in place, stale, and does not renew it. Reports whether the country
+// changed.
+func (self *ExtenderDirectory) SetCountryHint(countryCode string) (changed bool) {
+	countryCode = NormalizeSpoofCountryCode(countryCode)
+	// the wall clock alone, as the store keeps it: the monotonic clock stops
+	// while the host sleeps, and a journey slept through must count
+	now := self.settings.Now().Round(0)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if countryCode == "" {
+		self.countryHintCurrent = false
+		return false
+	}
+	changed = self.countryHint != countryCode
+	self.countryHint = countryCode
+	self.countryHintTime = now
+	self.countryHintCurrent = true
+	// the renewed time is saved whether or not the country changed
+	self.changedWithLock()
+	return changed
+}
+
+// Makes the operator's last country stale: the hint failed, or the path
+// changed and the answer placed the address of the old one. Until the operator
+// answers again, the network country the host reports stands in for it, and on
+// a host that reports none, the last country itself while it is within
+// CountryHintMaxAge (SpoofCountryCode).
+func (self *ExtenderDirectory) ExpireCountryHint() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.countryHintCurrent = false
+}
+
+// The country the extender dials through this directory draw their outer
+// names for (SpoofDomainsForCountry), lower case, empty for the global list:
+// the operator's country while its hint is current, else the network country
+// the host reports (SetNetworkCountryCode), else the operator's last country
+// until CountryHintMaxAge has passed since the operator last answered it,
+// which a restart keeps, since the country is stored. The host's report is
+// the fallback rather than the rule because the operator placed this client's
+// own address; but when the operator cannot be asked -- on a whitelist-only
+// mobile network no operator address is routable -- the host's report is the
+// only current one there is, and on a host that reports none, the operator's
+// last answer is all there is.
+func (self *ExtenderDirectory) SpoofCountryCode() string {
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.countryHintCurrent {
+		return self.countryHint
+	}
+	if networkCountryCode := NetworkCountryCode(); networkCountryCode != "" {
+		return networkCountryCode
+	}
+	if self.countryHintWithinMaxAge(self.countryHintTime, now) {
+		return self.countryHint
+	}
+	return ""
+}
+
+// Whether the operator's last country, answered at `countryHintTime`, may still
+// stand in at `now`: younger than CountryHintMaxAge by the wall clock. A time
+// ahead of the clock cannot be aged -- the clock moved back, or the store is
+// not what this directory wrote -- so it is not used. It reads only its
+// arguments and the settings, so the state lock is neither needed nor taken,
+// as in holdTimeout.
+func (self *ExtenderDirectory) countryHintWithinMaxAge(countryHintTime time.Time, now time.Time) bool {
+	if countryHintTime.IsZero() {
+		return false
+	}
+	age := now.Sub(countryHintTime)
+	return 0 <= age && age < self.settings.CountryHintMaxAge
+}
+
+// The spoof list the dials through one directory draw from, and the country
+// whose list it is (spoofDomainsForCountry). A nil directory places nothing
+// and draws from the global list.
+func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
+	countryCode := ""
+	if directory != nil {
+		countryCode = directory.SpoofCountryCode()
+	}
+	return spoofDomainsForCountry(countryCode)
+}
+
 // RecordLatency stores the outcome of one probe pass over an address: the
 // lowest rtt it measured and whether the target co-signed a claim of that
 // pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
 // without a verdict does not count. The sample is per process and ages out
-// after LatencyMaxAge; it is never stored, because yesterday's path is not
-// today's.
+// after LatencyMaxAge, the time the host slept included; it is never stored,
+// because yesterday's path is not today's. It replaces the address's last
+// sample, which is how one due a refresh after a path change or a resume is
+// replaced (RefreshLatencies).
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1196,6 +1559,7 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	address.latency = rtt
 	address.latencyTime = now
 	address.latencyAttested = attested
+	address.latencyRefreshDue = false
 	address.probeCount += 1
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]latency %s %s attested=%t\n", ip, rtt, attested)
@@ -1203,6 +1567,55 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	// a measured record is preferred by the active cap
 	self.tierUpdateAddressWithLock(address, now)
 	self.changedWithLock()
+}
+
+// Makes every latency sample due a refresh: the path changed, and each one
+// measured the old path (DESIGNNOTES4.md §6). A sample due a refresh stays in
+// use -- the candidate order still ranks by it and the active cap still counts
+// its record measured -- until a probe measures the address again and the new
+// sample replaces it (RecordLatency), so a path change leaves no time with no
+// samples. A probe pass measures the samples due a refresh first and does not
+// count them toward its window (ProbeCandidates, probeWindowLatencies), so the
+// pass that follows the first sample on the new path measures them again. The
+// rest of the local evidence -- successes, failures, holds and limits -- stays
+// too. Nothing the order, the status or the store reads moves, so no change is
+// published.
+func (self *ExtenderDirectory) RefreshLatencies() {
+	self.refreshLatencies(func(time.Time, time.Time) bool {
+		return true
+	})
+}
+
+// Makes due a refresh every latency sample the host has slept at least
+// `minSleep` through since it was taken (hostSlept): the host resumed from a
+// sleep that long, and may have woken where it measured nothing, so a sample
+// from before it is measured again as one of another path is
+// (RefreshLatencies), and stays in use until then. A sample taken since the
+// host woke is not due. A wall clock set forward reads as a sleep here, and
+// one set back hides as much sleep. A `minSleep` <= 0 makes nothing due.
+func (self *ExtenderDirectory) RefreshSleptLatencies(minSleep time.Duration) {
+	if minSleep <= 0 {
+		return
+	}
+	self.refreshLatencies(func(latencyTime time.Time, now time.Time) bool {
+		return minSleep <= hostSlept(now, latencyTime)
+	})
+}
+
+// Makes due a refresh each latency sample `due` picks by when it was taken and
+// the time now. Every sample stays where it is.
+func (self *ExtenderDirectory) refreshLatencies(due func(latencyTime time.Time, now time.Time) bool) {
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	for _, address := range self.ipAddresses {
+		if address.latencyTime.IsZero() || !due(address.latencyTime, now) {
+			continue
+		}
+		address.latencyRefreshDue = true
+	}
 }
 
 // The hold after `consecutiveFailureCount` failures: the base doubling per
@@ -1275,6 +1688,30 @@ func (self *ExtenderDirectory) Candidates(
 	count int,
 	exclude ...netip.Addr,
 ) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, false, exclude)
+}
+
+// The candidates of `Candidates` that a signed record verifies, in the same
+// order: a manual address no record verifies, the one unverified kind
+// `Candidates` offers, is left out. A strategy that refuses extenders
+// configured by hand (`ClientStrategySettings.DisableManualExtenders`) draws
+// from here.
+func (self *ExtenderDirectory) VerifiedCandidates(
+	ipVersion int,
+	count int,
+	exclude ...netip.Addr,
+) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, true, exclude)
+}
+
+// The candidates of `Candidates`, or of `VerifiedCandidates` with
+// `verifiedOnly`.
+func (self *ExtenderDirectory) candidates(
+	ipVersion int,
+	count int,
+	verifiedOnly bool,
+	exclude []netip.Addr,
+) []*ExtenderCandidate {
 	if count <= 0 {
 		return []*ExtenderCandidate{}
 	}
@@ -1314,10 +1751,14 @@ func (self *ExtenderDirectory) Candidates(
 			return compare(a, b)
 		}
 	}
-	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(
-		self.usableAddressesWithLock(ipVersion, now, excludeIps),
-		now,
-	)
+	usable := self.usableAddressesWithLock(ipVersion, now, excludeIps)
+	if verifiedOnly {
+		// the retained expired addresses below are verified by construction
+		usable = slices.DeleteFunc(usable, func(address *extenderDirectoryAddress) bool {
+			return address.publicKeyHex == ""
+		})
+	}
+	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(usable, now)
 	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(
 		self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps),
 		now,
@@ -1354,7 +1795,7 @@ func splitExtenderLimitedAddresses(
 	healthyAddresses := []*extenderDirectoryAddress{}
 	limitedAddresses := []*extenderDirectoryAddress{}
 	for _, address := range addresses {
-		if now.Before(address.limitedUntilTime) {
+		if extenderBefore(now, address.limitedUntilTime) {
 			limitedAddresses = append(limitedAddresses, address)
 		} else {
 			healthyAddresses = append(healthyAddresses, address)
@@ -1405,7 +1846,7 @@ func (self *ExtenderDirectory) retainedExpiredAddressesWithLock(
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !retained[address.publicKeyHex] {
@@ -1431,7 +1872,7 @@ func (self *ExtenderDirectory) usableAddressesWithLock(
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !self.addressDialableWithLock(address) {
@@ -1460,9 +1901,11 @@ func compareExtenderVerified(a *extenderDirectoryAddress, b *extenderDirectoryAd
 
 // The proximity order of DESIGNNOTES4.md §4: the hinted continent before the
 // others before unknown, then within a tier a measured address before an
-// unmeasured one and ascending by rtt. `explore` puts the unmeasured first
-// instead, which is the probe pass asking for what it has not measured yet;
-// `attesting` counts only an attested sample as a measurement.
+// unmeasured one and ascending by rtt, a sample due a refresh ranking as it
+// stands. `explore` is the probe pass asking for what to measure: the samples
+// due a refresh first, ascending, since they lead the order until they are
+// measured again, then the unmeasured, then the rest; `attesting` counts only
+// an attested sample as a measurement.
 func (self *ExtenderDirectory) compareProximityWithLock(
 	a *extenderDirectoryAddress,
 	b *extenderDirectoryAddress,
@@ -1477,8 +1920,22 @@ func (self *ExtenderDirectory) compareProximityWithLock(
 	}
 	aLatency, aMeasured := self.latencyWithLock(a, now, attesting)
 	bLatency, bMeasured := self.latencyWithLock(b, now, attesting)
-	if aMeasured != bMeasured {
-		if aMeasured != explore {
+	if explore {
+		exploreRank := func(address *extenderDirectoryAddress, measured bool) int {
+			switch {
+			case measured && address.latencyRefreshDue:
+				return 0
+			case !measured:
+				return 1
+			default:
+				return 2
+			}
+		}
+		if aRank, bRank := exploreRank(a, aMeasured), exploreRank(b, bMeasured); aRank != bRank {
+			return aRank - bRank
+		}
+	} else if aMeasured != bMeasured {
+		if aMeasured {
 			return -1
 		}
 		return 1
@@ -1501,7 +1958,8 @@ func (self *ExtenderDirectory) continentTierWithLock(address *extenderDirectoryA
 }
 
 // The current latency sample of an address, and whether there is one: a sample
-// exists, is younger than LatencyMaxAge and, when `attesting`, was attested.
+// exists, is younger than LatencyMaxAge by either clock and, when `attesting`,
+// was attested.
 func (self *ExtenderDirectory) latencyWithLock(
 	address *extenderDirectoryAddress,
 	now time.Time,
@@ -1513,7 +1971,7 @@ func (self *ExtenderDirectory) latencyWithLock(
 	if attesting && !address.latencyAttested {
 		return 0, false
 	}
-	if 0 < self.settings.LatencyMaxAge && self.settings.LatencyMaxAge <= now.Sub(address.latencyTime) {
+	if 0 < self.settings.LatencyMaxAge && self.settings.LatencyMaxAge <= extenderElapsed(now, address.latencyTime) {
 		return 0, false
 	}
 	return address.latency, true
@@ -1521,11 +1979,12 @@ func (self *ExtenderDirectory) latencyWithLock(
 
 // ProbeCandidates is what a probe pass measures, in the order it should
 // (DESIGNNOTES4.md §4): the hinted continent first, and within a tier the
-// addresses with no current sample before those with one, so the prior saves
-// probes rather than merely reordering them. `attesting` treats an unattested
-// sample as none, which is what a provider's pass has yet to do. A limited
-// address is left out until its backoff passes (A12): a probe of it would be
-// turned away again, and a limit is never a measurement.
+// samples due a refresh lowest first (RefreshLatencies), then the addresses
+// with no current sample, then those with one, so the prior saves probes
+// rather than merely reordering them. `attesting` treats an unattested sample
+// as none, which is what a provider's pass has yet to do. A limited address
+// is left out until its backoff passes (A12): a probe of it would be turned
+// away again, and a limit is never a measurement.
 func (self *ExtenderDirectory) ProbeCandidates(
 	ipVersion int,
 	count int,
@@ -1564,9 +2023,23 @@ func (self *ExtenderDirectory) ProbeCandidates(
 }
 
 // MeasuredLatencies is every current latency sample of a usable address of
-// one family (0 for any), which is what the probe pass counts its window
-// over. With `attesting` only attested samples count.
+// one family (0 for any), due a refresh or not, which is what the candidate
+// order ranks by. With `attesting` only attested samples count.
 func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, true)
+}
+
+// The latency samples a probe pass counts its window over (DESIGNNOTES4.md
+// §4): every current sample of a usable address of one family (0 for any)
+// that is not due a refresh, since one that is will be measured again
+// (RefreshLatencies). With `attesting` only attested samples count.
+func (self *ExtenderDirectory) probeWindowLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, false)
+}
+
+// The current latency samples of the usable addresses of one family, with or
+// without the samples due a refresh.
+func (self *ExtenderDirectory) usableLatencies(ipVersion int, attesting bool, includeRefreshDue bool) []time.Duration {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
@@ -1574,6 +2047,9 @@ func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) 
 
 	latencies := []time.Duration{}
 	for _, address := range self.usableAddressesWithLock(ipVersion, now, nil) {
+		if address.latencyRefreshDue && !includeRefreshDue {
+			continue
+		}
 		if latency, measured := self.latencyWithLock(address, now, attesting); measured {
 			latencies = append(latencies, latency)
 		}
@@ -1597,12 +2073,13 @@ func (self *ExtenderDirectory) candidateWithLock(
 		DnsTld:    DefaultExtenderDnsTld,
 		Source:    address.source,
 	}
-	if now.Before(address.limitedUntilTime) {
+	if extenderBefore(now, address.limitedUntilTime) {
 		candidate.LimitedUntil = address.limitedUntilTime
 	}
 	if latency, measured := self.latencyWithLock(address, now, false); measured {
 		candidate.Latency = latency
 		candidate.LatencyAttested = address.latencyAttested
+		candidate.LatencyRefreshDue = address.latencyRefreshDue
 	}
 	keyRecord := self.keyHexRecords[address.publicKeyHex]
 	if keyRecord == nil || keyRecord.recordBody == nil {
@@ -1614,6 +2091,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 	candidate.PublicKey = slices.Clone(keyRecord.publicKey)
 	candidate.CountryCode = body.CountryCode
 	candidate.ContinentCode = strings.ToUpper(strings.TrimSpace(body.ContinentCode))
+	candidate.DirectoryTier = int(body.DirectoryTier)
 	if 0 < body.TcpPort {
 		candidate.TcpPort = int(body.TcpPort)
 	}
@@ -1632,12 +2110,69 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if carriers := recordAddressCarriers(body, address.ip); carriers != nil {
 		candidate.Carriers = carriers
 	}
+	// the webrtc carrier needs the record's rendezvous id and a signaling
+	// path on this host, which the enable says the owner has (S)
+	if webRtcClientId, err := IdFromBytes(body.WebRtcClientId); err == nil {
+		candidate.WebRtcClientId = webRtcClientId
+	}
+	if !self.webRtcCarrierEnabled || candidate.WebRtcClientId == (Id{}) {
+		candidate.Carriers = slices.DeleteFunc(
+			slices.Clone(candidate.Carriers),
+			func(carrier string) bool { return carrier == ExtenderCarrierWebRtc },
+		)
+	}
 	return candidate
 }
 
-// The dns ports one record offers, in dial order (L2). DnsPorts when it has
-// them, else the single DnsPort, else nothing, which leaves the candidate on
-// the carrier default.
+// SetWebRtcCarrierEnabled turns the webrtc carrier of every candidate on or
+// off at run time (EXTENDER.md S): on when the owner has installed a carrier
+// with a signaling path on its connect settings, off again when it loses it.
+func (self *ExtenderDirectory) SetWebRtcCarrierEnabled(enabled bool) {
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.webRtcCarrierEnabled == enabled {
+			return
+		}
+		self.webRtcCarrierEnabled = enabled
+		changed = true
+	}()
+	if changed {
+		self.changeMonitor.Update(func(version uint64) uint64 { return version + 1 })
+	}
+}
+
+// WebRtcCarrierEnabled reports whether candidates carry the webrtc carrier.
+func (self *ExtenderDirectory) WebRtcCarrierEnabled() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.webRtcCarrierEnabled
+}
+
+// WebRtcClientId is the exchange rendezvous id the verified record of one
+// identity carries for its webrtc carrier (EXTENDER.md S), which the dial
+// side's resolver signals to. false for an unknown key, a key with no record,
+// and a record that carries no id.
+func (self *ExtenderDirectory) WebRtcClientId(publicKey []byte) (Id, bool) {
+	keyHex := hex.EncodeToString(publicKey)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return Id{}, false
+	}
+	webRtcClientId, err := IdFromBytes(keyRecord.recordBody.WebRtcClientId)
+	if err != nil || webRtcClientId == (Id{}) {
+		return Id{}, false
+	}
+	return webRtcClientId, true
+}
+
+// The dns ports one record offers, ascending (L2). DnsPorts when it has them,
+// else the single DnsPort, else nothing, which leaves the candidate on the
+// carrier default. A dial adds whichever of 4053 and 53 these do not include
+// (ExtenderCandidate.dnsCarrierPorts).
 func recordDnsPorts(body *protocol.ExtenderRecordBody) []int {
 	dnsPorts := []int{}
 	for _, dnsPort := range body.DnsPorts {
@@ -1663,7 +2198,7 @@ func recordAddressCarriers(body *protocol.ExtenderRecordBody, ip netip.Addr) []s
 		carriers := []string{}
 		for _, carrier := range recordAddress.Carriers {
 			switch carrier {
-			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns:
+			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc:
 				carriers = append(carriers, carrier)
 			}
 		}
@@ -1996,6 +2531,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			Carriers:        candidate.Carriers,
 			CountryCode:     candidate.CountryCode,
 			ContinentCode:   candidate.ContinentCode,
+			DirectoryTier:   candidate.DirectoryTier,
 			Latency:         candidate.Latency,
 			State:           state,
 			Source:          address.source,
@@ -2003,7 +2539,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			LastFailureTime: address.lastFailureTime,
 			SuccessCount:    address.successCount,
 			FailureCount:    address.failureCount,
-			InUse:           address.inUseCount,
+			InUse:           self.ipInUseCounts[address.ip],
 			LimitedUntil:    candidate.LimitedUntil,
 		}
 		if keyRecord := self.keyHexRecords[address.publicKeyHex]; keyRecord != nil && keyRecord.recordBody != nil {
@@ -2073,7 +2609,7 @@ func (self *ExtenderDirectory) UsableCount(ipVersion int) int {
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !self.addressDialableWithLock(address) {
@@ -2129,7 +2665,7 @@ func (self *ExtenderDirectory) AddressUsable(ip netip.Addr) bool {
 	if address == nil {
 		return false
 	}
-	if now.Before(address.holdUntilTime) {
+	if extenderBefore(now, address.holdUntilTime) {
 		return false
 	}
 	if !self.addressDialableWithLock(address) {
@@ -2157,7 +2693,7 @@ func (self *ExtenderDirectory) addressStateWithLock(
 			return ExtenderStateExpired
 		}
 	}
-	if now.Before(address.holdUntilTime) {
+	if extenderBefore(now, address.holdUntilTime) {
 		return ExtenderStateHold
 	}
 	if 0 < self.settings.WarningConsecutiveFailureCount &&
@@ -2244,6 +2780,101 @@ func (self *ExtenderDirectory) changedWithLock() {
 	self.changeMonitor.Set(self.version)
 }
 
+// Returns the directory to what a fresh install starts with (the reset of the
+// account screen's extender section). Everything it learned goes: the records
+// and revocations from the feed, the mesh, the dns bootstrap, an activation's
+// sample and a share, every address with its local evidence -- successes,
+// failures, holds, limits, latency samples -- the manual addresses, the
+// continent hint and the operator's last country. `rootKeySet` replaces the
+// root keys in force, which drops whatever a hello installed; nil or empty is
+// the unconfigured state, which waits for the first hello. The store is
+// written before this returns, so a process that ends right after it starts
+// as fresh as the directory now is, and the startup gate is back where a
+// directory with no network client has it, so the client started next waits
+// it out once, as on a first run (E4).
+//
+// What stays is not knowledge of other extenders: the identities this
+// directory was told to keep (KeepPublicKey), which are this device's own
+// extender identity -- its record and any revocation, verified again under
+// the new keys, with fresh evidence for its addresses, which take the source
+// an activation applies them with -- and the settings, the active cap in
+// force, the subscriptions and the live use of each address (SetInUse).
+//
+// A record or revocation whose verification began before the reset is not
+// applied after it (applyVerifiedRecord). Anything else that writes learned
+// state -- a network client's bootstrap and feed, a gossip node -- is stopped
+// by its owner before the reset and started again after it, which is how the
+// sdk's network space makes the client relearn from scratch: an address a
+// stopped writer added after the reset would be one the reset never cleared.
+func (self *ExtenderDirectory) Reset(rootKeySet *ExtenderRootKeySet) {
+	if rootKeySet == nil {
+		rootKeySet = NewExtenderRootKeySet()
+	}
+	now := self.settings.Now()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		self.resetVersion += 1
+		self.rootKeySet = rootKeySet
+		keyHexRecords := map[string]*extenderDirectoryRecord{}
+		ipAddresses := map[netip.Addr]*extenderDirectoryAddress{}
+		for keyHex := range self.keptKeyHexes {
+			keyRecord := self.keyHexRecords[keyHex]
+			if keyRecord == nil {
+				continue
+			}
+			// judged again as SetRootKeys judges, an empty set judging nothing
+			if 0 < rootKeySet.Len() {
+				if keyRecord.record != nil {
+					if _, err := rootKeySet.VerifyRecord(keyRecord.record); err != nil {
+						keyRecord.record = nil
+						keyRecord.recordBody = nil
+					}
+				}
+				if keyRecord.revocation != nil {
+					if _, err := rootKeySet.VerifyRevocation(keyRecord.revocation); err != nil {
+						keyRecord.revocation = nil
+						keyRecord.revocationBody = nil
+					}
+				}
+			}
+			if keyRecord.record == nil && keyRecord.revocation == nil {
+				continue
+			}
+			keptIps := []netip.Addr{}
+			for _, ip := range keyRecord.ips {
+				if address := self.ipAddresses[ip]; address == nil || address.publicKeyHex != keyHex {
+					continue
+				}
+				ipAddresses[ip] = &extenderDirectoryAddress{
+					ip:           ip,
+					source:       ExtenderSourceBootstrap,
+					publicKeyHex: keyHex,
+					addTime:      now,
+				}
+				keptIps = append(keptIps, ip)
+			}
+			keyRecord.ips = keptIps
+			keyHexRecords[keyHex] = keyRecord
+		}
+		self.keyHexRecords = keyHexRecords
+		self.ipAddresses = ipAddresses
+		self.continentHint = ""
+		self.countryHint = ""
+		self.countryHintTime = time.Time{}
+		self.countryHintCurrent = false
+		clear(self.eventTimes)
+		self.eventTimes = self.eventTimes[:0]
+		self.eventHead = 0
+		self.tierRebuildWithLock(now)
+		self.changedWithLock()
+	}()
+	self.initialSampleMonitor.Set(ExtenderInitialSampleNone)
+	self.log.Infof("[extender]directory reset\n")
+	self.save()
+}
+
 // Ends the save loop after one last save of anything the loop has not written
 // yet, so a directory closed inside the coalescing window is still durable.
 func (self *ExtenderDirectory) Close() {
@@ -2284,6 +2915,23 @@ type extenderDirectoryStoreState struct {
 	Version   int                              `json:"version"`
 	Records   []*extenderDirectoryStoreRecord  `json:"records"`
 	Addresses []*extenderDirectoryStoreAddress `json:"addresses"`
+	// The operator's last country, absent until the operator has placed this
+	// client. Kept raw and decoded on its own, so a section this build cannot
+	// read is dropped alone (extenderDirectoryStoreCountryHint).
+	CountryHint json.RawMessage `json:"country_hint,omitempty"`
+}
+
+// The operator's last country as the store keeps it (SpoofCountryCode): the
+// two-letter code and when the operator last answered it, and nothing else --
+// no address, path or network. It is a section with a version of its own
+// rather than a new envelope version, because a build that predates it
+// discards an envelope of another version whole, records and addresses with
+// it, while it skips a field it does not know; so a store this build writes
+// still loads in full on a build that predates it.
+type extenderDirectoryStoreCountryHint struct {
+	Version     int    `json:"version"`
+	CountryCode string `json:"country_code"`
+	TimeMs      int64  `json:"time_ms"`
 }
 
 // A stored identity carries the signed messages verbatim, so a later root key
@@ -2311,10 +2959,17 @@ type extenderDirectoryStoreAddress struct {
 
 // Writes the current state through the store. A store failure is logged and
 // dropped: the directory is a cache, and losing a write costs a rediscovery.
+//
+// Two saves can be out at once -- the loop's and a reset's (Reset) -- and the
+// state is read before the store is called, so a save that read an older state
+// than one already written is skipped rather than written over it. The check
+// and the write are one step under the save lock, so the last write is always
+// of the newest state read.
 func (self *ExtenderDirectory) save() {
 	if self.settings.Store == nil {
 		return
 	}
+	now := self.settings.Now()
 	var stateBytes []byte
 	var version uint64
 	err := func() error {
@@ -2372,6 +3027,18 @@ func (self *ExtenderDirectory) save() {
 		slices.SortFunc(state.Addresses, func(a *extenderDirectoryStoreAddress, b *extenderDirectoryStoreAddress) int {
 			return strings.Compare(a.Ip, b.Ip)
 		})
+		// a country past its max age is not written: no start would use it
+		if self.countryHint != "" && self.countryHintWithinMaxAge(self.countryHintTime, now) {
+			countryHintBytes, err := json.Marshal(&extenderDirectoryStoreCountryHint{
+				Version:     extenderDirectoryStoreCountryHintVersion,
+				CountryCode: self.countryHint,
+				TimeMs:      extenderTimeMs(self.countryHintTime),
+			})
+			if err != nil {
+				return err
+			}
+			state.CountryHint = countryHintBytes
+		}
 		var err error
 		stateBytes, err = json.Marshal(state)
 		return err
@@ -2381,6 +3048,22 @@ func (self *ExtenderDirectory) save() {
 		return
 	}
 	if stateBytes == nil {
+		return
+	}
+	if self.saveReadHook != nil {
+		self.saveReadHook()
+	}
+
+	self.saveLock.Lock()
+	defer self.saveLock.Unlock()
+
+	stale := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return version <= self.savedVersion
+	}()
+	if stale {
+		// a newer state was written since this one was read
 		return
 	}
 	// the store is an external object, so it is called with no state lock
@@ -2491,13 +3174,46 @@ func (self *ExtenderDirectory) load() {
 			keyRecord.ips = append(keyRecord.ips, ip)
 		}
 	}
+	now := self.settings.Now()
+	// The operator's last country, a section of its own. No section, one of
+	// another version or one that does not decode, a code that is not two
+	// letters, and a time that is missing, ahead of the clock or past
+	// CountryHintMaxAge all leave no country, and none of them costs the
+	// records and addresses above. A restored country is stale: the operator
+	// gave it on a path of an earlier process, so it ranks after the network
+	// country the host reports (SpoofCountryCode).
+	func() {
+		if len(state.CountryHint) == 0 {
+			return
+		}
+		storeCountryHint := &extenderDirectoryStoreCountryHint{}
+		if err := json.Unmarshal(state.CountryHint, storeCountryHint); err != nil {
+			self.log.Infof("[extender]directory country load err = %s\n", err)
+			return
+		}
+		if storeCountryHint.Version != extenderDirectoryStoreCountryHintVersion {
+			return
+		}
+		countryCode := NormalizeSpoofCountryCode(storeCountryHint.CountryCode)
+		countryHintTime := extenderTimeFromMs(storeCountryHint.TimeMs)
+		if countryCode == "" || !self.countryHintWithinMaxAge(countryHintTime, now) {
+			return
+		}
+		self.countryHint = countryCode
+		self.countryHintTime = countryHintTime
+		self.countryHintCurrent = false
+		self.log.Infof(
+			"[extender]country hint %s (stored, %s old)\n",
+			countryCode,
+			now.Sub(countryHintTime).Round(time.Minute),
+		)
+	}()
 	self.pruneKeyRecordsWithLock()
 	// a load is the state the store already holds, so it is not a change to
 	// save back
 	self.savedVersion = self.version
 	// but a store written under a larger cap is brought within this one, and
 	// that is saved with the next change or the close
-	now := self.settings.Now()
 	self.tierRebuildWithLock(now)
 	if self.enforceActiveRecordCapWithLock(now) {
 		self.changedWithLock()
@@ -2514,6 +3230,26 @@ func addressIpVersion(ip netip.Addr) int {
 	default:
 		return 0
 	}
+}
+
+// The time from `t` to `now` as the directory's policy counts it: the longer of
+// what the monotonic clock and the wall clock say. Go compares two readings of
+// time.Now by their monotonic parts alone, and the monotonic clock stops while
+// the host sleeps (mach_absolute_time on darwin, CLOCK_MONOTONIC on linux and
+// android), so alone it would not count a sleep; the wall clock alone can be
+// set back, which would make what came before it young again. The longer of
+// the two counts a sleep and outlasts a clock set back. A time with no
+// monotonic reading -- one loaded from the store, or a fake clock's -- is
+// counted by the wall clock alone, as it always was.
+func extenderElapsed(now time.Time, t time.Time) time.Duration {
+	return max(now.Sub(t), now.Round(0).Sub(t.Round(0)))
+}
+
+// Whether `now` is before `t` by both clocks: what was set to last until `t`,
+// a hold or a limit, has lapsed once either clock reaches it, for the reasons
+// of extenderElapsed. A zero `t`, nothing set, is never in force.
+func extenderBefore(now time.Time, t time.Time) bool {
+	return now.Before(t) && now.Round(0).Before(t.Round(0))
 }
 
 func extenderTimeMs(t time.Time) int64 {

@@ -9,6 +9,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
+	"os"
 	// "runtime/debug"
 	"slices"
 	"strconv"
@@ -277,6 +278,8 @@ type ipPacketGroup struct {
 	ipPaths   []IpPath
 	payloads  [][]byte
 	byteCount ByteCount
+	// Present only during one synchronous batch offer/retry scope.
+	batchAdmission *ipPacketGroupAdmission
 }
 
 // Returns a comparable flow key and a path with owned canonical addresses.
@@ -460,6 +463,7 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		// explicit profile below.
 		GlobalLimit:     globalLimit,
 		MaxWindowSize:   uint32(MemoryScaledByteCount(mib(1), kib(256))),
+		EgressTtlMode:   EgressTtlModeMirror,
 		ConnectSettings: *DefaultConnectSettings(),
 	}
 }
@@ -522,6 +526,7 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		// on by default: the benchmark range is reserved (RFC 2544) and the
 		// synthetic server only ever answers flows explicitly addressed to it
 		EnableSyntheticSpeed: true,
+		EgressTtlMode:        EgressTtlModeMirror,
 		ConnectSettings:      *DefaultConnectSettings(),
 	}
 	// the upstream socket buffers are the kernel's unless an explicit request
@@ -765,6 +770,8 @@ type LocalUserNat struct {
 	// (THROUGHPUTFIX §12). Read from the socket's own counter at close on
 	// Linux; zero elsewhere. Invisible to every layer above the socket.
 	udpKernelReceiveDropCount atomic.Uint64
+	// Fixed-size local diagnostics, shared by all dispatch shards and families.
+	egressRealism egressRealismCounters
 
 	sendPackets      chan *SendPacket
 	reliableCapacity receiveCapacitySignal
@@ -1620,6 +1627,10 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	tcp4Buffer := newTcp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
 	tcp6Buffer := newTcp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
+	udp4Buffer.egressRealism = &self.egressRealism
+	udp6Buffer.egressRealism = &self.egressRealism
+	tcp4Buffer.egressRealism = &self.egressRealism
+	tcp6Buffer.egressRealism = &self.egressRealism
 	tcp4Buffer.admissionCapacity = &self.reliableCapacity
 	tcp6Buffer.admissionCapacity = &self.reliableCapacity
 	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
@@ -1701,6 +1712,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				udpPacket.ttl = ipPacket[8]
 				c := func() bool {
 					success, err := udp4Buffer.sendTransferKey(
 						source,
@@ -1731,6 +1743,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				tcpPacket.ttl = ipPacket[8]
 				c := func() bool {
 					success, err := tcp4Buffer.sendTransferKey(
 						source,
@@ -1823,6 +1836,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				udpPacket.ttl = ipPacket[7]
 				c := func() bool {
 					success, err := udp6Buffer.sendTransferKey(
 						source,
@@ -1853,6 +1867,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				tcpPacket.ttl = ipPacket[7]
 				c := func() bool {
 					success, err := tcp6Buffer.sendTransferKey(
 						source,
@@ -2135,6 +2150,9 @@ func applyPathMtu(
 
 type UdpBufferSettings struct {
 	MemoryBudget *TransferMemoryBudget
+	// Shadow observes the socket default; mirror applies the first datagram's
+	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
+	EgressTtlMode EgressTtlMode
 	// nil resolves to the local user nat `Log`
 	Log                 Logger
 	ReadTimeout         time.Duration
@@ -2172,6 +2190,9 @@ type UdpBufferSettings struct {
 	// 0 (the default) is no limit.
 	GlobalLimit   int
 	MaxWindowSize uint32
+	// Tests inspect the configured socket before the first datagram is written.
+	// Runs on the flow's opener; nil is a production no-op.
+	afterSocketOpenForTest func(*UdpSequence, net.Conn)
 
 	ConnectSettings
 }
@@ -2198,6 +2219,7 @@ const (
 type parsedUdp struct {
 	sourceIp        net.IP
 	destinationIp   net.IP
+	ttl             uint8
 	sourcePort      uint16
 	destinationPort uint16
 	payload         []byte
@@ -2206,6 +2228,7 @@ type parsedUdp struct {
 type parsedTcp struct {
 	sourceIp          net.IP
 	destinationIp     net.IP
+	ttl               uint8
 	sourcePort        uint16
 	destinationPort   uint16
 	fin               bool
@@ -2873,6 +2896,7 @@ type UdpBuffer[BufferId comparable] struct {
 	// the owning NAT's kernel receive-drop counter, handed to each sequence
 	// for its socket close; nil leaves the drops uncounted
 	kernelReceiveDropCount *atomic.Uint64
+	egressRealism          *egressRealismCounters
 
 	mutex sync.Mutex
 
@@ -2999,6 +3023,10 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		if sequence == nil {
 			return nil
 		}
+		// Shared lifecycle opens the socket here, before any send item exists.
+		sequence.egressTarget = newProviderEgressTarget(
+			self.udpBufferSettings.EgressTtlMode, udp.ttl, ipProtocolNumberUdp, self.egressRealism,
+		)
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.prepareReturnReadCallback = self.prepareReturnReadCallback
 		sequence.providerReturnCapacity = self.providerReturnCapacity
@@ -3261,6 +3289,7 @@ type UdpSequence struct {
 	sharedSocketLifecycle          bool
 	sharedLifecycleWake            chan struct{}
 	udpBufferSettings              *UdpBufferSettings
+	egressTarget                   providerEgressTarget
 	sharedSocket                   net.Conn
 	sharedSocketErr                error
 	closeOnce                      sync.Once
@@ -3543,8 +3572,10 @@ func (self *UdpSequence) receiveBatch(packets [][]byte) {
 
 func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.log.V(2).Infof("[init]udp connect\n")
+	dialCtx, egressDial := self.egressTarget.dialContext(self.ctx)
+	dialStart := time.Now()
 	socket, err := self.udpBufferSettings.DialContext(
-		self.ctx,
+		dialCtx,
 		"udp",
 		self.IpPath().DestinationHostPort(),
 	)
@@ -3553,11 +3584,12 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 			self.log.Infof("[init]udp connect error = %s\n", err)
 		}
 		// A UDP dial cannot yield a meaningful refusal to the inner source.
-		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
+		if _, signal := classifyDialFailure(self.IpPath(), err, time.Since(dialStart)); signal != nil {
 			self.receivePacket(MessagePoolCopy(signal))
 		}
 		return nil, err
 	}
+	egressDial.afterConnect(socket)
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]connect success\n")
 	if udpConn, ok := socket.(*net.UDPConn); ok {
@@ -3572,6 +3604,9 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 		// (closeSocket).
 		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
 		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	}
+	if self.udpBufferSettings.afterSocketOpenForTest != nil {
+		self.udpBufferSettings.afterSocketOpenForTest(self, socket)
 	}
 	return socket, nil
 }
@@ -4010,6 +4045,13 @@ func (self *StreamState) udpPacket(payload []byte) []byte {
 
 type TcpBufferSettings struct {
 	MemoryBudget *TransferMemoryBudget
+	// Shadow observes the socket default; mirror applies the first SYN's
+	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
+	EgressTtlMode EgressTtlMode
+	// Nil preserves existing provider keepalive settings (5s by default).
+	// An explicit config, including Enable:false, applies after connect and is
+	// independent of the control-plane ConnectSettings keepalive cadence.
+	ProviderKeepAliveConfig *net.KeepAliveConfig
 	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
 	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
 	// to the shared pool; nil budget uses the configured TCP window per flow.
@@ -4372,6 +4414,7 @@ type TcpBuffer[BufferId comparable] struct {
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	tcpBufferSettings              *TcpBufferSettings
+	egressRealism                  *egressRealismCounters
 	flowCloseCallback              tcpFlowCloseFunction
 	admissionCapacity              *receiveCapacitySignal
 
@@ -4632,6 +4675,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.admissionCapacity = self.admissionCapacity
+		sequence.egressRealism = self.egressRealism
 		sequence.flowCloseCallback = self.flowCloseCallback
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
@@ -4954,6 +4998,8 @@ type TcpSequence struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 
 	tcpBufferSettings *TcpBufferSettings
+	egressRealism     *egressRealismCounters
+	egressTarget      providerEgressTarget
 
 	// Guarded by the connection mutex. Chunk copies survive Transfer delivery
 	// until the source's inner cumulative TCP acknowledgement releases them.
@@ -5259,6 +5305,9 @@ func (self *TcpSequence) applyEstablishedPureAck(
 // initializeSynWithLock establishes sequence and window state from the first
 // SYN. The sequence mutex must be held.
 func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
+	self.egressTarget = newProviderEgressTarget(
+		self.tcpBufferSettings.EgressTtlMode, tcp.ttl, ipProtocolNumberTcp, self.egressRealism,
+	)
 	// SYN and FIN consume one sequence number.
 	self.sendSeq = tcp.seq + 1
 	// The synthetic return sequence may start at the sender's sequence because
@@ -5448,6 +5497,8 @@ func (self *TcpSequence) Run() {
 	self.log.V(2).Infof("[init]tcp connect\n")
 	var socket net.Conn
 	var err error
+	var egressDial *providerEgressDial
+	var dialDuration time.Duration
 	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
@@ -5456,11 +5507,15 @@ func (self *TcpSequence) Run() {
 		}
 		socket = newSyntheticSpeedConn()
 	} else {
+		var dialCtx context.Context
+		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)
+		dialStart := time.Now()
 		socket, err = self.tcpBufferSettings.DialContext(
-			self.ctx,
+			dialCtx,
 			"tcp",
 			self.IpPath().DestinationHostPort(),
 		)
+		dialDuration = time.Since(dialStart)
 	}
 	if err != nil {
 		// The source has not seen our synthetic syn-ack yet. Abandoning the
@@ -5474,14 +5529,15 @@ func (self *TcpSequence) Run() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
 		}
 		// answer the source instead of going silent: a refused destination gets
-		// an honest RST+ACK, everything else a capacity-class unreachable. both
-		// ride the same receive callback the SynAck uses (from-destination
-		// orientation); then return as before -- no socket exists. the ctx
-		// guard implements the comment above: classifyDialFailure cannot tell
-		// a canceled parent from a capacity failure, and teardown must not
-		// generate new output.
+		// an honest RST+ACK, any other immediate failure a capacity-class
+		// unreachable, and a timed-out dial nothing (classifyDialFailure says
+		// why). both answers ride the same receive callback the SynAck uses
+		// (from-destination orientation); then return as before -- no socket
+		// exists. the ctx guard implements the comment above:
+		// classifyDialFailure cannot tell a canceled parent from a capacity
+		// failure, and teardown must not generate new output.
 		if self.ctx.Err() == nil {
-			switch action, signal := classifyDialFailure(self.IpPath(), err); action {
+			switch action, signal := classifyDialFailure(self.IpPath(), err, dialDuration); action {
 			case dialFailureRst:
 				var rstPacket []byte
 				var rstErr error
@@ -5506,6 +5562,7 @@ func (self *TcpSequence) Run() {
 	self.log.V(2).Infof("[init]connect success\n")
 
 	defer socket.Close()
+	egressDial.afterConnect(socket)
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		// the default dialer ran the buffer control hook before connecting;
 		// a host-supplied dial is opaque and gets the post-connect subset
@@ -5515,6 +5572,9 @@ func (self *TcpSequence) Run() {
 			defaultSocketBufferPolicy(),
 			self.tcpBufferSettings.DialContextSettings == nil,
 		)
+	}
+	configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		if self.tcpBufferSettings.afterUpstreamConnectForTest != nil {
 			self.tcpBufferSettings.afterUpstreamConnectForTest(tcpConn)
 		}
@@ -7566,8 +7626,9 @@ type RemoteUserNatProvider struct {
 	// Immutable provider identity sent to each authenticated source on its
 	// first packet. The policy digest is computed once at construction, never
 	// on a packet hot path.
-	buildVersion       string
-	securityPolicyHash string
+	buildVersion             string
+	securityPolicyHash       string
+	securityPolicyGeneration uint64
 	// Defense in depth at the exit. Client and provider policies are
 	// intentionally independent, and multiple tunnel clients can share an IP
 	// tuple, so smtpEgressGuard namespaces its state by the authenticated source.
@@ -7768,6 +7829,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		securityPolicy:           securityPolicy,
 		buildVersion:             BuildVersion(),
 		securityPolicyHash:       SecurityPolicyHash(securityPolicy),
+		securityPolicyGeneration: SecurityPolicyGeneration(securityPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
 		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
@@ -9585,7 +9647,23 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		[][]byte{packet},
 	)
 	if err != nil {
-		return
+		// ParseIpPath rejects icmp errors. The one this provider originates
+		// for this very flow, its dial-failure signal, is inspected as the
+		// flow's return instead; anything else stays dropped (IPV6.md C7).
+		returnIpPath, ok := providerDialFailureReturnPath(ipPath, packet)
+		if !ok {
+			return
+		}
+		r, err = inspectAndRefreshEgressForSenderBorrowed(
+			self.securityPolicy,
+			source.SourceId,
+			provideMode,
+			*returnIpPath,
+			nil,
+		)
+		if err != nil {
+			return
+		}
 	}
 	if r != SecurityPolicyResultAllow {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
@@ -10113,7 +10191,10 @@ type RemoteUserNatClient struct {
 	smtpEgressGuard       smtpEgressGuard
 	egressIpv4Fragments   ipv4FragmentGate
 	ingressIpv4Fragments  ipv4FragmentGate
-	pathTable             *pathTable
+	// the provider dial-failure signals admitted to the local stack
+	// (ip_remote_user_nat_dial_failure.go)
+	dialFailures remoteUserNatDialFailures
+	pathTable    *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
 	provideMode       protocol.ProvideMode
@@ -10254,6 +10335,10 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		if err != nil {
 			// drop
 			return false
+		}
+		if 0 < destination.Len() {
+			// before the send consumes the packet that ipPath borrows
+			self.dialFailures.syn(&ipPath, destination.Tail())
 		}
 
 		// The default v2 path embeds the raw frame in the pooled SendPack. It
@@ -10474,6 +10559,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 				if protocol.ProvideMode_Network != peer.ProvideMode {
 					self.securityPolicy.RefreshIngress(ipPath)
 				}
+				self.dialFailures.reply(ipPath)
 				// Deliberate device-TUN exception from CODESTYLE.md: Transfer
 				// acknowledges only after this borrowed packet returns, so the
 				// synchronous final injection is its receive-side flow control.
@@ -10483,6 +10569,17 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 						source,
 						peer.ProvideMode,
 						ipPath,
+						packet,
+					)
+				})
+			} else if ingressIpPath, ok := self.dialFailures.admit(source.SourceId, packet); ok {
+				// the provider could not dial an outstanding syn: the local
+				// stack fails that connect at once (IPV6.md C7)
+				HandleError(func() {
+					self.receivePacketCallback(
+						source,
+						peer.ProvideMode,
+						ingressIpPath,
 						packet,
 					)
 				})
@@ -10883,11 +10980,14 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 // the provider sends back to the source in place of the SynAck. Without a
 // signal the source sits in syn-retransmit backoff (3s..63s) and the blackhole
 // timeout eventually removes the provider along with its working flows -- the
-// bug this replaces.
+// bug this replaces for a dial that fails at once. A dial that times out is
+// left to the source's own backoff and the client's silence inference (see
+// classifyDialFailure).
 type dialFailureAction int
 
 const (
-	// dialFailureNone: send nothing (nil path / unsupported ip version).
+	// dialFailureNone: send nothing (a timed-out dial, a nil path, an
+	// unsupported protocol or ip version).
 	dialFailureNone dialFailureAction = iota
 	// dialFailureRst: the destination itself refused the connection. The caller
 	// answers with ConnectionState.RstAck() -- honest tcp semantics, forwarded
@@ -10898,26 +10998,39 @@ const (
 	dialFailureUnreachable
 )
 
-// classifyDialFailure maps an upstream DialContext error to the signal the
-// provider should return in place of a SynAck. It is pure -- no live socket, no
-// ConnectionState -- so the errno logic is unit-testable.
+// classifyDialFailure maps an upstream DialContext error, and how long the dial
+// took to fail, to the signal the provider should return in place of a SynAck.
+// It is pure -- no live socket, no ConnectionState, no clock -- so the errno
+// logic is unit-testable.
 //
 // For dialFailureUnreachable the built icmp packet is returned as well (a fresh
 // non-pool buffer from ipOosUnreachable; the caller copies it into the pool
 // before delivery). For dialFailureRst and dialFailureNone the packet is nil --
 // a RST needs the ConnectionState's sequence state, so the caller builds it.
 //
-// tcp + ECONNREFUSED means the destination refused: RST+ACK. Anything else on
-// tcp (timeouts, EMFILE/ENFILE, EADDRNOTAVAIL, unreachable, unrecognized) is
-// capacity-class and gets an unreachable; defaulting unrecognized errors to the
-// capacity class is deliberate -- new clients intercept the signal and old ones
-// drop it at ParseIpPath, so a misclassification is cheap. errors.Is folds the
-// Windows WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs
-// on are almost all linux, so linux errno semantics are what matter. udp "dial"
+// A dial that timed out gets nothing (isDialTimeout), and neither does one
+// that failed in any other way only after dialFailureSignalHorizon. A timed
+// out dial fails at the dialer's ConnectTimeout, 15s after the SYN; a dial
+// through a host-supplied dialer without a deadline can fail as late. By then
+// the source has retransmitted at 1s and 3s, the multi client's silence
+// inference has re-raced a flow that is still waiting, and an app racing
+// address families has connected over the other family 250ms in and
+// abandoned this attempt. A signal that late speeds nothing up. It only
+// strikes the exit for a flow no one waits on, and three such strikes for a
+// blackholed AAAA downgrade a healthy dual-stack exit to v4-only (IPV6.md C7).
+//
+// Every other failure is immediate and answered. tcp + ECONNREFUSED means the
+// destination refused: RST+ACK. Anything else on tcp (no route, unreachable,
+// EMFILE/ENFILE, EADDRNOTAVAIL, unrecognized) is capacity-class and gets an
+// unreachable; defaulting unrecognized errors to the capacity class is
+// deliberate -- new clients intercept the signal and old ones drop it at
+// ParseIpPath, so a misclassification is cheap. errors.Is folds the Windows
+// WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs on
+// are almost all linux, so linux errno semantics are what matter. udp "dial"
 // cannot produce a meaningful ECONNREFUSED at connect time, so udp is always
 // capacity-class.
-func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) {
-	if ipPath == nil {
+func classifyDialFailure(ipPath *IpPath, err error, dialDuration time.Duration) (dialFailureAction, []byte) {
+	if ipPath == nil || isDialTimeout(err) || dialFailureSignalHorizon <= dialDuration {
 		return dialFailureNone, nil
 	}
 	switch ipPath.Protocol {
@@ -10935,6 +11048,24 @@ func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) 
 		return dialFailureUnreachable, packet
 	}
 	return dialFailureNone, nil
+}
+
+// dialFailureSignalHorizon is how long a dial may take to fail and still be
+// answered with the dial-failure signal: the multi client's silence-inference
+// horizon, the retransmit at which it re-races a flow on its own. A later
+// failure reaches the source after the inference, or an app's family
+// fallback, has acted.
+const dialFailureSignalHorizon = inferredDialFailureTimeout
+
+// isDialTimeout reports whether a dial failed by running out of time rather
+// than at once. The dialer's own timeout surfaces as context.DeadlineExceeded
+// (net's "i/o timeout" matches it), or as os.ErrDeadlineExceeded when the
+// socket's write deadline fires before the context's timer; the kernel's own
+// connect timeout is ETIMEDOUT.
+func isDialTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, syscall.ETIMEDOUT)
 }
 
 func (self *IpPath) Source() *IpPath {

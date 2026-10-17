@@ -3,6 +3,8 @@ package connect
 import (
 	"context"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"math"
 	"os"
 	"strings"
@@ -247,32 +249,45 @@ func TestWindowCompressionResidenceGrowsSmallOpening(t *testing.T) {
 	}
 }
 
+// The interior round trips run their parity cover; the two boundary round
+// trips keep full grids in TestWindowPathDeterministicPerformanceBoundaries.
+func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
+	checkWindowDeterministicPerformanceCells(t, false)
+}
+
+// The 300 µs and deep-flight 400 ms boundaries meet both flow counts and both
+// compression states; this half of the matrix holds its deepest flights.
+func TestWindowPathDeterministicPerformanceBoundaries(t *testing.T) {
+	checkWindowDeterministicPerformanceCells(t, true)
+}
+
 // Every reported/design-point RTT is exercised with one/eight offered flows
 // and immediate/compressed ACKs. A constant window with the same memory and
 // receiver bounds calibrates the fixture's attainable payload rate per cell.
-func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
+// Two tests split the cells at the boundary round trips, so each cell runs once.
+func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	roundTrips := envDurations(t, "CONNECT_WINDOW_MODEL_RTT_US", time.Microsecond, windowDeterministicRoundTrips())
 	for _, cell := range windowDeterministicPerformanceCells(roundTrips, os.Getenv("CONNECT_WINDOW_MODEL_RTT_US") != "") {
-		var ceiling, fixed windowPathReading
-		for _, arm := range []string{"ceiling", "delivery"} {
-			synctest.Test(t, func(t *testing.T) {
+		if windowDeterministicBoundary(cell.RoundTrip) != boundaries {
+			continue
+		}
+		t.Run(fmt.Sprintf("rtt=%s/flows=%d/compression=%s", cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
+			windowPathParallel(t)
+			readings := measureWindowPathArms(t, max(100*time.Millisecond, 2*cell.RoundTrip), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				trial := cell
 				trial.Arm = arm
-				reading := measureWindowPathCell(t, trial, max(100*time.Millisecond, 2*cell.RoundTrip))
-				if arm == "ceiling" {
-					ceiling = reading
-				} else {
-					fixed = reading
-				}
+				return trial
 			})
-		}
-		t.Logf("rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f model Mb/s", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps)
-		if ceiling.Mbps < 500 || fixed.Mbps < .85*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.RelayDrops != 0 {
-			t.Errorf("uncalibrated or underperforming model cell: rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f drops=%d", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops)
-			encoded, _ := json.Marshal(fixed)
-			t.Log(string(encoded))
-		}
+			ceiling, fixed := readings[0], readings[1]
+			t.Logf("rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f model Mb/s", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps)
+			if ceiling.Mbps < 500 || fixed.Mbps < .85*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.RelayDrops != 0 {
+				t.Errorf("uncalibrated or underperforming model cell: rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f drops=%d", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops)
+				encoded, _ := json.Marshal(fixed)
+				t.Log(string(encoded))
+			}
+		})
 	}
 }
 
@@ -283,19 +298,23 @@ func TestWindowPathBoundsBurstsAtFiniteRelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, flows := range []int{1, 8} {
 		for _, arm := range []string{"unpaced", "delivery"} {
-			synctest.Test(t, func(t *testing.T) {
-				reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), BootstrapWindow: mib(48), Rate: 125000000, Drop: true}, time.Second)
-				if reading.Window.Initial != mib(48) {
-					t.Fatal("finite relay control did not use the same large opening")
-				}
-				t.Logf("%s flows=%d goodput=%.1f min-flow=%.1f model Mb/s relay-drops=%d gap-repairs=%d", arm, flows, reading.Mbps, reading.MinFlowMbps, reading.RelayDrops, reading.Recovery.SelectiveGapWriteCount)
-				if arm == "unpaced" {
-					if reading.RelayDrops == 0 || reading.Recovery.SelectiveGapWriteCount == 0 {
-						t.Fatal("unpaced relay overflow/recovery stimulus did not run")
+			// Each arm owns its gates, so the four bubbles are independent.
+			t.Run(fmt.Sprintf("flows=%d/%s", flows, arm), func(t *testing.T) {
+				windowPathParallel(t)
+				synctest.Test(t, func(t *testing.T) {
+					reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), BootstrapWindow: mib(48), Rate: 125000000, Drop: true}, time.Second)
+					if reading.Window.Initial != mib(48) {
+						t.Fatal("finite relay control did not use the same large opening")
 					}
-				} else if reading.RelayDrops != 0 || reading.Mbps < 900 || reading.MinFlowMbps == 0 {
-					t.Fatalf("paced relay is lossy, underfilled or stalled: %.1f model Mb/s, %d drops", reading.Mbps, reading.RelayDrops)
-				}
+					t.Logf("%s flows=%d goodput=%.1f min-flow=%.1f model Mb/s relay-drops=%d gap-repairs=%d", arm, flows, reading.Mbps, reading.MinFlowMbps, reading.RelayDrops, reading.Recovery.SelectiveGapWriteCount)
+					if arm == "unpaced" {
+						if reading.RelayDrops == 0 || reading.Recovery.SelectiveGapWriteCount == 0 {
+							t.Fatal("unpaced relay overflow/recovery stimulus did not run")
+						}
+					} else if reading.RelayDrops != 0 || reading.Mbps < 900 || reading.MinFlowMbps == 0 {
+						t.Fatalf("paced relay is lossy, underfilled or stalled: %.1f model Mb/s, %d drops", reading.Mbps, reading.RelayDrops)
+					}
+				})
 			})
 		}
 	}
@@ -327,7 +346,134 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 	}
 }
 
+// Value snapshots belong to the fixture owner; they retain no packet or error.
+type windowReferenceCompletionSnapshot struct {
+	Started     uint64
+	FirstWrites uint64
+	Successes   uint64
+	Errors      uint64
+}
+
+// Callbacks only increment the chosen phase's atomic value counters.
+type windowReferenceCompletionCounts struct {
+	started     atomic.Uint64
+	firstWrites atomic.Uint64
+	successes   atomic.Uint64
+	errors      atomic.Uint64
+}
+
+// A nullable per-fixture observer keeps the default per-Packet path unchanged.
+// Phase selection precedes publication; snapshots wait for the existing join.
+type windowReferenceCompletions struct {
+	cleanup      atomic.Bool
+	phases       [2]windowReferenceCompletionCounts
+	preCleanup   windowReferenceCompletionSnapshot
+	afterCleanup windowReferenceCompletionSnapshot
+	joined       bool
+}
+
+// Install only before NewClient. Nil leaves the existing observer untouched.
+func (self *windowReferenceCompletions) configure(settings *SendBufferSettings) {
+	if self != nil {
+		settings.SendPackLifecycleObserver = self.observe
+	}
+}
+
+// No payload, client, callback error, timer, goroutine or per-event allocation.
+func (self *windowReferenceCompletions) observe(event SendPackLifecycleObservation) {
+	if event.MessageType != protocol.MessageType_IpIpPacketFromProvider {
+		return
+	}
+	phase := 0
+	if self.cleanup.Load() {
+		phase = 1
+	}
+	counts := &self.phases[phase]
+	switch event.Phase {
+	case SendPackLifecyclePhaseStarted:
+		counts.started.Add(1)
+	case SendPackLifecyclePhaseFirstRouteWrite:
+		counts.firstWrites.Add(1)
+	case SendPackLifecyclePhaseTerminal:
+		if event.Err == nil {
+			counts.successes.Add(1)
+		} else {
+			counts.errors.Add(1)
+		}
+	}
+}
+
+// Mark the existing cleanup boundary before its first cancellation.
+func (self *windowReferenceCompletions) beginCleanup() {
+	if self != nil {
+		self.cleanup.Store(true)
+	}
+}
+
+// Read after producers and clients join, including publication that began before
+// cleanup but finished later. A failed join retains values, never a valid verdict.
+func (self *windowReferenceCompletions) finish(joined bool) {
+	if self == nil {
+		return
+	}
+	var snapshots [2]windowReferenceCompletionSnapshot
+	for phase := range snapshots {
+		counts := &self.phases[phase]
+		snapshots[phase] = windowReferenceCompletionSnapshot{
+			Started: counts.started.Load(), FirstWrites: counts.firstWrites.Load(),
+			Successes: counts.successes.Load(), Errors: counts.errors.Load(),
+		}
+	}
+	self.preCleanup, self.afterCleanup, self.joined = snapshots[0], snapshots[1], joined
+}
+
+// The unselected fixture installs no callback and allocates no observer.
+func TestWindowReferenceCompletionObserverDisabled(t *testing.T) {
+	settings := DefaultClientSettings().SendBufferSettings
+	var completions *windowReferenceCompletions
+	if allocations := testing.AllocsPerRun(100, func() { completions.configure(settings) }); allocations != 0 ||
+		settings.SendPackLifecycleObserver != nil {
+		t.Fatal("disabled completion observation changed the default send path")
+	}
+}
+
+// Phase counters own values, retain cleanup separately, and fail closed on join.
+func TestWindowReferenceCompletionObserverPhaseOwnership(t *testing.T) {
+	completions := &windowReferenceCompletions{}
+	event := SendPackLifecycleObservation{
+		Phase: SendPackLifecyclePhaseTerminal, MessageType: protocol.MessageType_IpIpPacketFromProvider,
+		Err: context.DeadlineExceeded,
+	}
+	completions.observe(event)
+	// A producer may select this phase before cleanup and publish after it.
+	selectedBeforeCleanup := &completions.phases[0]
+	completions.beginCleanup()
+	event.Err = nil
+	completions.observe(event)
+	completions.finish(false)
+	if completions.joined || completions.preCleanup.Errors != 1 {
+		t.Fatal("unjoined completion counts were accepted")
+	}
+	selectedBeforeCleanup.errors.Add(1)
+	completions.finish(true)
+	if !completions.joined || completions.preCleanup.Errors != 2 ||
+		completions.preCleanup.Successes != 0 || completions.afterCleanup.Errors != 0 ||
+		completions.afterCleanup.Successes != 1 {
+		t.Fatalf("completion phases or late publication were lost: %+v %+v", completions.preCleanup, completions.afterCleanup)
+	}
+	before := completions.preCleanup
+	if allocations := testing.AllocsPerRun(100, func() { completions.observe(event) }); allocations != 0 {
+		t.Fatalf("completion observation allocated %.0f objects", allocations)
+	}
+	if completions.preCleanup != before || completions.afterCleanup.Successes != 1 {
+		t.Fatal("published value snapshots retained mutable counter ownership")
+	}
+}
+
 type windowPathCell struct {
+	// Opt-in test observation; nil adds no per-Packet callback or token work.
+	referenceCompletions *windowReferenceCompletions
+
 	// Optional explicit opening for a controlled comparison. It does not
 	// change byte permissions, the serializer, or measurement duration.
 	BootstrapWindow          ByteCount                  `json:",omitempty"`
@@ -379,6 +525,7 @@ type windowPathReading struct {
 	NatRefused            int64
 	MaxRelayQueued        int64
 	MaxRelayQueuedBytes   int64
+	DelayedPacingWakes    int64
 	Recovery              ClientSendRecoveryStatsSnapshot
 	Receiver              ClientReceiveStatsSnapshot
 	SenderReceive         ClientReceiveStatsSnapshot
@@ -427,7 +574,7 @@ func holdWindowPathAckCompression(ctx context.Context, t *testing.T, settings *R
 // Measures receiver bytes over one common interval. Construction, warmup and
 // draining are outside the interval. This is a Transfer/FIFO instrument, not
 // a measurement of H1 sockets, a native kernel TUN, or provider TCP.
-func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration) windowPathReading {
+func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
 	if cell.Bidirectional && cell.Tcp {
 		t.Fatal("bidirectional fixture currently requires the raw Transfer workload")
@@ -438,6 +585,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	ctx, cancel := context.WithCancel(context.Background())
 	fixtureStart := time.Now()
 	var firstAckLanes atomic.Uint32
+	var delayedPacingWakes atomic.Int64
 	settings := func(profile *windowPathEndpointProfile) *ClientSettings {
 		s := DefaultClientSettings()
 		s.Log = NewNoopLogger()
@@ -453,7 +601,10 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			s.SendBufferSettings.windowRoundTripOverrideForTest = &cell.RoundTrip
 		}
 		if cell.PacingWakeDelay > 0 {
-			s.SendBufferSettings.afterWindowPacingWaitForTest = func() { time.Sleep(cell.PacingWakeDelay) }
+			s.SendBufferSettings.afterWindowPacingWaitForTest = func() {
+				delayedPacingWakes.Add(1)
+				time.Sleep(cell.PacingWakeDelay)
+			}
 		}
 		if cell.Arm == "path-rtt-only" {
 			zero := time.Duration(0)
@@ -544,6 +695,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueBudget = NewTransferMemoryBudget(cell.ReceiveWindow)
 		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = max(cell.ReceiveWindow, cell.ReceiveWindowAfter)
 	}
+	cell.referenceCompletions.configure(dataSenderSettings.SendBufferSettings)
 	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings)
 	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 	sender.ContractManager().AddNoContractPeer(receiver.ClientId())
@@ -553,6 +705,10 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{sendIn}, TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable})
 	receiver.RouteManager().UpdateTransport(NewSendGatewayTransportWithType(TransportTypeH1), []Route{receiveOut})
 	receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{receiveIn}, TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable})
+	// Optional observers install existing hooks before any offered data or link worker.
+	for _, observer := range observe {
+		observer(cell, sender, receiver)
+	}
 	var workers sync.WaitGroup
 	if cell.ReceiveWindowAfter > 0 {
 		workers.Go(func() {
@@ -661,13 +817,16 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 	}
 	defer func() {
+		cell.referenceCompletions.beginCleanup()
 		cancel()
 		cleanupWorkload()
 		workers.Wait()
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer closeCancel()
+		clientsJoined := true
 		for _, client := range []*Client{sender, receiver} {
 			if err := client.CloseAndWait(closeCtx); err != nil {
+				clientsJoined = false
 				t.Errorf("performance client cleanup: %v", err)
 			}
 		}
@@ -684,6 +843,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 				}
 			}
 		}
+		cell.referenceCompletions.finish(clientsJoined)
 	}()
 	// Allow the blind RTT, the peer-capacity step and two complete delivery
 	// horizons to settle. A 2-RTT warmup included startup in 400-ms cells.
@@ -805,6 +965,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	reading.Mbps = float64(reading.Bytes) * 8 / elapsed.Seconds() / 1e6
 	reading.NatRefused = natRefused.Load()
+	reading.DelayedPacingWakes = delayedPacingWakes.Load()
 	reading.RelayDrops = dataLink.dropped.Load()
 	reading.MaxRelayQueued = dataLink.maxQueued.Load()
 	reading.MaxRelayQueuedBytes = dataLink.maxQueuedBytes.Load()
@@ -836,6 +997,130 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		t.Errorf("initial feedback ordering missed logical lanes: mask=%02x want=%02x", firstAckLanes.Load(), expectedFirstAckLanes)
 	}
 	return reading
+}
+
+// Under -race, window cells and arms run as parallel subtests. That runtime
+// randomizes the order of woken goroutines, so producers competing for one
+// admission keep their share even when each arm has a single P. Without it a
+// run queue that orders them the same way every time starved one of eight
+// flows for a whole interval, so ordinary builds measure one arm at a time.
+func windowPathParallel(t *testing.T) {
+	if raceEnabled {
+		t.Parallel()
+	}
+}
+
+// Arms of one comparison share no state: each owns its bubble, clients,
+// budgets, FIFO links and producers, so its virtual-time reading does not
+// depend on another arm's progress. They may run as parallel subtests and the
+// caller compares readings only after the group joins; a failed arm stops it.
+// The process-wide pool assertion stays with the sequential top-level test.
+func measureWindowPathArms(t *testing.T, duration time.Duration, arms []string, trial func(arm string) windowPathCell) []windowPathReading {
+	t.Helper()
+	readings := make([]windowPathReading, len(arms))
+	if !t.Run("arms", func(t *testing.T) {
+		for i, arm := range arms {
+			t.Run(arm, func(t *testing.T) {
+				windowPathParallel(t)
+				readings[i] = measureWindowPathTrial(t, trial(arm), duration)
+			})
+		}
+	}) {
+		t.FailNow()
+	}
+	return readings
+}
+
+// Named regressions repeat exact cells of the broader matrices. A process
+// measures each identical passing trial once; every owner still asserts its
+// own gates on that reading. Readings are values that callers never write.
+var windowPathTrials struct {
+	stateLock sync.Mutex
+	readings  map[string]windowPathTrialReading
+}
+
+type windowPathTrialReading struct {
+	reading windowPathReading
+	owner   string
+}
+
+// Measure one arm in its own bubble, or reuse the identical trial's reading.
+func measureWindowPathTrial(t *testing.T, trial windowPathCell, duration time.Duration) windowPathReading {
+	t.Helper()
+	key, shared := windowPathTrialKey(trial, duration)
+	if shared {
+		windowPathTrials.stateLock.Lock()
+		previous, ok := windowPathTrials.readings[key]
+		windowPathTrials.stateLock.Unlock()
+		if ok {
+			t.Logf("identical trial measured by %s", previous.owner)
+			logWindowServiceReading(t, previous.reading)
+			return previous.reading
+		}
+	}
+	var reading windowPathReading
+	synctest.Test(t, func(t *testing.T) {
+		reading = measureWindowPathCell(t, trial, duration)
+		logWindowServiceReading(t, reading)
+	})
+	if shared {
+		windowPathTrials.stateLock.Lock()
+		defer windowPathTrials.stateLock.Unlock()
+		if windowPathTrials.readings == nil {
+			windowPathTrials.readings = map[string]windowPathTrialReading{}
+		}
+		windowPathTrials.readings[key] = windowPathTrialReading{reading: reading, owner: t.Name()}
+	}
+	return reading
+}
+
+// The key holds the inputs of measureWindowPathCell: the cell with both
+// captured profiles, the interval and the process memory budget behind default
+// settings. Completion observers, pacing traces and -count repeats measure anew.
+func windowPathTrialKey(trial windowPathCell, duration time.Duration) (string, bool) {
+	if trial.referenceCompletions != nil || os.Getenv("CONNECT_WINDOW_PACING_TRACE") != "" ||
+		flag.Lookup("test.count").Value.String() != "1" {
+		return "", false
+	}
+	key, err := json.Marshal(struct {
+		Trial        windowPathCell
+		Duration     time.Duration
+		MemoryBudget ByteCount
+	}{trial, duration, MemoryBudget()})
+	return string(key), err == nil
+}
+
+// Equal captured profiles behind different pointers share one reading; any
+// changed arm, loss rule, profile value or interval measures separately.
+func TestWindowPathTrialKeySeparatesInputs(t *testing.T) {
+	profiles, digest := windowSdkProfiles(t)
+	copies, _ := windowSdkProfiles(t)
+	cell := windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profiles[6], ProfileFixtureSha256: digest,
+		Arm: "delivery", RoundTrip: 400 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Rate: 125000000}
+	key, shared := windowPathTrialKey(cell, time.Second)
+	same := cell
+	same.SenderProfile, same.ReceiverProfile = &copies[1], &copies[6]
+	if again, ok := windowPathTrialKey(same, time.Second); !shared || !ok || again != key {
+		t.Fatal("identical trials behind copied profiles did not share one reading")
+	}
+	arm, drop, profile := cell, cell, cell
+	arm.Arm, drop.Drop = "ceiling", true
+	changed := copies[6]
+	changed.LogicalDataLanes = 0
+	profile.ReceiverProfile = &changed
+	for name, trial := range map[string]windowPathCell{"arm": arm, "drop": drop, "profile": profile} {
+		if other, ok := windowPathTrialKey(trial, time.Second); !ok || other == key {
+			t.Errorf("changed %s shared the original trial's reading", name)
+		}
+	}
+	if other, ok := windowPathTrialKey(cell, 2*time.Second); !ok || other == key {
+		t.Error("a longer interval shared the original trial's reading")
+	}
+	observed := cell
+	observed.referenceCompletions = &windowReferenceCompletions{}
+	if _, ok := windowPathTrialKey(observed, time.Second); ok {
+		t.Error("a completion-observed trial shared its reading")
+	}
 }
 
 // Opt-in paired sweep for the cells absent from the original 200/400 ms

@@ -3,6 +3,7 @@ package connect
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -58,6 +59,9 @@ func newSmtpIntegrationMulti(
 	) SecurityPolicy {
 		return policy
 	}
+	// SMTP egresses through the local nat; the documentation addresses
+	// here are dialed in the process, never sent to
+	settings.LocalDialContextSettings, _ = testRefusingLocalDialContextSettings()
 	return NewRemoteUserNatMultiClient(
 		context.Background(),
 		&testingEmptyMultiClientGenerator{},
@@ -67,11 +71,14 @@ func newSmtpIntegrationMulti(
 	)
 }
 
+// newSmtpIntegrationBasicClient is a basic client whose local nat dials in the
+// process: what it routes locally (TCP/25) is refused there, and the dialed
+// addresses come back on the returned channel.
 func newSmtpIntegrationBasicClient(
 	t *testing.T,
 	policy *smtpCountingSecurityPolicy,
 	receive ReceivePacketFunction,
-) *RemoteUserNatClient {
+) (*RemoteUserNatClient, <-chan string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	clientSettings := DefaultClientSettings()
@@ -87,12 +94,23 @@ func newSmtpIntegrationBasicClient(
 		protocol.ProvideMode_Network,
 	)
 	remote.securityPolicy = policy
+	// The client builds its own local nat, which has no dial setting and
+	// would send TCP/25 to the documentation address from the host. Replace
+	// it, before any packet, with the same nat dialing in the process.
+	remote.localUserNatUnsub()
+	remote.localUserNat.Close()
+	localDialContextSettings, localDials := testRefusingLocalDialContextSettings()
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.UdpBufferSettings.DialContextSettings = localDialContextSettings
+	localUserNatSettings.TcpBufferSettings.DialContextSettings = localDialContextSettings
+	remote.localUserNat = NewLocalUserNat(client.Ctx(), "remote local", localUserNatSettings)
+	remote.localUserNatUnsub = remote.localUserNat.AddReceivePacketCallback(receive)
 	t.Cleanup(func() {
 		remote.Close()
 		client.Cancel()
 		cancel()
 	})
-	return remote
+	return remote, localDials
 }
 
 func nextSmtpBlockActions(t *testing.T, actions <-chan []*BlockAction) []*BlockAction {
@@ -274,7 +292,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			stats:  DefaultSecurityPolicyStatsCollector(),
 			result: SecurityPolicyResultIncident,
 		}
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, localDials := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
@@ -297,6 +315,13 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 		if calls := policy.egressCalls.Load(); calls != 0 {
 			t.Fatalf("basic client TCP/25 reached CFAA %d times", calls)
 		}
+		// the SYN reached the client's local nat, whose dial stays in the process
+		select {
+		case address := <-localDials:
+			AssertEqual(t, net.JoinHostPort("203.0.113.10", fmt.Sprint(smtpLocalPort)), address)
+		case <-time.After(5 * time.Second):
+			t.Fatal("basic client TCP/25 did not reach the local nat dial")
+		}
 	})
 
 	t.Run("plaintext 465 is reset before CFAA", func(t *testing.T) {
@@ -305,7 +330,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			result: SecurityPolicyResultAllow,
 		}
 		var resetCount atomic.Int64
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, _ := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
@@ -338,7 +363,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			result: SecurityPolicyResultAllow,
 		}
 		var resetCount atomic.Int64
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, _ := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
@@ -621,9 +646,29 @@ func TestUpgradeMuxBatchPreservesSmtpPolicyEntryPoint(t *testing.T) {
 	})
 }
 
+// newSmtpIntegrationProvider is a real provider whose exit nat holds every
+// dial for the provider's life, so a flow it dials stays open while the test
+// runs (see newSmtpIntegrationProviderWithDialRelease).
 func newSmtpIntegrationProvider(
 	t *testing.T,
 	policy *smtpCountingSecurityPolicy,
+) *RemoteUserNatProvider {
+	t.Helper()
+	return newSmtpIntegrationProviderWithDialRelease(t, policy, nil)
+}
+
+// newSmtpIntegrationProviderWithDialRelease is a real provider whose exit nat
+// holds every dial until release closes and then refuses it; a nil release
+// holds them until the nat closes. Nothing is sent. A held dial keeps its flow
+// open, as a dial to the unrouted documentation address 203.0.113.10 does, so a
+// test's segments are the only input to the provider's SMTP state for the
+// flow. A refused dial ends the flow, and the provider then forgets the
+// tuple's SMTP state (tcpFlowClosed): with a nat that refused at once, that
+// could happen between any two of a test's segments.
+func newSmtpIntegrationProviderWithDialRelease(
+	t *testing.T,
+	policy *smtpCountingSecurityPolicy,
+	release <-chan struct{},
 ) *RemoteUserNatProvider {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -633,7 +678,7 @@ func newSmtpIntegrationProvider(
 	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
 	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
-	localUserNat := NewLocalUserNatWithDefaults(ctx, "smtp-provider-test")
+	localUserNat := newTestHeldDialLocalUserNat(ctx, "smtp-provider-test", release)
 	settings := DefaultRemoteUserNatProviderSettings()
 	if policy != nil {
 		settings.SecurityPolicyGenerator = func(
@@ -651,6 +696,30 @@ func newSmtpIntegrationProvider(
 		cancel()
 	})
 	return provider
+}
+
+// newTestHeldDialLocalUserNat is an exit nat whose TCP and UDP dials wait until
+// release closes and are then refused in the process, or return when their
+// flow's context ends. A nil release holds every dial until then.
+func newTestHeldDialLocalUserNat(
+	ctx context.Context,
+	clientTag string,
+	release <-chan struct{},
+) *LocalUserNat {
+	settings := DefaultLocalUserNatSettings()
+	dialContextSettings := &DialContextSettings{
+		DialContext: func(dialCtx context.Context, network string, address string) (net.Conn, error) {
+			select {
+			case <-release:
+				return nil, fmt.Errorf("the test dials nothing, refused %s %s", network, address)
+			case <-dialCtx.Done():
+				return nil, dialCtx.Err()
+			}
+		},
+	}
+	settings.UdpBufferSettings.DialContextSettings = dialContextSettings
+	settings.TcpBufferSettings.DialContextSettings = dialContextSettings
+	return NewLocalUserNat(ctx, clientTag, settings)
 }
 
 func sendSmtpProviderPacket(
@@ -967,6 +1036,85 @@ func TestProviderAllows587NegotiationOnlyThroughTls(t *testing.T) {
 	}
 	if blocked := provider.PacketStats().BlockIngressPacketCount; blocked != 1 {
 		t.Fatalf("provider plaintext TCP/587 blocked ingress = %d, want 1", blocked)
+	}
+}
+
+// A provider forgets a TCP/587 tuple's STARTTLS progress when its NAT ends the
+// flow, here by refusing the dial. A ClientHello on the tuple afterwards starts
+// a stream the guard has not seen negotiate STARTTLS, so the guard refuses it
+// before the reversed policy. TestProviderAllows587NegotiationOnlyThroughTls
+// raced this edge while its NAT refused dials at once: under load the refusal
+// could end the flow between the STARTTLS and ClientHello segments.
+func TestProviderRefuses587ClientHelloAfterNatEndsFlow(t *testing.T) {
+	policy := &smtpCountingSecurityPolicy{
+		stats:  DefaultSecurityPolicyStatsCollector(),
+		result: SecurityPolicyResultAllow,
+	}
+	releaseDials := make(chan struct{})
+	provider := newSmtpIntegrationProviderWithDialRelease(t, policy, releaseDials)
+	// Flow-close callbacks run in registration order, after the provider's own.
+	flowEnded := make(chan struct{}, 1)
+	unsub := provider.localUserNat.addTcpFlowCloseCallback(func(_ TransferPath, ipPath *IpPath) {
+		if ipPath.DestinationPort == smtpStartTlsPort {
+			select {
+			case flowEnded <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer unsub()
+
+	source := SourceId(NewId())
+	sequence := uint32(19800)
+	segments := [][]byte{
+		smtpTestTcp4PacketToPort(smtpStartTlsPort, byte(tcpFlagSyn), sequence, 0, nil),
+	}
+	sequence += 1
+	for _, payload := range [][]byte{
+		[]byte("EHLO ios.example\r\n"),
+		[]byte("STARTTLS\r\n"),
+		smtpTestClientHello,
+	} {
+		segments = append(segments, smtpTestTcp4PacketToPort(
+			smtpStartTlsPort,
+			byte(tcpFlagAck|tcpFlagPsh),
+			sequence,
+			39800,
+			payload,
+		))
+		sequence += uint32(len(payload))
+	}
+	negotiation, clientHello := segments[:3], segments[3]
+	for _, segment := range negotiation {
+		sendSmtpProviderPacket(t, provider, source, segment)
+	}
+	if calls := policy.egressCalls.Load(); calls != int64(len(negotiation)) {
+		t.Fatalf("provider TCP/587 negotiation policy calls = %d, want %d", calls, len(negotiation))
+	}
+
+	close(releaseDials)
+	select {
+	case <-flowEnded:
+	case <-time.After(30 * time.Second):
+		t.Fatal("provider NAT did not end the TCP/587 flow after refusing its dial")
+	}
+
+	sendSmtpProviderPacket(t, provider, source, clientHello)
+	if calls := policy.egressCalls.Load(); calls != int64(len(negotiation)) {
+		t.Fatalf(
+			"ClientHello after the NAT ended its flow reached the reversed policy: calls = %d, want %d",
+			calls,
+			len(negotiation),
+		)
+	}
+	stats := provider.PacketStats()
+	if stats.BlockIngressPacketCount != 1 || stats.RemoteIngressPacketCount != int64(len(negotiation)) {
+		t.Fatalf(
+			"provider TCP/587 ingress after the NAT ended the flow blocked=%d remote=%d, want 1/%d",
+			stats.BlockIngressPacketCount,
+			stats.RemoteIngressPacketCount,
+			len(negotiation),
+		)
 	}
 }
 

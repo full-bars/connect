@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -379,6 +380,15 @@ func TestExtenderNetworkClientSamplesAnExtender(t *testing.T) {
 
 	bootstrapIp := netip.MustParseAddr("198.51.100.40")
 	networkClient := fixture.newNetworkClient(t, ctx, directory, func(settings *connect.ExtenderNetworkClientSettings) {
+		if settings.ResolveDns == nil || settings.ResolveDnsTxt == nil {
+			t.Fatal("feed fixture left a bootstrap resolver on the host network")
+		}
+		if addrs, err := settings.ResolveDns(ctx, settings.ExtenderDnsName); err != nil || len(addrs) != 0 {
+			t.Fatal("default feed address resolver must return an empty synthetic answer")
+		}
+		if txts, err := settings.ResolveDnsTxt(ctx, settings.ExtenderDnsName); err != nil || len(txts) != 0 {
+			t.Fatal("default feed TXT resolver must return an empty synthetic answer")
+		}
 		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 			return []netip.Addr{bootstrapIp}, nil
 		}
@@ -404,18 +414,28 @@ func TestExtenderNetworkClientSamplesAnExtender(t *testing.T) {
 		return false
 	}, "the dns bootstrap never reached the directory")
 
-	status := networkClient.Status()
+	// the end of the sample is the frame after the record, and the status
+	// takes its time and the completed first attempt in two updates, so the
+	// status is waited for rather than read once
+	status := func() connect.ExtenderNetworkClientStatus {
+		timeout := time.After(60 * time.Second)
+		for {
+			status, changed := networkClient.StatusMonitor().Get()
+			if !status.LastSampleTime.IsZero() && status.InitialAttemptDone {
+				return status
+			}
+			select {
+			case <-changed:
+			case <-timeout:
+				t.Fatalf("the status never carried the sample time and the completed first attempt, status = %+v", status)
+			}
+		}
+	}()
 	if !status.FeedConnected {
 		t.Fatal("the status does not report the open feed")
 	}
 	if status.FeedIp != fixture.extenderIp {
 		t.Fatalf("feed ip = %s, expected %s", status.FeedIp, fixture.extenderIp)
-	}
-	if status.LastSampleTime.IsZero() {
-		t.Fatal("the status carries no sample time")
-	}
-	if !status.InitialAttemptDone {
-		t.Fatal("the status does not report the completed first attempt")
 	}
 
 	// a revocation pushed on the open subscription is applied
@@ -521,6 +541,13 @@ func (self *feedFixture) newNetworkClient(
 	t.Helper()
 	strategySettings := connect.DefaultClientStrategySettings()
 	strategySettings.ConnectSettings = *self.extender.connectSettings()
+	// the records beside the fixture's own carry documentation addresses,
+	// which the client samples and probes over every carrier: it dials
+	// loopback only, so none of them is sent to
+	strategySettings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
+		DialContext:       testLoopbackDial,
+		PacketConnFactory: testLoopbackPacketConn,
+	}
 	strategySettings.ExtenderDirectory = directory
 	clientStrategy := connect.NewClientStrategy(ctx, strategySettings)
 	t.Cleanup(clientStrategy.Close)
@@ -532,6 +559,10 @@ func (self *feedFixture) newNetworkClient(
 	settings.DialTimeout = 20 * time.Second
 	settings.HelloTimeout = 20 * time.Second
 	settings.IpVersionSupported = func(ipVersion int) bool { return true }
+	// Feed tests own both bootstrap record types. Individual tests may supply
+	// answers below; an omitted seam must never fall back to the host DNS.
+	settings.ResolveDns = func(context.Context, string) ([]netip.Addr, error) { return nil, nil }
+	settings.ResolveDnsTxt = func(context.Context, string) ([]string, error) { return nil, nil }
 	settings.Hello = func(ctx context.Context) (*connect.ExtenderHelloResult, error) {
 		return &connect.ExtenderHelloResult{
 			RootPublicKeyHexes: []string{hex.EncodeToString(self.rootPublic)},
@@ -543,6 +574,38 @@ func (self *feedFixture) newNetworkClient(
 	networkClient := connect.NewExtenderNetworkClient(ctx, clientStrategy, directory, settings)
 	t.Cleanup(networkClient.Close)
 	return networkClient
+}
+
+// testLoopbackDial dials loopback and refuses every other destination.
+func testLoopbackDial(ctx context.Context, network string, address string) (net.Conn, error) {
+	addrPort, err := netip.ParseAddrPort(address)
+	if err != nil || !addrPort.Addr().IsLoopback() {
+		return nil, fmt.Errorf("the fixture dials nothing off the machine, refused %s %s", network, address)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+// testLoopbackPacketConn is the udp endpoint of a quic or dns carrier dial,
+// which sends to loopback only.
+func testLoopbackPacketConn(ctx context.Context) (net.PacketConn, error) {
+	packetConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &loopbackPacketConn{PacketConn: packetConn}, nil
+}
+
+// Only the net.PacketConn methods, so quic-go writes through WriteTo rather
+// than the udp socket's own message writes.
+type loopbackPacketConn struct {
+	net.PacketConn
+}
+
+func (self *loopbackPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if udpAddr, ok := addr.(*net.UDPAddr); !ok || !udpAddr.IP.IsLoopback() {
+		return 0, fmt.Errorf("the fixture sends nothing off the machine, refused %s", addr)
+	}
+	return self.PacketConn.WriteTo(b, addr)
 }
 
 // Waits for the directory to reach a state, driven by its change monitor so

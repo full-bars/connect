@@ -34,9 +34,11 @@ import (
 // The loop runs on five triggers (G3): start, the 24 hour tick, the own key
 // observed revoked in the directory, a changed caller address from hello, and a
 // network change. Everything else is backoff: a refusal holds the next attempt
-// for ten minutes, doubling to six hours, and a success resets it.
+// for ten minutes, doubling to six hours, and a success resets it. The tick,
+// the address check and the backoff count the time the host slept, from the
+// first minute it is awake after a sleep of fifteen minutes or more.
 //
-// Every clock and every side effect is a settings seam -- `Now`,
+// Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `AddNetworkChangeListener` -- so the whole loop is
 // deterministic in tests.
 //
@@ -49,24 +51,47 @@ const ExtenderActivatePath = "/network/extender-activate"
 // names are the wire and are not ours to rename.
 type ExtenderActivateArgs struct {
 	PublicKeyHex string `json:"public_key_hex"`
-	TcpPort      int    `json:"tcp_port"`
-	UdpPort      int    `json:"udp_port"`
-	DnsPort      int    `json:"dns_port"`
+	// the hex X25519 static public key of the camouflage (EXTENDER.md P1, P6),
+	// derived from the identity seed. Empty on an extender with camouflage off;
+	// an operator that predates the field ignores it (Go's decoder drops an
+	// unknown field), so activation stays non-fatal.
+	RealityPublicKeyHex string `json:"reality_public_key_hex,omitempty"`
+	TcpPort             int    `json:"tcp_port"`
+	UdpPort             int    `json:"udp_port"`
+	DnsPort             int    `json:"dns_port"`
 	// every dns port that is listening, which the operator probes one by one
 	// and the record then lists (L2). Empty leaves the operator on DnsPort
 	// alone, which is what an extender that predates the list offers.
 	DnsPorts []int    `json:"dns_ports,omitempty"`
 	DnsTld   string   `json:"dns_tld"`
 	Carriers []string `json:"carriers"`
+	// the certificate request of the extender's measurement key
+	// (lag.dev/PLAN.md C4): standard base64 of the DER, whose one name is the
+	// extender's measurement name (N1). Empty when the extender asks for no
+	// certificate, which is most activations; an operator that predates the
+	// field ignores it.
+	MeasurementCsr string `json:"measurement_csr,omitempty"`
+	// the owner opted out of lag.dev measurement (lag.dev/PLAN.md C4, decision
+	// 18), or the extender cannot use its measurement key, so the operator
+	// withdraws the measurement name (C9). Set on every activation while
+	// either stands, and only by an extender that keeps its identity, which
+	// is all that can have a name to withdraw.
+	MeasurementDisabled bool `json:"measurement_disabled,omitempty"`
 }
 
 // The activation answer (C2). A refusal is a normal answer with `Activated`
 // false and `Error` naming the carrier that failed its probe, not a request
 // error, so the caller can act on it rather than on an http status.
 type ExtenderActivateResult struct {
-	Activated bool   `json:"activated"`
-	Ip        string `json:"ip,omitempty"`
-	IpVersion int    `json:"ip_version,omitempty"`
+	Activated bool `json:"activated"`
+	// the operator's id of this extender, one per identity key and the same at
+	// every activation (lag.dev/PLAN.md N4). The extender's measurement name
+	// is this id under the measurement zone (N1), so it is how an extender
+	// learns the name its certificate request asks for (C4). Nil from an
+	// operator that predates it, and on a refusal.
+	ExtenderId *Id    `json:"extender_id,omitempty"`
+	Ip         string `json:"ip,omitempty"`
+	IpVersion  int    `json:"ip_version,omitempty"`
 	// the carriers that passed their probe, which is what the signed record
 	// lists
 	Carriers   []string   `json:"carriers,omitempty"`
@@ -143,6 +168,14 @@ type ExtenderActivatorSettings struct {
 	// against and signs the record for.
 	PublicKey []byte
 
+	// This extender's X25519 static public key of the camouflage (EXTENDER.md
+	// P1, P6), which the operator signs into the record so a client can front
+	// the tcp carrier with an authenticated hello. The role derives it from the
+	// identity seed (ExtenderRealityStaticPublicKey) and sets it only when
+	// camouflage is on and at least one borrowed name verified; empty leaves the
+	// extender on the legacy terminate path and publishes no camouflage key.
+	RealityPublicKey []byte
+
 	// The carrier ports and the encoding tld this extender serves (C1, C2).
 	// Zero ports and an empty tld take the operator's defaults.
 	TcpPort int
@@ -170,6 +203,26 @@ type ExtenderActivatorSettings struct {
 	// block.
 	OnActivated func(ipVersion int, result *ExtenderActivateResult)
 
+	// MeasurementCsr, when set, is asked for the measurement certificate
+	// request a post carries (lag.dev/PLAN.md C4): the base64 DER request
+	// whose one name is the measurement name of `extenderId`, this extender's
+	// id as the operator's answers report it (N4); or "" for none, because
+	// measurement is off or the operator already holds a request or a
+	// certificate for that name. It is asked only once an answer has reported
+	// the id, so the first post of a new identity carries none and the request
+	// rides the next post, and a pass carries at most one. A pass that learned
+	// the id from its last answer has no next post: when a request is wanted
+	// then, one more pass follows at once to carry it -- so this may be asked
+	// with no post following. It runs on the loop goroutine and must not
+	// block.
+	MeasurementCsr func(extenderId Id) string
+	// MeasurementDisabled, when set, reports whether the owner has opted out of
+	// measurement, or the extender cannot measure for want of a usable key
+	// (lag.dev/PLAN.md C4): every post made while it reports true carries
+	// measurement_disabled and no request, so the operator withdraws the
+	// measurement name (C9). It runs on the loop goroutine and must not block.
+	MeasurementDisabled func() bool
+
 	// The re-activation period (G3).
 	ActivateTimeout time.Duration
 	// The caller address check period (G3).
@@ -179,9 +232,23 @@ type ExtenderActivatorSettings struct {
 	MaxBackoff time.Duration
 	// Budget of one activation post and of one hello.
 	RequestTimeout time.Duration
+	// A resume from a sleep of at least ResumeMinSleep pulls the address
+	// check and the re-activation forward by the time slept, so each comes
+	// due as it would have had its timer run through the sleep: the loop's
+	// timers run on the monotonic clock, which stops while the host sleeps.
+	// The loop reads the host clock every ResumeCheckTimeout while it waits,
+	// and acts once per resume, when the host has stayed awake that long
+	// since the check that saw the sleep (hostResumeWatch). The defaults are
+	// argued at defaultResumeMinSleep. <= 0 for either disables it.
+	ResumeCheckTimeout time.Duration
+	ResumeMinSleep     time.Duration
 
 	// The only clock this loop reads. Tests install a fake one.
 	Now func() time.Time
+	// When set, replaces time.After as the loop's waits: until the next pass
+	// is due, and each resume check while it waits (ResumeCheckTimeout).
+	// Tests fire the checks through it, and hold the loop without a sleep.
+	PassAfter func(wait time.Duration) <-chan time.Time
 	// IpVersionSupported, when set, replaces the host family probe. Nil uses
 	// FamilySupported, which is what a family without a global address answers
 	// no for (G3).
@@ -202,6 +269,8 @@ func DefaultExtenderActivatorSettings() *ExtenderActivatorSettings {
 		MinBackoff:          10 * time.Minute,
 		MaxBackoff:          6 * time.Hour,
 		RequestTimeout:      60 * time.Second,
+		ResumeCheckTimeout:  defaultResumeCheckTimeout,
+		ResumeMinSleep:      defaultResumeMinSleep,
 		Now:                 time.Now,
 	}
 }
@@ -276,6 +345,13 @@ type ExtenderActivator struct {
 	revokedObserved bool
 	// set by a network change, taken by the next pass
 	forcedActivate bool
+
+	// this extender's id as the operator's last answer reported it, zero
+	// until one has (lag.dev/PLAN.md N4), and whether the last pass forced this
+	// one to carry the measurement request (C4), so that it is followed by no
+	// other. Both are read and written by the loop goroutine alone.
+	extenderId          Id
+	measurementFollowUp bool
 }
 
 // The activator is running when this returns: the loop is up and its first
@@ -392,6 +468,14 @@ func (self *ExtenderActivator) ChangeMonitor() *MonitorValue[uint64] {
 	return self.changeMonitor
 }
 
+// Starts a pass at once, as a network change does (G3), for something the
+// operator should hear now rather than at the next tick: a measurement request
+// for a key it does not hold, or an owner's opt-out of measurement or its end
+// (lag.dev/PLAN.md C4). Safe to call from any goroutine.
+func (self *ExtenderActivator) Reactivate() {
+	self.networkChanged()
+}
+
 // Wakes the loop, which re-activates every family (G3). A path change can move
 // this host's public address.
 func (self *ExtenderActivator) networkChanged() {
@@ -426,11 +510,26 @@ func (self *ExtenderActivator) changedWithLock() {
 // or a trigger says so. Everything the pass needs is read after the subscribe
 // above it, so a trigger that lands while the pass runs is carried into the
 // next wait rather than lost.
+//
+// The deadlines are monotonic, and the monotonic clock stops while the host
+// sleeps, so the wait reads the host clock at every wakeup, and at least every
+// ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls both
+// deadlines forward by the time slept and starts a pass.
 func (self *ExtenderActivator) run() {
 	backoff := self.settings.MinBackoff
 	var nextActivateTime time.Time
 	var nextAddressCheckTime time.Time
 	var clientAddress string
+
+	passAfter := self.settings.PassAfter
+	if passAfter == nil {
+		passAfter = time.After
+	}
+	resumeWatch := newHostResumeWatch(
+		self.settings.ResumeMinSleep,
+		self.settings.ResumeCheckTimeout,
+		self.settings.Now(),
+	)
 
 	for {
 		select {
@@ -496,12 +595,37 @@ func (self *ExtenderActivator) run() {
 			wait = self.settings.MinBackoff
 		}
 
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-wake:
-		case <-directoryChange:
-		case <-time.After(wait):
+		dueAfter := passAfter(wait)
+		for waiting := true; waiting; {
+			// nil, which never fires, when resumes are not watched
+			var checkAfter <-chan time.Time
+			if resumeWatch.Watching() {
+				checkAfter = passAfter(self.settings.ResumeCheckTimeout)
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-wake:
+				waiting = false
+			case <-directoryChange:
+				waiting = false
+			case <-dueAfter:
+				waiting = false
+			case <-checkAfter:
+			}
+			if sleep, resumed := resumeWatch.Check(self.settings.Now()); resumed {
+				// what came due while the host slept is due now
+				pullForward := func(deadline time.Time) time.Time {
+					if deadline.IsZero() {
+						return deadline
+					}
+					return deadline.Add(-sleep)
+				}
+				nextActivateTime = pullForward(nextActivateTime)
+				nextAddressCheckTime = pullForward(nextAddressCheckTime)
+				self.log.Infof("[extender]activate resumed after %s asleep\n", sleep.Round(time.Second))
+				waiting = false
+			}
 		}
 	}
 }
@@ -599,8 +723,8 @@ func (self *ExtenderActivator) byJwt() string {
 	return self.settings.ByJwt()
 }
 
-// The dns ports this extender is listening on, in dial order (L2). Nil when
-// the caller offers none, which leaves the operator on DnsPort alone.
+// The dns ports this extender is listening on, ascending (L2). Nil when the
+// caller offers none, which leaves the operator on DnsPort alone.
 func (self *ExtenderActivator) dnsPorts() []int {
 	if self.settings.DnsPorts == nil {
 		return nil
@@ -622,30 +746,89 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 	if self.settings.Carriers != nil {
 		carriers = self.settings.Carriers()
 	}
+	// a pass forced to carry the measurement request is followed by no
+	// other, so a request that keeps missing cannot hold the loop (C4)
+	followUp := self.measurementFollowUp
+	self.measurementFollowUp = false
 
+	succeeded := false
+	// whether a post of this pass delivered the measurement request
+	measurementCarried := false
 	if self.fallback {
-		return self.activateFallback(carriers, now)
+		succeeded, measurementCarried = self.activateFallback(carriers, now)
+	} else {
+		attempted := false
+		succeeded = true
+		for _, ipVersion := range self.ipVersions() {
+			if !self.ipVersionSupported(ipVersion) {
+				// a family with no global address on this host cannot be probed
+				// back, so it is skipped rather than refused (G3)
+				continue
+			}
+			attempted = true
+			if len(carriers) == 0 {
+				self.recordFailure(ipVersion, now, "no carrier is listening", false)
+				succeeded = false
+				continue
+			}
+			// one request a pass, on the first post that can carry it (C4)
+			measurementCsr := ""
+			if !measurementCarried {
+				measurementCsr = self.measurementCsr()
+			}
+			if self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now) {
+				measurementCarried = measurementCarried || measurementCsr != ""
+			} else {
+				succeeded = false
+			}
+		}
+		succeeded = attempted && succeeded
 	}
+	if succeeded && !followUp && !measurementCarried {
+		self.followMeasurementCsr()
+	}
+	return succeeded
+}
 
-	attempted := false
-	succeeded := true
-	for _, ipVersion := range self.ipVersions() {
-		if !self.ipVersionSupported(ipVersion) {
-			// a family with no global address on this host cannot be probed
-			// back, so it is skipped rather than refused (G3)
-			continue
-		}
-		attempted = true
-		if len(carriers) == 0 {
-			self.recordFailure(ipVersion, now, "no carrier is listening", false)
-			succeeded = false
-			continue
-		}
-		if !self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, now) {
-			succeeded = false
-		}
+// The measurement request a post carries (lag.dev/PLAN.md C4): what the
+// extender asks for under its id, and nothing until an answer has reported
+// that id (N4), since the request's one name is made from it.
+func (self *ExtenderActivator) measurementCsr() string {
+	if self.settings.MeasurementCsr == nil || self.extenderId == (Id{}) || self.measurementDisabled() {
+		return ""
 	}
-	return attempted && succeeded
+	return self.settings.MeasurementCsr(self.extenderId)
+}
+
+// Whether the owner has opted out of measurement (lag.dev/PLAN.md C4).
+func (self *ExtenderActivator) measurementDisabled() bool {
+	return self.settings.MeasurementDisabled != nil && self.settings.MeasurementDisabled()
+}
+
+// Follows a successful pass that delivered no measurement request with one
+// more pass at once, when a request is wanted now. That is the first pass of
+// a new identity with a single post -- one family, or the plain api url --
+// which learned this extender's id from the answer to that post and so had no
+// later post to carry the request on.
+//
+// lag.dev/PLAN.md C4 has a new identity's request ride its next activation
+// post. With one post a pass that next post is the 24 hour tick away, and a
+// process that restarts more often than that would never reach it, since the
+// id is learned again from the first answer of each run. This one extra post
+// is the smallest change that makes the next post follow the first.
+func (self *ExtenderActivator) followMeasurementCsr() {
+	if self.measurementCsr() == "" {
+		// nothing is wanted: measurement is off, the id is not known, or the
+		// operator already holds a request or a certificate for the name
+		return
+	}
+	self.measurementFollowUp = true
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.forcedActivate = true
+	}()
+	self.wakeMonitor.NotifyAll()
 }
 
 func (self *ExtenderActivator) ipVersionSupported(ipVersion int) bool {
@@ -660,35 +843,48 @@ func (self *ExtenderActivator) ipVersionSupported(ipVersion int) bool {
 // the other family with, and the operator derives the family from the caller
 // address, so the answer names whichever family this host's egress used. A host
 // with no global address of either family is skipped exactly as a family
-// without one is (G3).
-func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) bool {
+// without one is (G3). The one post carries the measurement request when one
+// is wanted and this extender's id is known, and whether it delivered one
+// comes back with the outcome (C4).
+func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (succeeded bool, measurementCarried bool) {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
-		return false
+		return false, false
 	}
 	if len(carriers) == 0 {
 		self.recordFailure(0, now, "no carrier is listening", false)
-		return false
+		return false, false
 	}
-	return self.activateUrl(0, self.fallbackApiUrl(), carriers, now)
+	measurementCsr := self.measurementCsr()
+	succeeded = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
+	return succeeded, succeeded && measurementCsr != ""
 }
 
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
-// fallback mode.
+// fallback mode. `measurementCsr` is the request the post carries, empty for
+// none (C4).
 func (self *ExtenderActivator) activateUrl(
 	ipVersion int,
 	apiUrl string,
 	carriers []string,
+	measurementCsr string,
 	now time.Time,
 ) bool {
 	args := &ExtenderActivateArgs{
-		PublicKeyHex: hex.EncodeToString(self.settings.PublicKey),
-		TcpPort:      self.settings.TcpPort,
-		UdpPort:      self.settings.UdpPort,
-		DnsPort:      self.settings.DnsPort,
-		DnsPorts:     self.dnsPorts(),
-		DnsTld:       self.settings.DnsTld,
-		Carriers:     carriers,
+		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
+		TcpPort:             self.settings.TcpPort,
+		UdpPort:             self.settings.UdpPort,
+		DnsPort:             self.settings.DnsPort,
+		DnsPorts:            self.dnsPorts(),
+		DnsTld:              self.settings.DnsTld,
+		Carriers:            carriers,
+		MeasurementCsr:      measurementCsr,
+		MeasurementDisabled: self.measurementDisabled(),
+	}
+	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
+	// empty key is left off the args so an operator sees no camouflage key
+	if 0 < len(self.settings.RealityPublicKey) {
+		args.RealityPublicKeyHex = hex.EncodeToString(self.settings.RealityPublicKey)
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
@@ -719,6 +915,13 @@ func (self *ExtenderActivator) activateUrl(
 		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
 		self.recordFailure(ipVersion, now, message, true)
 		return false
+	}
+
+	// the operator's id of this extender, the same at every activation, which
+	// is what its measurement certificate request is named by (lag.dev/PLAN.md
+	// N4, C4)
+	if result.ExtenderId != nil && *result.ExtenderId != (Id{}) {
+		self.extenderId = *result.ExtenderId
 	}
 
 	// the record is applied either way: it is signed and carries its own
