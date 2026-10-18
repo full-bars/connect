@@ -247,6 +247,40 @@ func TestExtenderNetworkClientRebootstrapsBelowTheLowWaterMark(t *testing.T) {
 	}
 }
 
+// A name that answers NXDOMAIN parks the bootstrap instead of being asked
+// again on every pass. The low-water condition above is true forever while
+// the name is dead, which is what turned one missing name into a resolver
+// and log flood (the 2026-10-18 field report).
+func TestExtenderNetworkClientDefinitiveDnsMissParksTheBootstrap(t *testing.T) {
+	clock := newTestClock()
+	var resolveCount atomic.Int64
+	_, _, _ = newTestExtenderNetworkClient(t, clock, func(settings *ExtenderNetworkClientSettings) {
+		settings.LowWaterCount = 4
+		settings.DefinitiveDnsMissCooldown = time.Hour
+		settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+			resolveCount.Add(1)
+			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+		}
+		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for resolveCount.Load() == 0 {
+		if deadline.Before(time.Now()) {
+			t.Fatal("the bootstrap never resolved")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	first := resolveCount.Load()
+	// the pass cadence in this fixture is milliseconds; without the park the
+	// count grows with every pass
+	time.Sleep(250 * time.Millisecond)
+	if got := resolveCount.Load(); got != first {
+		t.Fatalf("the bootstrap re-asked a dead name: %d -> %d resolutions", first, got)
+	}
+}
+
 // Above the low-water mark the bootstrap does not repeat until the
 // re-bootstrap period, however many passes the loop makes (E3).
 //
