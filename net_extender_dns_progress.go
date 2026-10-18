@@ -135,6 +135,10 @@ func (self *extenderDnsPublication) waitFirst(ctx context.Context) error {
 // Signed TXT records have already been verified before this starts. Unsigned
 // A/AAAA entries retain their DNS source and cannot become feed-dial authority.
 func (self *ExtenderNetworkClient) bootstrapDnsAddresses(ctx context.Context) {
+	if self.dnsDead() {
+		// a definitively negative name is not asked again until the cooldown
+		return
+	}
 	deadline, _ := ctx.Deadline()
 	publication := self.startDnsPublication(extenderBootstrapDnsPublication, 0, deadline, func(ctx context.Context, ready func(bool)) error {
 		return self.resolveDnsPublication(ctx, self.settings.ExtenderDnsName, func(ips []netip.Addr) {
@@ -154,8 +158,20 @@ func (self *ExtenderNetworkClient) bootstrapDnsAddresses(ctx context.Context) {
 		self.probeWake.NotifyAll()
 		return
 	}
-	if err := publication.waitFirst(self.ctx); err != nil && self.ctx.Err() == nil {
-		self.log.Infof("[extender]bootstrap err = %s\n", err)
+	err := publication.waitFirst(self.ctx)
+	if err != nil {
+		if self.ctx.Err() == nil {
+			if authoritativeDnsMiss(err) {
+				// the name does not exist: park the retry rather than
+				// re-asking on every pass
+				self.markDnsDead()
+			}
+			if allow, suppressed := self.dnsLogThrottle.Allow(self.settings.Now()); allow {
+				self.log.Infof("[extender]bootstrap err = %s%s\n", err, suppressedSuffix(suppressed))
+			}
+		}
+	} else {
+		self.clearDnsDead()
 	}
 }
 

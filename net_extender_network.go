@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -75,6 +76,11 @@ type ExtenderNetworkClientSettings struct {
 	MaxBackoff time.Duration
 	// The dns bootstrap repeats on this period, and so does the hello refresh.
 	RebootstrapTimeout time.Duration
+	// A name that answers NXDOMAIN is not asked again for this long. The
+	// negative is final until then, and the low-water re-bootstrap below is
+	// otherwise true on every pass for as long as the name stays dead, which
+	// turns one missing name into a resolver and log flood per client.
+	DefinitiveDnsMissCooldown time.Duration
 	// A directory with fewer usable addresses than this re-bootstraps at once.
 	LowWaterCount int
 	// Budget of one feed dial and of one hello.
@@ -202,28 +208,29 @@ type ExtenderNetworkClientSettings struct {
 
 func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 	return &ExtenderNetworkClientSettings{
-		Subscribe:              true,
-		SampleCount:            DefaultExtenderFeedSampleCount,
-		MinBackoff:             1 * time.Second,
-		MaxBackoff:             5 * time.Minute,
-		RebootstrapTimeout:     6 * time.Hour,
-		LowWaterCount:          4,
-		DialTimeout:            30 * time.Second,
-		HelloTimeout:           30 * time.Second,
-		SubscribeIdleTimeout:   90 * time.Second,
-		HintMinBackoff:         1 * time.Minute,
-		HintMaxBackoff:         6 * time.Hour,
-		HelloMinBackoff:        1 * time.Minute,
-		HelloMaxBackoff:        6 * time.Hour,
-		ProbeWindowCount:       4,
-		ProbeCountPerExtender:  2,
-		ProbeMaxCandidateCount: 16,
-		ProbeTimeout:           5 * time.Second,
-		ProbeCloseFactor:       2.0,
-		ProbeCloseFloor:        50 * time.Millisecond,
-		ResumeCheckTimeout:     defaultResumeCheckTimeout,
-		ResumeMinSleep:         defaultResumeMinSleep,
-		Now:                    time.Now,
+		Subscribe:                 true,
+		SampleCount:               DefaultExtenderFeedSampleCount,
+		MinBackoff:                1 * time.Second,
+		MaxBackoff:                5 * time.Minute,
+		RebootstrapTimeout:        6 * time.Hour,
+		DefinitiveDnsMissCooldown: 30 * time.Minute,
+		LowWaterCount:             4,
+		DialTimeout:               30 * time.Second,
+		HelloTimeout:              30 * time.Second,
+		SubscribeIdleTimeout:      90 * time.Second,
+		HintMinBackoff:            1 * time.Minute,
+		HintMaxBackoff:            6 * time.Hour,
+		HelloMinBackoff:           1 * time.Minute,
+		HelloMaxBackoff:           6 * time.Hour,
+		ProbeWindowCount:          4,
+		ProbeCountPerExtender:     2,
+		ProbeMaxCandidateCount:    16,
+		ProbeTimeout:              5 * time.Second,
+		ProbeCloseFactor:          2.0,
+		ProbeCloseFloor:           50 * time.Millisecond,
+		ResumeCheckTimeout:        defaultResumeCheckTimeout,
+		ResumeMinSleep:            defaultResumeMinSleep,
+		Now:                       time.Now,
 	}
 }
 
@@ -291,6 +298,18 @@ func ExtenderGossipStateForMember(meshPeerCount int, connecting bool) string {
 	}
 }
 
+// Retry lines on the extender path are useful once and useless in a flood: a
+// sustained fault otherwise emits one line per pass per client. Each class
+// keeps its first line and then at most one line per interval with the count
+// of what it suppressed, via logThrottle.
+const (
+	extenderBootstrapLogInterval = 1 * time.Minute
+	extenderHelloLogInterval     = 5 * time.Minute
+	extenderHintLogInterval      = 30 * time.Minute
+	// Used when a caller builds settings by hand and leaves the field zero.
+	defaultDefinitiveDnsMissCooldown = 30 * time.Minute
+)
+
 type ExtenderNetworkClient struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -301,6 +320,15 @@ type ExtenderNetworkClient struct {
 	clientStrategy *ClientStrategy
 	directory      *ExtenderDirectory
 	settings       *ExtenderNetworkClientSettings
+
+	// retry logs are throttled per class (see the intervals above)
+	bootstrapLogThrottle *logThrottle
+	dnsLogThrottle       *logThrottle
+	helloLogThrottle     *logThrottle
+	hintLogThrottle      *logThrottle
+	// unix nanos until which a definitively negative dns answer parks the
+	// bootstrap; zero when the name is not known to be dead
+	dnsDeadUntilNanos atomic.Int64
 
 	statusMonitor *MonitorValue[ExtenderNetworkClientStatus]
 	// closed and replaced on a wake request; a network change and a low-water
@@ -419,6 +447,11 @@ func NewExtenderNetworkClient(
 		initialHintDone:   make(chan struct{}),
 		helloDone:         make(chan struct{}),
 		initialHelloDone:  make(chan struct{}),
+
+		bootstrapLogThrottle: newLogThrottle(extenderBootstrapLogInterval),
+		dnsLogThrottle:       newLogThrottle(extenderBootstrapLogInterval),
+		helloLogThrottle:     newLogThrottle(extenderHelloLogInterval),
+		hintLogThrottle:      newLogThrottle(extenderHintLogInterval),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -555,6 +588,28 @@ func (self *ExtenderNetworkClient) markInitialAttemptDone() {
 	})
 }
 
+// A definitive negative answer (NXDOMAIN) is final: the name does not exist,
+// and asking again on every pass is the flood the cooldown exists to stop.
+// The bootstrap probes once more when the cooldown expires, so a name that
+// appears is picked up within one cooldown.
+func (self *ExtenderNetworkClient) markDnsDead() {
+	cooldown := self.settings.DefinitiveDnsMissCooldown
+	if cooldown <= 0 {
+		cooldown = defaultDefinitiveDnsMissCooldown
+	}
+	self.dnsDeadUntilNanos.Store(self.settings.Now().Add(cooldown).UnixNano())
+}
+
+// True while a definitively negative dns answer holds the bootstrap off.
+func (self *ExtenderNetworkClient) dnsDead() bool {
+	return self.settings.Now().UnixNano() < self.dnsDeadUntilNanos.Load()
+}
+
+// The name answered: whatever parked the bootstrap no longer holds.
+func (self *ExtenderNetworkClient) clearDnsDead() {
+	self.dnsDeadUntilNanos.Store(0)
+}
+
 func (self *ExtenderNetworkClient) updateStatus(update func(*ExtenderNetworkClientStatus)) {
 	self.statusMonitor.Update(func(status ExtenderNetworkClientStatus) ExtenderNetworkClientStatus {
 		update(&status)
@@ -610,10 +665,13 @@ func (self *ExtenderNetworkClient) run() {
 		// due, and goes on without waiting for either (runHellos, runHints);
 		// they share the wake
 		self.hintWake.NotifyAll()
-		if lastBootstrapTime.IsZero() ||
+		// a name that answered NXDOMAIN is not asked again until the
+		// cooldown passes: the low-water condition below is true forever
+		// while it is dead, which is what made this a flood
+		if !self.dnsDead() && (lastBootstrapTime.IsZero() ||
 			self.settings.RebootstrapTimeout <= now.Sub(lastBootstrapTime) ||
 			self.directory.ActiveCount(0) < self.settings.LowWaterCount ||
-			self.directory.RootKeys() != bootstrapRootKeySet {
+			self.directory.RootKeys() != bootstrapRootKeySet) {
 			bootstrapRootKeySet = self.bootstrap()
 			lastBootstrapTime = now
 		}
@@ -781,7 +839,9 @@ func (self *ExtenderNetworkClient) refreshRootKeys() bool {
 	defer cancel()
 	helloResult, err := hello(ctx)
 	if err != nil {
-		self.log.Infof("[extender]hello err = %s\n", err)
+		if allow, suppressed := self.helloLogThrottle.Allow(self.settings.Now()); allow {
+			self.log.Infof("[extender]hello err = %s%s\n", err, suppressedSuffix(suppressed))
+		}
 		return false
 	}
 	if helloResult == nil {
@@ -895,6 +955,10 @@ func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 	if self.settings.ExtenderDnsName == "" {
 		return self.directory.RootKeys()
 	}
+	if self.dnsDead() {
+		// a definitively negative name is not asked again until the cooldown
+		return self.directory.RootKeys()
+	}
 	resolveTxt := self.settings.ResolveDnsTxt
 	if resolveTxt == nil {
 		resolveTxt = self.resolveDnsTxt
@@ -912,8 +976,18 @@ func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 		var err error
 		txts, err = resolveTxt(ctx, self.settings.ExtenderDnsName)
 		if err != nil {
+			if authoritativeDnsMiss(err) {
+				// the name does not exist: park the retry rather than
+				// re-asking on every pass
+				self.markDnsDead()
+			}
 			// not fatal: the address answers may still bootstrap, unverified
-			self.log.Infof("[extender]bootstrap txt err = %s\n", err)
+			if allow, suppressed := self.bootstrapLogThrottle.Allow(self.settings.Now()); allow {
+				self.log.Infof("[extender]bootstrap txt err = %s%s\n", err, suppressedSuffix(suppressed))
+			}
+		} else if 0 < len(txts) {
+			// the name answered; whatever parked the bootstrap no longer holds
+			self.clearDnsDead()
 		}
 		// keys installed while the answer was out judge it
 		rootKeySet = self.directory.RootKeys()
@@ -1467,7 +1541,9 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	defer cancel()
 	result, err := hint(ctx)
 	if err != nil {
-		self.log.Infof("[extender]hint err = %s\n", err)
+		if allow, suppressed := self.hintLogThrottle.Allow(self.settings.Now()); allow {
+			self.log.Infof("[extender]hint err = %s%s\n", err, suppressedSuffix(suppressed))
+		}
 		self.directory.ExpireCountryHint()
 		return false
 	}
