@@ -408,6 +408,11 @@ type ContractManagerSettings struct {
 
 	ProtocolVersion int
 
+	// ProxyDescription is a human-readable identifier for the proxy this
+	// manager's client runs behind (e.g. "proxy[15304] (216.26.234.33:1081)"
+	// or "proxy[0] (direct)"). When set, contract lifecycle logs include it.
+	ProxyDescription string
+
 	// TODO remove
 	LegacyCreateContract bool
 	// TODO remove
@@ -1000,7 +1005,12 @@ func (self *ContractManager) handleControlFrameForQueue(
 				// The clearest signal that this provider is moving traffic:
 				// v33 emitted this line on every contract it acquired, and the
 				// engine port dropped it.
-				self.client.log.Infof("💚 [contract] acquired size=%s destination=%s\n",
+				proxyTag := ""
+				if self.settings != nil && self.settings.ProxyDescription != "" {
+					proxyTag = " " + self.settings.ProxyDescription
+				}
+				self.client.log.Infof("💚 [contract] acquired%s size=%s destination=%s\n",
+					proxyTag,
 					ByteCountHumanReadable(ByteCount(storedContract.GetTransferByteCount())),
 					contractKey.Destination.DestinationId)
 				return nil
