@@ -997,6 +997,12 @@ func (self *ContractManager) handleControlFrameForQueue(
 					Key:     contractKey,
 					Premium: premium,
 				}
+				// The clearest signal that this provider is moving traffic:
+				// v33 emitted this line on every contract it acquired, and the
+				// engine port dropped it.
+				self.client.log.Infof("💚 [contract] acquired size=%s destination=%s\n",
+					ByteCountHumanReadable(ByteCount(storedContract.GetTransferByteCount())),
+					contractKey.Destination.DestinationId)
 				return nil
 			}
 			if self.client.log.V(2).Enabled() {
