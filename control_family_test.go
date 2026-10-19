@@ -433,12 +433,16 @@ func TestControlIpFamilyPolicyIgnoresDemotion(t *testing.T) {
 
 func TestControlFamilyDemoteNarrowsToTheOtherFamily(t *testing.T) {
 	tests := []struct {
-		name   string
-		demote int
-		want   string
+		name     string
+		demote   int
+		wantTake bool
+		want     string
 	}{
-		{"demote 6 narrows to tcp4", 6, "tcp4"},
-		{"demote 4 narrows to tcp6", 4, "tcp6"},
+		{"demote 6 narrows to tcp4", 6, true, "tcp4"},
+		// IPv4 is never demoted: the call is refused and the dial keeps Happy
+		// Eyeballs' family-agnostic network. IPv6 remains a per-dial fallback,
+		// not something a timeout can steer the process onto.
+		{"demote 4 is refused", 4, false, "tcp"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -447,8 +451,8 @@ func TestControlFamilyDemoteNarrowsToTheOtherFamily(t *testing.T) {
 			controlFamilyClear()
 			defer controlFamilyClear()
 
-			if !controlFamilyDemote(test.demote) {
-				t.Fatal("expected the demotion to take")
+			if took := controlFamilyDemote(test.demote); took != test.wantTake {
+				t.Fatalf("controlFamilyDemote(%d) = %v, want %v", test.demote, took, test.wantTake)
 			}
 			network, err := controlDialNetwork("tcp", "api.example:443")
 			if err != nil {
@@ -457,7 +461,7 @@ func TestControlFamilyDemoteNarrowsToTheOtherFamily(t *testing.T) {
 			if network != test.want {
 				t.Fatalf("got %q, want %s", network, test.want)
 			}
-			if controlFamilyStatus() == "" {
+			if test.wantTake && controlFamilyStatus() == "" {
 				t.Fatal("expected a non-empty status while a demotion is live")
 			}
 		})
@@ -636,19 +640,22 @@ func TestPickControlUDPAddrHonorsPolicyAndDemotion(t *testing.T) {
 	}
 
 	// a demotion moves the pick off the demoted family
-	controlFamilyDemote(6)
+	if !controlFamilyDemote(6) {
+		t.Fatalf("IPv6 must still be demotable in favour of IPv4")
+	}
 	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
 		t.Fatalf("got %v, want the IPv4 address once IPv6 is demoted", got.IP)
 	}
 	controlFamilyClear()
 
-	// demoting the OTHER family is the assertion that actually distinguishes
-	// the demotion branch from the IPv4-first Auto default above: Auto alone
-	// already answers v4, so demote(6)+want=v4 above cannot fail if the
-	// demotion branch is deleted. demote(4) must move the pick to v6.
-	controlFamilyDemote(4)
-	if got := pickControlIPAddr(addrs); !got.IP.Equal(v6.IP) {
-		t.Fatalf("got %v, want the IPv6 address once IPv4 is demoted", got.IP)
+	// IPv4 is what the fleet runs on while the dual-stack rollout is early, and
+	// it is never demoted: the call is refused and the pick stays IPv4 even
+	// with a viable IPv6 address.
+	if controlFamilyDemote(4) {
+		t.Fatalf("IPv4 must never be demoted")
+	}
+	if got := pickControlIPAddr(addrs); !got.IP.Equal(v4.IP) {
+		t.Fatalf("got %v, want the IPv4 address: IPv4 must never be demoted", got.IP)
 	}
 	controlFamilyClear()
 
