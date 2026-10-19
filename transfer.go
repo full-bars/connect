@@ -10687,8 +10687,8 @@ func (self *SendSequence) sendWithSetContractRecords(
 			}
 		}
 	}
-	recordTransferFirstSend(len(item.transferFrameBytes))
 	if err == nil {
+		recordTransferFirstSend(len(item.transferFrameBytes))
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)

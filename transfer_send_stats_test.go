@@ -1,6 +1,12 @@
 package connect
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/urnetwork/connect/protocol"
+)
 
 func TestTransferSendStats_SplitsFirstSendsFromResends(t *testing.T) {
 	before := TransferSendStatsNow()
@@ -33,5 +39,25 @@ func TestTransferSendStats_SplitsFirstSendsFromResends(t *testing.T) {
 	}
 	if got.ResendDepth[3]-before.ResendDepth[3] != 1 { // 16th send (9+)
 		t.Fatalf("depth bucket 9+ = %+v", got.ResendDepth)
+	}
+}
+
+// A first write that fails never reaches the wire, so it is not a first send.
+// Resend accounting already follows the same rule.
+func TestTransferSendStats_FailedFirstWriteIsNotAFirstSend(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	sequence, _, writer, _ := newRecoveryAccountingFixture(t)
+	writer.attempt = func([]byte, time.Duration) (bool, TransportType, error) {
+		return false, TransportTypeH3, errors.New("write failed")
+	}
+
+	before := TransferSendStatsNow()
+	sequence.send([]*protocol.Frame{budgetTestFrame(100)}, nil, false, false)
+	after := TransferSendStatsNow()
+	if got := after.FirstFrames - before.FirstFrames; got != 0 {
+		t.Fatalf("a failed first write counted %d first frames, want 0", got)
+	}
+	if got := after.FirstBytes - before.FirstBytes; got != 0 {
+		t.Fatalf("a failed first write counted %d first-send bytes, want 0", got)
 	}
 }
