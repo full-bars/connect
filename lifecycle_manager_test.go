@@ -171,6 +171,9 @@ func TestClientCloseAndWaitJoinsIntermediaryStreamChildren(t *testing.T) {
 	defer cancel()
 
 	settings := closeWaitClientSettings()
+	// The associations' P2P setup is refused (streamManagerTestSettings), so
+	// the one toward the destination does not query the public STUN pool.
+	settings.WebRtcSettings.MemoryBudget = NewTransferMemoryBudget(0)
 	childEntered := make(chan string, 4)
 	releaseChildren := make(chan struct{})
 	childrenStarted := make(chan struct{})
@@ -327,6 +330,13 @@ func TestClientCloseAndWaitJoinsContractManagerWorkers(t *testing.T) {
 	settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	manager := client.contractManager
+	// Queue a real reservation to activate the lazy expiry/final-flush owner.
+	destination := NewId()
+	frame := expiryContractFrame(t, client.ClientId(), destination, NewId())
+	defer MessagePoolReturn(frame.MessageBytes)
+	if err := manager.HandleControlFrame(ContractKey{Destination: DestinationId(destination)}, frame); err != nil {
+		t.Fatal(err)
+	}
 	workerEntered := make(chan string, 3)
 	releaseWorkers := make(chan struct{})
 	joinEntered := make(chan struct{})

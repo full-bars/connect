@@ -23,6 +23,8 @@ func newWebRtcPeerConnectionFactory(
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
+				// per-session random subset of the high-collateral pool (or the
+				// pinned override); see selectIceServerUrls
 				URLs: settings.selectIceServerUrls(),
 			},
 		},

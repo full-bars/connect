@@ -235,6 +235,10 @@ type AuthNetworkClientArgs struct {
 	SourceClientId *Id    `json:"source_client_id,omitempty"`
 	Description    string `json:"description"`
 	DeviceSpec     string `json:"device_spec"`
+	// ProvideIntent marks a client created as a provider install, which the
+	// platform exempts from the network's client limit. Recorded by the
+	// platform only when a client is created; renewal ignores it.
+	ProvideIntent bool `json:"provide_intent,omitempty"`
 }
 
 type AuthNetworkClientResult struct {

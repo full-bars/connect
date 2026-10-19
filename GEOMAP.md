@@ -24,7 +24,8 @@ After this program, the network locates itself from exactly three things:
 1. **GeoLite2** — city, region, country, continent, lat/lon, accuracy radius,
    ASN. Free, one license, one `geoipupdate` run. It is the *genesis* of every
    location: the prior we start from and never fully abandon.
-2. **Our operator probes** — the egress prober (`operator-proxy/egresshealth`)
+2. **Our operator probes** — the egress prober
+   (`server/qualityprobe/egresshealth`, run by taskworker)
    that routes lookups through a provider and cross-checks them, for ip
    *quality* (hosting, proxy, mobile) and egress country.
 3. **Our own pings** — provider→extender and extender→extender round trips,
@@ -88,7 +89,9 @@ one ping per address family the record lists.
 - **Refresh.** Every known peer is re-pinged every `PeerPingRefreshTimeout`
   (default 12 h, never later than 24 h), jittered, so the map follows
   re-activations and moves and every ping in the operator's one-day window
-  (§5.7) is renewed before it expires. An extender with *P* peers therefore
+  (§5.7) is renewed before it expires. The refresh counts the time the host
+  slept, as the operator's day does, so an extender host that slept through
+  one pings at its next pass. An extender with *P* peers therefore
   makes ~2*P*/day pings; at a thousand peers that is one ping every ~45 s
   per extender. Providers keep the same 12 h cadence for their probe pass
   (`LatencyMaxAge` on the network client).

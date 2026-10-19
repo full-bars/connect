@@ -3,6 +3,7 @@ package connect
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -159,6 +160,19 @@ func noteTlsHandshake(path tlsPath, host string, state tls.ConnectionState, err 
 		result = tlsResultResumed
 	}
 	streamMetrics.tls[path][tlsHostClass(host)][result].Add(1)
+}
+
+// tlsStateOf reads the handshake state of a dialed connection. A dial path may
+// hand back either crypto/tls's connection or the Chrome-hello one
+// (chromeTlsConn, net_tls_hello.go); both answer with crypto/tls's type. A
+// connection with no TLS state (nil after a failed handshake, or a wrapper
+// that does not expose it) reads as the zero state, which noteTlsHandshake
+// counts by its error argument rather than by resumption.
+func tlsStateOf(conn net.Conn) tls.ConnectionState {
+	if stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return stater.ConnectionState()
+	}
+	return tls.ConnectionState{}
 }
 
 // tlsHandshakeTotal sums one result over every path and host.

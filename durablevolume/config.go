@@ -22,8 +22,8 @@ const RootGenerationBytes = 32
 const maximumConfigBytes = 64 * 1024
 const maximumMarkerBytes = 4 * 1024
 
-// The caller selects a scope independently of declaration contents. Daemon
-// admission can never acquire the owner-local system-filesystem exception.
+// The caller selects a scope independently of declaration contents; a
+// declaration can never choose its own scope.
 type ownerScope uint8
 
 const (
@@ -110,7 +110,7 @@ func (self Config) validate() error {
 	return self.validateForScope(daemonScope)
 }
 
-// Owner-local custody may use the declared system filesystem. Its protected
+// Either scope may use the declared system filesystem. Its protected
 // precreated root, external lease and identity marker remain mandatory.
 func (self Config) validateForScope(scope ownerScope) error {
 	expectedSchema := Schema
@@ -125,14 +125,16 @@ func (self Config) validateForScope(scope ownerScope) error {
 	leasePaths := map[string]bool{}
 	mounts := map[string]bool{}
 	for _, volume := range self.Volumes {
-		canonicalMount := canonical(volume.MountPath) || scope == ownerLocalScope && volume.MountPath == "/"
+		canonicalMount := canonical(volume.MountPath) || volume.MountPath == "/"
 		if !canonicalMount || mounts[volume.MountPath] || !canonical(volume.MarkerPath) || !beneath(volume.MountPath, volume.MarkerPath) ||
 			!validDigest(volume.MarkerSha256) || len(volume.StateRoots) == 0 || len(volume.StateRoots) > 64 || volume.MinAvailableBytes == 0 || volume.MinAvailableInodes == 0 {
 			return errors.New("durable volume identity, roots or positive reserve is incomplete")
 		}
 		mounts[volume.MountPath] = true
 		identityPaths = append(identityPaths, volume.MarkerPath)
-		if volume.FilesystemType != "ext4" && volume.FilesystemType != "xfs" && volume.FilesystemType != "btrfs" {
+		// The declaration format is platform-neutral; each host admits only
+		// its own qualified types (ext4/xfs/btrfs on Linux, apfs on Darwin).
+		if volume.FilesystemType != "ext4" && volume.FilesystemType != "xfs" && volume.FilesystemType != "btrfs" && volume.FilesystemType != "apfs" {
 			return errors.New("durable volume filesystem type is unsupported")
 		}
 		if len(volume.FilesystemUuid) < 4 || len(volume.FilesystemUuid) > 64 {

@@ -14,7 +14,7 @@ import (
 )
 
 // defaultStunServerUrls is the shipped high-collateral STUN pool. It keeps the
-// two anycast servers connect used before (cloudflare, google, both live and
+// two anycast servers connect used before (cloudflare, google — both live and
 // very high collateral) and adds the public high-collateral set documented for
 // Snowflake, so a per-session subset is unlikely to be all-dead.
 //

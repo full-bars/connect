@@ -398,7 +398,8 @@ type ContractManagerSettings struct {
 	// its queue, for a destination that is never used again), and prevents
 	// handing out a stale contract the platform may have already force-closed
 	// server-side — keep this below the platform's unused-contract force-close
-	// window (5 minutes). <= 0 disables expiry.
+	// window (5 minutes). <= 0 disables enqueue-age expiry; signed absolute
+	// deadlines always apply.
 	ContractQueueExpireTimeout time.Duration
 
 	// the epoch for emitting open contract usage events to
@@ -406,6 +407,11 @@ type ContractManagerSettings struct {
 	ContractStatsEpoch time.Duration
 
 	ProtocolVersion int
+
+	// ProxyDescription is a human-readable identifier for the proxy this
+	// manager's client runs behind (e.g. "proxy[15304] (216.26.234.33:1081)"
+	// or "proxy[0] (direct)"). When set, contract lifecycle logs include it.
+	ProxyDescription string
 
 	// TODO remove
 	LegacyCreateContract bool
@@ -444,6 +450,9 @@ type ContractManager struct {
 	provideMonitor *Monitor
 
 	destinationContracts map[ContractKey]*contractQueue
+	// Protected by mutex. Contract-free clients need no expiry worker; once
+	// a contract is queued, the worker remains owned through its final flush.
+	contractExpiryStarted bool
 
 	receiveNoContractClientIds map[Id]bool
 	sendNoContractClientIds    map[Id]bool
@@ -541,7 +550,6 @@ func NewContractManager(
 		contractManager.startWorker("provide ping", contractManager.providePing)
 	}
 
-	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
 	if directory, err := originalContractCreationDirectory(settings); err != nil {
 		client.log.Errorf("[contract]original request custody configuration unavailable: %v", err)
 	} else {
@@ -654,6 +662,12 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 // otherwise be retained forever.
 func (self *ContractManager) expireQueuedContracts() {
 	timeout := self.settings.ContractQueueExpireTimeout
+	// Absolute deadlines still retire idle reservations when enqueue-age
+	// expiry is disabled. Poll independently enforces the exact deadline.
+	interval := time.Minute
+	if 0 < timeout {
+		interval = max(time.Nanosecond, min(interval, timeout/2))
+	}
 
 	// the contract manager is closing: close all still-queued (pending)
 	// contracts so their escrow is released promptly. `closeContracts`
@@ -682,13 +696,6 @@ func (self *ContractManager) expireQueuedContracts() {
 	}
 
 	for {
-		// when expiry is disabled the nil tick channel blocks forever and the
-		// loop only waits for shutdown
-		var tick <-chan time.Time
-		if 0 < timeout {
-			tick = time.After(timeout / 2)
-		}
-
 		select {
 		case <-self.ctx.Done():
 			finalFlush()
@@ -698,10 +705,13 @@ func (self *ContractManager) expireQueuedContracts() {
 			// is the shutdown signal
 			finalFlush()
 			return
-		case <-tick:
+		case <-time.After(interval):
 		}
 
-		minEnqueueTime := time.Now().Add(-timeout)
+		var minEnqueueTime time.Time
+		if 0 < timeout {
+			minEnqueueTime = time.Now().Add(-timeout)
+		}
 		expired := self.expireQueuedContractsBefore(minEnqueueTime)
 		if 0 < len(expired) {
 			if self.client.log.V(1).Enabled() {
@@ -733,7 +743,7 @@ func (self *ContractManager) expireQueuedContractsBefore(
 			self.hasOpenContractForKeyWithLock(contractKey) {
 			// Keep the newest successor even when it outlives the orphan
 			// timeout, but do not retain every delayed/retried create result.
-			// One stale successor is sufficient to make rollover immediate;
+			// One unexpired stale successor makes rollover immediate;
 			// retaining all of them would make a slow live sequence an
 			// unbounded memory/escrow sink.
 			expired = append(
@@ -992,6 +1002,17 @@ func (self *ContractManager) handleControlFrameForQueue(
 					Key:     contractKey,
 					Premium: premium,
 				}
+				// The clearest signal that this provider is moving traffic:
+				// v33 emitted this line on every contract it acquired, and the
+				// engine port dropped it.
+				proxyTag := ""
+				if self.settings != nil && self.settings.ProxyDescription != "" {
+					proxyTag = " " + self.settings.ProxyDescription
+				}
+				self.client.log.Infof("💚 [contract] acquired%s size=%s destination=%s\n",
+					proxyTag,
+					ByteCountHumanReadable(ByteCount(storedContract.GetTransferByteCount())),
+					contractKey.Destination.DestinationId)
 				return nil
 			}
 			if self.client.log.V(2).Enabled() {
@@ -1516,6 +1537,26 @@ func (self *ContractManager) TakeContract(
 	}
 }
 
+// Whether the queue for this key holds a contract that a take would hand out
+// now: enqueued within the expiry window and before its signed deadline. A
+// sequence whose successor is already queued has nothing to request. Read-only:
+// it neither creates a queue nor expires anything.
+func (self *ContractManager) hasQueuedContract(contractKey ContractKey) bool {
+	if self.settings.LegacyCreateContract {
+		contractKey = contractKey.Legacy()
+	}
+	var minEnqueueTime time.Time
+	if 0 < self.settings.ContractQueueExpireTimeout {
+		minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
+	}
+	contractQueue := func() *contractQueue {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return self.destinationContracts[contractKey]
+	}()
+	return contractQueue != nil && contractQueue.hasContract(minEnqueueTime)
+}
+
 func (self *ContractManager) hasOpenContractForKey(contractKey ContractKey) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -1574,10 +1615,18 @@ func (self *ContractManager) addContractToQueue(
 	// path, never repopulate a queue that no worker will consume or flush again.
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.closed {
+	if self.closed || self.ctx.Err() != nil || self.client.IsDone() {
 		return errContractQueueDrained
 	}
-	return contractQueue.Add(contract, storedContract)
+	if err := contractQueue.Add(contract, storedContract); err != nil {
+		return err
+	}
+	if !self.contractExpiryStarted {
+		// This admission shares Close's lock, so a successfully queued result
+		// always has a joined final-flush owner, even when expiry is disabled.
+		self.contractExpiryStarted = self.startWorker("contract expiry", self.expireQueuedContracts)
+	}
+	return nil
 }
 
 // Coalesces an identical pending request within its exact queue generation.
@@ -2072,8 +2121,9 @@ func (self *ContractManager) closeContractQueueWithForceRemove(
 // a contract waiting in the queue, stamped so unconsumed contracts can be
 // expired (see `ContractQueueExpireTimeout`)
 type queuedContract struct {
-	contract    *protocol.Contract
-	enqueueTime time.Time
+	contract                *protocol.Contract
+	enqueueTime             time.Time
+	expirationTimeUnixMilli *int64
 }
 
 // The original key also fences legacy queues that intentionally collapse
@@ -2158,7 +2208,7 @@ func (self *contractQueue) Close() {
 // `minEnqueueTime` — stale entries are removed and returned as `expired` for
 // the caller to close (the platform force-closes unused contracts, so a stale
 // queued contract may already be settled server-side). A zero `minEnqueueTime`
-// expires nothing.
+// disables enqueue-age expiry; signed absolute deadlines always apply.
 func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, []*protocol.Contract) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2173,7 +2223,24 @@ func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, [
 	return nil, expired
 }
 
-// Expire removes and returns all contracts enqueued before `minEnqueueTime`.
+// Whether Poll at `minEnqueueTime` would return a contract, without removing
+// or expiring any.
+func (self *contractQueue) hasContract(minEnqueueTime time.Time) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	currentTimeUnixMilli := time.Now().UnixMilli()
+	for _, queuedContract := range self.contracts {
+		if queuedContract.enqueueTime.Before(minEnqueueTime) ||
+			(queuedContract.expirationTimeUnixMilli != nil && *queuedContract.expirationTimeUnixMilli <= currentTimeUnixMilli) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// Removes contracts past their signed deadline or enqueue-age cutoff.
 func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2182,27 +2249,34 @@ func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract
 }
 
 // ExpireBeforeKeepingNewest expires stale entries while retaining at most one
-// stale successor. If a non-stale successor exists, every stale entry can be
-// removed; otherwise the newest stale entry is the bounded rollover reserve.
+// stale successor whose signed deadline is still valid. If a non-stale
+// successor exists, every stale entry can be removed; otherwise the newest
+// unexpired stale entry is the bounded rollover reserve.
 func (self *contractQueue) ExpireBeforeKeepingNewest(
 	minEnqueueTime time.Time,
 ) []*protocol.Contract {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if minEnqueueTime.IsZero() || len(self.contracts) == 0 {
+	if len(self.contracts) == 0 {
 		return nil
 	}
+	currentTimeUnixMilli := time.Now().UnixMilli()
+	expired := []*protocol.Contract{}
 	var newestId Id
 	var newestTime time.Time
 	for contractId, queued := range self.contracts {
+		if queued.expirationTimeUnixMilli != nil && *queued.expirationTimeUnixMilli <= currentTimeUnixMilli {
+			expired = append(expired, queued.contract)
+			delete(self.contracts, contractId)
+			continue
+		}
 		if newestTime.IsZero() || newestTime.Before(queued.enqueueTime) {
 			newestId = contractId
 			newestTime = queued.enqueueTime
 		}
 	}
 
-	expired := []*protocol.Contract{}
 	for contractId, queued := range self.contracts {
 		if queued.enqueueTime.Before(minEnqueueTime) &&
 			(contractId != newestId || !newestTime.Before(minEnqueueTime)) {
@@ -2215,8 +2289,10 @@ func (self *contractQueue) ExpireBeforeKeepingNewest(
 
 func (self *contractQueue) expireWithLock(minEnqueueTime time.Time) []*protocol.Contract {
 	var expired []*protocol.Contract
+	currentTimeUnixMilli := time.Now().UnixMilli()
 	for contractId, queuedContract := range self.contracts {
-		if queuedContract.enqueueTime.Before(minEnqueueTime) {
+		if queuedContract.enqueueTime.Before(minEnqueueTime) ||
+			(queuedContract.expirationTimeUnixMilli != nil && *queuedContract.expirationTimeUnixMilli <= currentTimeUnixMilli) {
 			expired = append(expired, queuedContract.contract)
 			delete(self.contracts, contractId)
 		}
@@ -2242,8 +2318,9 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 			self.log.Infof("[contract]add update existing %s\n", contractId)
 		}
 		self.contracts[contractId] = &queuedContract{
-			contract:    contract,
-			enqueueTime: time.Now(),
+			contract:                contract,
+			enqueueTime:             time.Now(),
+			expirationTimeUnixMilli: storedContract.ExpirationTimeUnixMilli,
 		}
 		self.updateMonitor.NotifyAll()
 	} else if !self.trackUsedContracts || !self.usedContractIds[contractId] {
@@ -2254,8 +2331,9 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 			self.usedContractIds[contractId] = true
 		}
 		self.contracts[contractId] = &queuedContract{
-			contract:    contract,
-			enqueueTime: time.Now(),
+			contract:                contract,
+			enqueueTime:             time.Now(),
+			expirationTimeUnixMilli: storedContract.ExpirationTimeUnixMilli,
 		}
 		self.updateMonitor.NotifyAll()
 	} else {

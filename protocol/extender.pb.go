@@ -526,6 +526,42 @@ type ExtenderRecordBody struct {
 	// CountryCode at signing, the same mapping the geo dns uses. Empty on
 	// records that predate it.
 	ContinentCode string `protobuf:"bytes,12,opt,name=ContinentCode,proto3" json:"ContinentCode,omitempty"`
+	// The directory tier the operator placed the extender in (EXTENDER.md
+	// Q1): 0 is the open tier, which the geo dns sets, the feed and the
+	// cleartext gossip carry, and 1 is the gated tier, released only to an
+	// authenticated identity and carried by no open channel. A reader that
+	// predates the field sees 0, and a record that predates it is open.
+	DirectoryTier uint32 `protobuf:"varint,13,opt,name=DirectoryTier,proto3" json:"DirectoryTier,omitempty"`
+	// The 16 byte client id the extender's device is reachable under on the
+	// exchange, which is the rendezvous of its peer-to-peer webrtc carrier
+	// (EXTENDER.md S, C2a): a dialer sends its SDP offer to this id through
+	// the exchange signaling and the extender answers. Set only when an
+	// address of the record lists the webrtc carrier; empty on every other
+	// record and on records that predate the field.
+	WebRtcClientId []byte `protobuf:"bytes,14,opt,name=WebRtcClientId,proto3" json:"WebRtcClientId,omitempty"`
+	// The 32 byte X25519 static public key of the extender camouflage
+	// (EXTENDER.md P1, P6), derived from the identity seed. A client fronts the
+	// tcp carrier with an authenticated browser hello sealed under it. Signed
+	// with the rest of the body; a reader that predates the field skips it and
+	// simply does not dial the camouflaged carrier. Empty on an extender with
+	// camouflage off and on records that predate the field. Field 13 and 14
+	// were taken by DirectoryTier and WebRtcClientId after P was written, so
+	// this is field 15, not the 13 section P names.
+	RealityPublicKey []byte `protobuf:"bytes,15,opt,name=RealityPublicKey,proto3" json:"RealityPublicKey,omitempty"`
+	// Exclusive discovery channel of an operator canary. Empty preserves
+	// ordinary tier behavior. Canary records also use the gated wire tier
+	// so older tier-aware readers cannot relay them on open channels.
+	CanaryChannel string `protobuf:"bytes,16,opt,name=CanaryChannel,proto3" json:"CanaryChannel,omitempty"`
+	// The 16 byte id of the extender, set when the operator signs the record
+	// of an extender that holds an issued, unexpired measurement certificate
+	// whose measurement name is published, so the name already resolves
+	// (lag.dev/PLAN.md C8, C10). A feed or gossip reader then knows the
+	// extender serves the lag.dev measurement API (M), and that its
+	// measurement name is this id in the measurement zone (N1). Only open
+	// tier extenders that are not canaries ever hold a certificate. Empty on
+	// an extender that does not serve the API or whose name is not published,
+	// and on records that predate the field.
+	MeasurementId []byte `protobuf:"bytes,17,opt,name=MeasurementId,proto3" json:"MeasurementId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -642,6 +678,41 @@ func (x *ExtenderRecordBody) GetContinentCode() string {
 		return x.ContinentCode
 	}
 	return ""
+}
+
+func (x *ExtenderRecordBody) GetDirectoryTier() uint32 {
+	if x != nil {
+		return x.DirectoryTier
+	}
+	return 0
+}
+
+func (x *ExtenderRecordBody) GetWebRtcClientId() []byte {
+	if x != nil {
+		return x.WebRtcClientId
+	}
+	return nil
+}
+
+func (x *ExtenderRecordBody) GetRealityPublicKey() []byte {
+	if x != nil {
+		return x.RealityPublicKey
+	}
+	return nil
+}
+
+func (x *ExtenderRecordBody) GetCanaryChannel() string {
+	if x != nil {
+		return x.CanaryChannel
+	}
+	return ""
+}
+
+func (x *ExtenderRecordBody) GetMeasurementId() []byte {
+	if x != nil {
+		return x.MeasurementId
+	}
+	return nil
 }
 
 type ExtenderRecord struct {
@@ -1275,7 +1346,7 @@ const file_extender_proto_rawDesc = "" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\x9e\x03\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xe4\x04\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
@@ -1289,7 +1360,12 @@ const file_extender_proto_rawDesc = "" +
 	"\vNetworkHost\x18\n" +
 	" \x01(\tR\vNetworkHost\x12\x1a\n" +
 	"\bDnsPorts\x18\v \x03(\rR\bDnsPorts\x12$\n" +
-	"\rContinentCode\x18\f \x01(\tR\rContinentCode\"h\n" +
+	"\rContinentCode\x18\f \x01(\tR\rContinentCode\x12$\n" +
+	"\rDirectoryTier\x18\r \x01(\rR\rDirectoryTier\x12&\n" +
+	"\x0eWebRtcClientId\x18\x0e \x01(\fR\x0eWebRtcClientId\x12*\n" +
+	"\x10RealityPublicKey\x18\x0f \x01(\fR\x10RealityPublicKey\x12$\n" +
+	"\rCanaryChannel\x18\x10 \x01(\tR\rCanaryChannel\x12$\n" +
+	"\rMeasurementId\x18\x11 \x01(\fR\rMeasurementId\"h\n" +
 	"\x0eExtenderRecord\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +

@@ -99,8 +99,14 @@ type extenderOptions struct {
 	listen       func(network string, address string) (net.Listener, error)
 	listenPacket func(network string, address string) (net.PacketConn, error)
 	// dialContext, when set, is the inner dial of every control request this
-	// command makes. The test maps its synthetic operator names to loopback.
+	// command makes, and of every tcp carrier dial: the network client's, the
+	// peer pinger's and the mesh's. The test maps its synthetic operator names
+	// to loopback.
 	dialContext connect.DialContextFunction
+	// packetConnFactory, when set with dialContext, opens the udp endpoint of
+	// every quic and dns carrier dial. The test refuses through it every
+	// destination off the machine, such as the address an activation returns.
+	packetConnFactory func(ctx context.Context) (net.PacketConn, error)
 	// configureNetworkClient, when set, adjusts the network client settings
 	// before it is built. The test installs an in-process resolver so the dns
 	// bootstrap never leaves the machine.
@@ -112,6 +118,20 @@ type extenderOptions struct {
 	// how often the admission counts are read for the log. The test reads
 	// them without waiting out the minute.
 	admissionLogTimeout time.Duration
+
+	// whether this extender serves the lag.dev measurement API and asks the
+	// operator for its certificate (lag.dev/PLAN.md C4, M): the owner's
+	// `measurement.enabled`, on unless --no_measurement. It also takes an
+	// identity kept in a file (newMeasurementCert). The zero value is off,
+	// which is what a test that builds the options itself gets.
+	measurementEnabled bool
+	// the zone of the measurement name (N1), empty for
+	// connect.ExtenderMeasurementZone
+	measurementZone string
+	// configureLagLifecycle, when set, adjusts the measurement lifecycle's
+	// settings before the server is built. The test shortens the certificate
+	// poll through it.
+	configureLagLifecycle func(settings *extender.ExtenderLagLifecycleSettings)
 }
 
 // Reads the extender command's flags. Zero ports take the fixed carrier ports
@@ -137,6 +157,15 @@ func extenderOptionsFromOpts(opts docopt.Opts) (*extenderOptions, error) {
 	}
 	if keyFile, err := opts.String("--extender_key_file"); err == nil {
 		options.keyFile = keyFile
+	}
+	// the measurement API is on unless the owner turns it off (lag.dev/PLAN.md
+	// C4, M10)
+	options.measurementEnabled = true
+	if noMeasurement, err := opts.Bool("--no_measurement"); err == nil && noMeasurement {
+		options.measurementEnabled = false
+	}
+	if measurementZone, err := opts.String("--measurement_zone"); err == nil {
+		options.measurementZone = strings.TrimSpace(measurementZone)
 	}
 	if stateDir, err := opts.String("--state_dir"); err == nil {
 		options.stateDir = stateDir
@@ -413,6 +442,9 @@ type extenderRun struct {
 	activator      *connect.ExtenderActivator
 	pingReporter   *connect.ExtenderPingReporter
 	peerPinger     *connect.ExtenderPeerPinger
+	// the lag.dev measurement key and certificate (lag.dev/PLAN.md C4), nil
+	// when this extender serves no measurement API
+	measurementCert *extender.ExtenderMeasurementCert
 
 	serveDone chan error
 	closers   []func()
@@ -473,13 +505,15 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		return nil, err
 	}
 	Out.Printf("extender public key: %s", hex.EncodeToString(run.publicKey))
+	run.measurementCert = run.newMeasurementCert()
 
 	// direct only: an activation that crossed an extender would tell the
 	// operator that extender's address, not this host's (C2)
 	strategySettings := connect.DefaultClientStrategySettings()
 	if options.dialContext != nil {
 		strategySettings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
-			DialContext: options.dialContext,
+			DialContext:       options.dialContext,
+			PacketConnFactory: options.packetConnFactory,
 		}
 	}
 	run.clientStrategy = connect.NewDirectClientStrategy(ctx, strategySettings, 0)
@@ -513,6 +547,11 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	// the mesh addresses are published per activated family, which has not
 	// happened yet (D2)
 	nodeSettings.ExtenderListener = run.listener
+	if options.dialContext != nil {
+		// the mesh dials its peers through the same seams as the strategy
+		nodeSettings.ConnectSettings = connect.DefaultConnectSettings()
+		nodeSettings.ConnectSettings.DialContextSettings = strategySettings.ConnectSettings.DialContextSettings
+	}
 	if run.node, err = gossip.NewNode(ctx, nodeSettings); err != nil {
 		return nil, err
 	}
@@ -554,6 +593,9 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 			Out.Printf("extender nlayer hop %d: %s", index, extenderHopDescription(hop))
 		}
 	}
+	// the lag.dev measurement API and the lifecycle behind it (lag.dev/PLAN.md
+	// C4, M3, M10), or no API at all
+	run.measurementSettings(serverSettings)
 	// the admission limits of this instance (A12)
 	serverSettings.AdmissionSubnetsPerMinute = options.admissionSubnetsPerMinute
 	serverSettings.AdmissionActionsPerSubnetPerMinute = options.admissionActionsPerSubnetPerMinute
@@ -622,7 +664,27 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	activatorSettings.Carriers = run.server.Carriers
 	activatorSettings.Directory = run.directory
 	activatorSettings.OnActivated = run.activated
+	if run.measurementCert != nil {
+		// the activation carries the measurement certificate request, named by
+		// the id its answers report (lag.dev/PLAN.md C4, N4)
+		activatorSettings.MeasurementCsr = run.measurementCert.ActivationCsr
+	} else if run.identityKeyFile() != "" {
+		// a kept identity with no measurement certificate: the owner opted
+		// out, or the measurement key cannot be used. Either way this
+		// extender answers no measurement name, so every activation says so,
+		// and a name it had is withdrawn (C4, C9) rather than renewed and
+		// offered to lag.dev with nothing answering it. An ephemeral identity
+		// has no name to withdraw.
+		activatorSettings.MeasurementDisabled = func() bool {
+			return true
+		}
+	}
 	run.activator = connect.NewExtenderActivator(ctx, activatorSettings)
+	if run.measurementCert != nil {
+		// the operator holding another key's request or certificate asks for a
+		// pass at once, which carries this key's request (C4)
+		run.measurementCert.SetReactivate(run.activator.Reactivate)
+	}
 	run.closers = append(run.closers, run.activator.Close)
 
 	if networkClientSettings := run.networkClientSettings(); networkClientSettings != nil {
@@ -663,6 +725,7 @@ func (self *extenderRun) run(ctx context.Context) error {
 	ipVersionLines := map[int]string{}
 	pingerLine := ""
 	admissionLine := ""
+	measurementLine := ""
 	admissionLogTimeout := extenderAdmissionLogTimeout
 	if 0 < self.options.admissionLogTimeout {
 		admissionLogTimeout = self.options.admissionLogTimeout
@@ -693,6 +756,15 @@ func (self *extenderRun) run(ctx context.Context) error {
 			admissionLine = line
 			Out.Printf("%s", line)
 		}
+		// a nil channel never fires, which is a run with no measurement API
+		var measurementChange chan struct{}
+		if self.measurementCert != nil {
+			_, measurementChange = self.measurementCert.ChangeMonitor().Get()
+			if line := extenderMeasurementLine(self.measurementCert); line != measurementLine {
+				measurementLine = line
+				Out.Printf("%s", line)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -701,6 +773,7 @@ func (self *extenderRun) run(ctx context.Context) error {
 			return err
 		case <-change:
 		case <-pingerChange:
+		case <-measurementChange:
 		case <-time.After(admissionLogTimeout):
 		}
 	}
@@ -717,6 +790,21 @@ func extenderAdmissionStatsLine(stats extender.ExtenderAdmissionStats) string {
 		stats.LimitedBySubnetsCount,
 		stats.LimitedBySourceCount,
 		stats.UnlimitedCount,
+	)
+}
+
+// The measurement certificate as a log line (lag.dev/PLAN.md C4): the name it
+// serves and until when, or that there is none to serve -- before the operator
+// issues one, and after it expires or is withdrawn.
+func extenderMeasurementLine(measurementCert *extender.ExtenderMeasurementCert) string {
+	names, certificate := measurementCert.Certificate()
+	if certificate == nil || certificate.Leaf == nil {
+		return "extender measurement: no certificate"
+	}
+	return fmt.Sprintf(
+		"extender measurement: serving %s until %s",
+		strings.Join(names, ","),
+		certificate.Leaf.NotAfter.Format(time.RFC3339),
 	)
 }
 
@@ -811,13 +899,83 @@ func (self *extenderRun) activated(ipVersion int, result *connect.ExtenderActiva
 	}
 }
 
-// The identity key (B1): the file's seed, a new seed written to it, or an
-// ephemeral one when there is nowhere to keep it.
-func (self *extenderRun) identityKeySeed() ([]byte, error) {
+// The file the identity key is kept in (B1): --extender_key_file, else the
+// state dir's dot file, else "" for an ephemeral identity.
+func (self *extenderRun) identityKeyFile() string {
 	keyFile := strings.TrimSpace(self.options.keyFile)
 	if keyFile == "" && strings.TrimSpace(self.options.stateDir) != "" {
 		keyFile = filepath.Join(self.options.stateDir, extenderKeyFileName)
 	}
+	return keyFile
+}
+
+// The measurement key and certificate (lag.dev/PLAN.md C4), or nil when this
+// extender serves no measurement API: the owner turned it off, or the identity
+// is ephemeral. The operator names the certificate by the extender's id, one
+// per identity key, so an identity that is new at every start would ask for a
+// new certificate each time; and the measurement key is kept beside the
+// identity's file, which an ephemeral identity has none of. A key that cannot
+// be read leaves measurement off rather than the extender down, and the
+// activation then asks the operator to withdraw the name, as for an opt-out.
+func (self *extenderRun) newMeasurementCert() *extender.ExtenderMeasurementCert {
+	if !self.options.measurementEnabled {
+		Out.Printf("extender measurement: off")
+		return nil
+	}
+	keyFile := self.identityKeyFile()
+	if keyFile == "" {
+		Err.Printf("extender measurement: off, the identity is ephemeral; pass --extender_key_file or --state_dir to keep it")
+		return nil
+	}
+	measurementKeyFile := extender.ExtenderMeasurementKeyPath(keyFile)
+	measurementCert, err := extender.NewExtenderMeasurementCert(measurementKeyFile, self.options.measurementZone)
+	if err != nil {
+		Err.Printf(
+			"extender measurement: off, the measurement key %s is not usable, so every activation asks the operator to withdraw this extender's measurement name: %s",
+			measurementKeyFile,
+			err,
+		)
+		return nil
+	}
+	return measurementCert
+}
+
+// The measurement settings of the server (lag.dev/PLAN.md C4, M3, M10). With a
+// measurement certificate: the API's admission trusts the root keys the
+// directory trusts for records, read at each ticket so a rotation applies at
+// once, and the network hosts its records are for; and the lifecycle polls the
+// certificate and posts reports under the activation credential. Without one,
+// no API at all, so a hello for a measurement name takes the existing path.
+func (self *extenderRun) measurementSettings(serverSettings *extender.ExtenderSettings) {
+	if self.measurementCert == nil {
+		serverSettings.Measurement.Enabled = false
+		serverSettings.LagLifecycle = nil
+		return
+	}
+	directory := self.directory
+	serverSettings.Measurement.RootPublicKeys = func() []ed25519.PublicKey {
+		return directory.RootKeys().PublicKeys()
+	}
+	serverSettings.Measurement.NetworkHosts = self.networkHosts()
+
+	lagSettings := extender.DefaultExtenderLagLifecycleSettings()
+	lagSettings.Certificate = self.measurementCert
+	lagSettings.ApiUrl = self.options.apiUrl
+	jwt := self.options.jwt
+	lagSettings.ByJwt = func() string {
+		return jwt
+	}
+	lagSettings.ClientStrategy = self.clientStrategy
+	if self.options.configureLagLifecycle != nil {
+		self.options.configureLagLifecycle(lagSettings)
+	}
+	serverSettings.LagLifecycle = lagSettings
+}
+
+// The identity key (B1): the file's seed, a new seed written to it, or an
+// ephemeral one when there is nowhere to keep it.
+func (self *extenderRun) identityKeySeed() ([]byte, error) {
+	keyFile := self.identityKeyFile()
 	if keyFile == "" {
 		Err.Printf("extender identity is ephemeral; pass --extender_key_file to keep it")
 		return connect.NewExtenderKeySeed()

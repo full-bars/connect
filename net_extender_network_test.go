@@ -156,8 +156,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 		t.Fatal("the bootstrap never resolved")
 	}
 
-	// the change monitor is the barrier; the pass applies the hello keys before
-	// it adds the bootstrap addresses, so these landing proves the keys did
 	waitForDirectoryAddresses(t, directory, map[string]string{
 		"192.0.2.200":   ExtenderSourceDns,
 		"2001:db8::200": ExtenderSourceDns,
@@ -169,6 +167,19 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if entry.State != ExtenderStateUnverified && entry.State != ExtenderStateHold && entry.State != ExtenderStateWarning {
 		t.Fatalf("state = %s, expected an unverified bootstrap address", entry.State)
 	}
+
+	// the same answer carries the operator's gossip identity, which the member
+	// role's node dials (C6, D3). Hello runs beside the pass, and the status
+	// names the identity once the keys that came with it are in force, so it
+	// is the barrier for them too.
+	waitForExtenderNetworkStatus(
+		t,
+		networkClient,
+		"the operator gossip peer id",
+		func(status ExtenderNetworkClientStatus) bool {
+			return status.GossipPeerId == testExtenderGossipPeerId
+		},
+	)
 
 	// the hello keys are the anchor now, so a record signed by them applies
 	record := signTestRecord(
@@ -182,17 +193,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
 		t.Fatalf("the hello root keys were never applied: %v", err)
 	}
-
-	// the same answer carries the operator's gossip identity, which the member
-	// role's node dials (C6, D3)
-	waitForExtenderNetworkStatus(
-		t,
-		networkClient,
-		"the operator gossip peer id",
-		func(status ExtenderNetworkClientStatus) bool {
-			return status.GossipPeerId == testExtenderGossipPeerId
-		},
-	)
 }
 
 // The first attempt is marked complete even when nothing answers, so the
@@ -244,6 +244,48 @@ func TestExtenderNetworkClientRebootstrapsBelowTheLowWaterMark(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("the bootstrap did not repeat below the low-water mark (pass %d)", i)
 		}
+	}
+}
+
+// A name that answers NXDOMAIN parks the bootstrap instead of being asked
+// again on every pass. The low-water condition above is true forever while
+// the name is dead, which is what turned one missing name into a resolver
+// and log flood (the 2026-10-18 field report).
+func TestExtenderNetworkClientDefinitiveDnsMissParksTheBootstrap(t *testing.T) {
+	clock := newTestClock()
+	var resolveCount atomic.Int64
+	_, rootPublicKey := newTestRootKeyPair(t)
+	_, _, _ = newTestExtenderNetworkClient(t, clock, func(settings *ExtenderNetworkClientSettings) {
+		settings.LowWaterCount = 4
+		settings.DefinitiveDnsMissCooldown = time.Hour
+		// the TXT answers wait for root keys, so the hello must install one
+		// before a resolution happens at all
+		settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
+			return &ExtenderHelloResult{
+				RootPublicKeyHexes: []string{ExtenderKeySeedHex(rootPublicKey)},
+			}, nil
+		}
+		settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+			resolveCount.Add(1)
+			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+		}
+		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for resolveCount.Load() == 0 {
+		if deadline.Before(time.Now()) {
+			t.Fatal("the bootstrap never resolved")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	first := resolveCount.Load()
+	// the pass cadence in this fixture is milliseconds; without the park the
+	// count grows with every pass
+	time.Sleep(250 * time.Millisecond)
+	if got := resolveCount.Load(); got != first {
+		t.Fatalf("the bootstrap re-asked a dead name: %d -> %d resolutions", first, got)
 	}
 }
 

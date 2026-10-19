@@ -1108,9 +1108,18 @@ type Auth struct {
 	// 4 or 6. Zero (absent) is a legacy family-agnostic transport, which the
 	// platform counts as v4. The platform ignores the intent unless the
 	// family it observed the connection arrive on agrees.
-	IpFamily      int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	IpFamily int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	// the client intends to provide publicly on this connection. The platform
+	// then judges the client as a provider instead of counting it toward the
+	// network's concurrent client limit. This is the frame form of the H1
+	// `X-UR-Provide-Intent: 1` header, for transports that authenticate with
+	// this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
+	// server ignores the unknown field, which counts as no intent.
+	ProvideIntent      bool   `protobuf:"varint,7,opt,name=provide_intent,json=provideIntent,proto3" json:"provide_intent,omitempty"`
+	ClientInfo         string `protobuf:"bytes,8,opt,name=client_info,json=clientInfo,proto3" json:"client_info,omitempty"`
+	StreamLeaseVersion uint32 `protobuf:"varint,9,opt,name=stream_lease_version,json=streamLeaseVersion,proto3" json:"stream_lease_version,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Auth) Reset() {
@@ -1181,6 +1190,27 @@ func (x *Auth) GetH3DatagramAcceptedVersion() uint32 {
 func (x *Auth) GetIpFamily() int32 {
 	if x != nil {
 		return x.IpFamily
+	}
+	return 0
+}
+
+func (x *Auth) GetProvideIntent() bool {
+	if x != nil {
+		return x.ProvideIntent
+	}
+	return false
+}
+
+func (x *Auth) GetClientInfo() string {
+	if x != nil {
+		return x.ClientInfo
+	}
+	return ""
+}
+
+func (x *Auth) GetStreamLeaseVersion() uint32 {
+	if x != nil {
+		return x.StreamLeaseVersion
 	}
 	return 0
 }
@@ -1286,7 +1316,10 @@ func (x *ProvideKey) GetProvideSecretKey() []byte {
 // including the first and last hops
 // this is sent each time a stream contract is created
 type StreamOpen struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
+	state                           protoimpl.MessageState `protogen:"open.v1"`
+	AuthorizationGeneration         []byte                 `protobuf:"bytes,4,opt,name=authorization_generation,json=authorizationGeneration,proto3" json:"authorization_generation,omitempty"`
+	AuthorizationLeaseMillis        uint32                 `protobuf:"varint,5,opt,name=authorization_lease_millis,json=authorizationLeaseMillis,proto3" json:"authorization_lease_millis,omitempty"`
+	AuthorizationDeadlineUnixMillis int64                  `protobuf:"varint,6,opt,name=authorization_deadline_unix_millis,json=authorizationDeadlineUnixMillis,proto3" json:"authorization_deadline_unix_millis,omitempty"`
 	// ulid
 	SourceId []byte `protobuf:"bytes,2,opt,name=source_id,json=sourceId,proto3,oneof" json:"source_id,omitempty"`
 	// ulid
@@ -1327,6 +1360,27 @@ func (*StreamOpen) Descriptor() ([]byte, []int) {
 	return file_transfer_proto_rawDescGZIP(), []int{10}
 }
 
+func (x *StreamOpen) GetAuthorizationGeneration() []byte {
+	if x != nil {
+		return x.AuthorizationGeneration
+	}
+	return nil
+}
+
+func (x *StreamOpen) GetAuthorizationLeaseMillis() uint32 {
+	if x != nil {
+		return x.AuthorizationLeaseMillis
+	}
+	return 0
+}
+
+func (x *StreamOpen) GetAuthorizationDeadlineUnixMillis() int64 {
+	if x != nil {
+		return x.AuthorizationDeadlineUnixMillis
+	}
+	return 0
+}
+
 func (x *StreamOpen) GetSourceId() []byte {
 	if x != nil {
 		return x.SourceId
@@ -1351,7 +1405,8 @@ func (x *StreamOpen) GetStreamId() []byte {
 // each hop on the stream receives this to configure its state
 // this is sent when all open contracts for the stream are closed
 type StreamClose struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	AuthorizationGeneration []byte                 `protobuf:"bytes,4,opt,name=authorization_generation,json=authorizationGeneration,proto3" json:"authorization_generation,omitempty"`
 	// ulid
 	StreamId      []byte `protobuf:"bytes,3,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1386,6 +1441,13 @@ func (x *StreamClose) ProtoReflect() protoreflect.Message {
 // Deprecated: Use StreamClose.ProtoReflect.Descriptor instead.
 func (*StreamClose) Descriptor() ([]byte, []int) {
 	return file_transfer_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *StreamClose) GetAuthorizationGeneration() []byte {
+	if x != nil {
+		return x.AuthorizationGeneration
+	}
+	return nil
 }
 
 func (x *StreamClose) GetStreamId() []byte {
@@ -1635,8 +1697,16 @@ type ExchangeSignals struct {
 	// initial WaitingForSdpOffer from a newly restarted passive association.
 	// Older peers omit/ignore it and retain the legacy compatibility path.
 	SenderGenerationId []byte `protobuf:"bytes,4,opt,name=sender_generation_id,json=senderGenerationId,proto3" json:"sender_generation_id,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// True for the signaling of the peer-to-peer webrtc extender carrier
+	// (EXTENDER.md S): a dialer's SDP offer to an extender and the extender's
+	// SDP answer, keyed by stream_id like a p2p negotiation but never bound
+	// to a transport peer connection. A receiver that predates the field
+	// sees an offer for a stream it has no peer connection for and drops it,
+	// which is the compatibility path: an old extender simply does not
+	// answer.
+	ExtenderCarrier bool `protobuf:"varint,5,opt,name=extender_carrier,json=extenderCarrier,proto3" json:"extender_carrier,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ExchangeSignals) Reset() {
@@ -1695,6 +1765,13 @@ func (x *ExchangeSignals) GetSenderGenerationId() []byte {
 		return x.SenderGenerationId
 	}
 	return nil
+}
+
+func (x *ExchangeSignals) GetExtenderCarrier() bool {
+	if x != nil {
+		return x.ExtenderCarrier
+	}
+	return false
 }
 
 // signals are sent in real time to the destination of the peer pair
@@ -2084,9 +2161,13 @@ type StoredContract struct {
 	// identity principal assigned to the source client at creation.
 	// Sealed into the platform-signed contract bytes. Set only when
 	// `provide_mode` is `Network`; empty for all other provide modes.
-	Principal     string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Principal string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
+	// Absolute admission deadline, sealed into the platform-signed bytes.
+	// Missing preserves legacy contracts without a time limit. At or after
+	// this Unix millisecond timestamp no new transfer bytes may be debited.
+	ExpirationTimeUnixMilli *int64 `protobuf:"varint,12,opt,name=expiration_time_unix_milli,json=expirationTimeUnixMilli,proto3,oneof" json:"expiration_time_unix_milli,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *StoredContract) Reset() {
@@ -2194,6 +2275,13 @@ func (x *StoredContract) GetPrincipal() string {
 		return x.Principal
 	}
 	return ""
+}
+
+func (x *StoredContract) GetExpirationTimeUnixMilli() int64 {
+	if x != nil && x.ExpirationTimeUnixMilli != nil {
+		return *x.ExpirationTimeUnixMilli
+	}
+	return 0
 }
 
 // control message
@@ -2820,6 +2908,153 @@ func (x *ResidentMigrate) GetMigrateTime() uint64 {
 	return 0
 }
 
+// A hint; receivers refetch an authoritative snapshot before replacing state.
+type NetworkSessionsChanged struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Generation    string                 `protobuf:"bytes,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	EventId       int64                  `protobuf:"varint,2,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetworkSessionsChanged) Reset() {
+	*x = NetworkSessionsChanged{}
+	mi := &file_transfer_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetworkSessionsChanged) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetworkSessionsChanged) ProtoMessage() {}
+
+func (x *NetworkSessionsChanged) ProtoReflect() protoreflect.Message {
+	mi := &file_transfer_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetworkSessionsChanged.ProtoReflect.Descriptor instead.
+func (*NetworkSessionsChanged) Descriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *NetworkSessionsChanged) GetGeneration() string {
+	if x != nil {
+		return x.Generation
+	}
+	return ""
+}
+
+func (x *NetworkSessionsChanged) GetEventId() int64 {
+	if x != nil {
+		return x.EventId
+	}
+	return 0
+}
+
+// Accepted only from authenticated platform control. A retired generation cannot
+// be revived by a delayed renew, StreamOpen, or resident migration snapshot.
+type StreamAuthorization struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	StreamId                []byte                 `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
+	AuthorizationGeneration []byte                 `protobuf:"bytes,2,opt,name=authorization_generation,json=authorizationGeneration,proto3" json:"authorization_generation,omitempty"`
+	LeaseMillis             uint32                 `protobuf:"varint,3,opt,name=lease_millis,json=leaseMillis,proto3" json:"lease_millis,omitempty"`
+	Retired                 bool                   `protobuf:"varint,4,opt,name=retired,proto3" json:"retired,omitempty"`
+	ClockId                 []byte                 `protobuf:"bytes,5,opt,name=clock_id,json=clockId,proto3" json:"clock_id,omitempty"`
+	ClockUnixMillis         int64                  `protobuf:"varint,6,opt,name=clock_unix_millis,json=clockUnixMillis,proto3" json:"clock_unix_millis,omitempty"`
+	DeadlineUnixMillis      int64                  `protobuf:"varint,7,opt,name=deadline_unix_millis,json=deadlineUnixMillis,proto3" json:"deadline_unix_millis,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *StreamAuthorization) Reset() {
+	*x = StreamAuthorization{}
+	mi := &file_transfer_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamAuthorization) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamAuthorization) ProtoMessage() {}
+
+func (x *StreamAuthorization) ProtoReflect() protoreflect.Message {
+	mi := &file_transfer_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamAuthorization.ProtoReflect.Descriptor instead.
+func (*StreamAuthorization) Descriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *StreamAuthorization) GetStreamId() []byte {
+	if x != nil {
+		return x.StreamId
+	}
+	return nil
+}
+
+func (x *StreamAuthorization) GetAuthorizationGeneration() []byte {
+	if x != nil {
+		return x.AuthorizationGeneration
+	}
+	return nil
+}
+
+func (x *StreamAuthorization) GetLeaseMillis() uint32 {
+	if x != nil {
+		return x.LeaseMillis
+	}
+	return 0
+}
+
+func (x *StreamAuthorization) GetRetired() bool {
+	if x != nil {
+		return x.Retired
+	}
+	return false
+}
+
+func (x *StreamAuthorization) GetClockId() []byte {
+	if x != nil {
+		return x.ClockId
+	}
+	return nil
+}
+
+func (x *StreamAuthorization) GetClockUnixMillis() int64 {
+	if x != nil {
+		return x.ClockUnixMillis
+	}
+	return 0
+}
+
+func (x *StreamAuthorization) GetDeadlineUnixMillis() int64 {
+	if x != nil {
+		return x.DeadlineUnixMillis
+	}
+	return 0
+}
+
 var File_transfer_proto protoreflect.FileDescriptor
 
 const file_transfer_proto_rawDesc = "" +
@@ -2898,7 +3133,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
 	"\x1a_receiver_ack_delay_micros\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xed\x01\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xe7\x02\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
@@ -2907,22 +3142,30 @@ const file_transfer_proto_rawDesc = "" +
 	"instanceId\x12.\n" +
 	"\x13h3_datagram_version\x18\x04 \x01(\rR\x11h3DatagramVersion\x12?\n" +
 	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\x12\x1b\n" +
-	"\tip_family\x18\x06 \x01(\x05R\bipFamily\"4\n" +
+	"\tip_family\x18\x06 \x01(\x05R\bipFamily\x12%\n" +
+	"\x0eprovide_intent\x18\a \x01(\bR\rprovideIntent\x12\x1f\n" +
+	"\vclient_info\x18\b \x01(\tR\n" +
+	"clientInfo\x120\n" +
+	"\x14stream_lease_version\x18\t \x01(\rR\x12streamLeaseVersion\"4\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\"f\n" +
 	"\n" +
 	"ProvideKey\x12*\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.bringyour.ProvideModeR\x04mode\x12,\n" +
-	"\x12provide_secret_key\x18\x02 \x01(\fR\x10provideSecretKey\"\x98\x01\n" +
+	"\x12provide_secret_key\x18\x02 \x01(\fR\x10provideSecretKey\"\xde\x02\n" +
 	"\n" +
-	"StreamOpen\x12 \n" +
+	"StreamOpen\x129\n" +
+	"\x18authorization_generation\x18\x04 \x01(\fR\x17authorizationGeneration\x12<\n" +
+	"\x1aauthorization_lease_millis\x18\x05 \x01(\rR\x18authorizationLeaseMillis\x12K\n" +
+	"\"authorization_deadline_unix_millis\x18\x06 \x01(\x03R\x1fauthorizationDeadlineUnixMillis\x12 \n" +
 	"\tsource_id\x18\x02 \x01(\fH\x00R\bsourceId\x88\x01\x01\x12*\n" +
 	"\x0edestination_id\x18\x01 \x01(\fH\x01R\rdestinationId\x88\x01\x01\x12\x1b\n" +
 	"\tstream_id\x18\x03 \x01(\fR\bstreamIdB\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
-	"\x0f_destination_id\"*\n" +
-	"\vStreamClose\x12\x1b\n" +
+	"\x0f_destination_id\"e\n" +
+	"\vStreamClose\x129\n" +
+	"\x18authorization_generation\x18\x04 \x01(\fR\x17authorizationGeneration\x12\x1b\n" +
 	"\tstream_id\x18\x03 \x01(\fR\bstreamId\">\n" +
 	"\vStreamReset\x12/\n" +
 	"\astreams\x18\x01 \x03(\v2\x15.bringyour.StreamOpenR\astreams\"\x9f\x02\n" +
@@ -2939,12 +3182,13 @@ const file_transfer_proto_rawDesc = "" +
 	"\x10_disconnect_time\"\x13\n" +
 	"\x11NetworkPeersReset\"B\n" +
 	"\x12NetworkPeersUpdate\x12,\n" +
-	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xba\x01\n" +
+	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xe5\x01\n" +
 	"\x0fExchangeSignals\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12#\n" +
 	"\rreset_signals\x18\x02 \x01(\bR\fresetSignals\x123\n" +
 	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\x120\n" +
-	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\"\xa3\x01\n" +
+	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\x12)\n" +
+	"\x10extender_carrier\x18\x05 \x01(\bR\x0fextenderCarrier\"\xa3\x01\n" +
 	"\x0eExchangeSignal\x126\n" +
 	"\vsignal_type\x18\x03 \x01(\x0e2\x15.bringyour.SignalTypeR\n" +
 	"signalType\x12\x15\n" +
@@ -2979,7 +3223,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
 	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
 	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
-	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\xbe\x04\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x9f\x05\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -2993,13 +3237,15 @@ const file_transfer_proto_rawDesc = "" +
 	"-destination_client_key_signed_tls_certificate\x18\t \x01(\fR(destinationClientKeySignedTlsCertificate\x12\x14\n" +
 	"\x05roles\x18\n" +
 	" \x03(\tR\x05roles\x12\x1c\n" +
-	"\tprincipal\x18\v \x01(\tR\tprincipalB\f\n" +
+	"\tprincipal\x18\v \x01(\tR\tprincipal\x12@\n" +
+	"\x1aexpiration_time_unix_milli\x18\f \x01(\x03H\x04R\x17expirationTimeUnixMilli\x88\x01\x01B\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\x9d\x02\n" +
+	"\t_priorityB\x1d\n" +
+	"\x1b_expiration_time_unix_milli\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
@@ -3044,7 +3290,20 @@ const file_transfer_proto_rawDesc = "" +
 	"\bepoch_id\x18\x05 \x01(\fH\x00R\aepochId\x88\x01\x01B\v\n" +
 	"\t_epoch_id\"4\n" +
 	"\x0fResidentMigrate\x12!\n" +
-	"\fmigrate_time\x18\x01 \x01(\x04R\vmigrateTime*W\n" +
+	"\fmigrate_time\x18\x01 \x01(\x04R\vmigrateTime\"S\n" +
+	"\x16NetworkSessionsChanged\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x01 \x01(\tR\n" +
+	"generation\x12\x19\n" +
+	"\bevent_id\x18\x02 \x01(\x03R\aeventId\"\xa3\x02\n" +
+	"\x13StreamAuthorization\x12\x1b\n" +
+	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x129\n" +
+	"\x18authorization_generation\x18\x02 \x01(\fR\x17authorizationGeneration\x12!\n" +
+	"\flease_millis\x18\x03 \x01(\rR\vleaseMillis\x12\x18\n" +
+	"\aretired\x18\x04 \x01(\bR\aretired\x12\x19\n" +
+	"\bclock_id\x18\x05 \x01(\fR\aclockId\x12*\n" +
+	"\x11clock_unix_millis\x18\x06 \x01(\x03R\x0fclockUnixMillis\x120\n" +
+	"\x14deadline_unix_millis\x18\a \x01(\x03R\x12deadlineUnixMillis*W\n" +
 	"\fSequenceRole\x12\x17\n" +
 	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
 	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +
@@ -3091,58 +3350,60 @@ func file_transfer_proto_rawDescGZIP() []byte {
 }
 
 var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_transfer_proto_goTypes = []any{
-	(SequenceRole)(0),             // 0: bringyour.SequenceRole
-	(ProvideMode)(0),              // 1: bringyour.ProvideMode
-	(SignalType)(0),               // 2: bringyour.SignalType
-	(ContractError)(0),            // 3: bringyour.ContractError
-	(EncryptedControlType)(0),     // 4: bringyour.EncryptedControlType
-	(*TransferPath)(nil),          // 5: bringyour.TransferPath
-	(*TransferFrame)(nil),         // 6: bringyour.TransferFrame
-	(*FilteredTransferFrame)(nil), // 7: bringyour.FilteredTransferFrame
-	(*Pack)(nil),                  // 8: bringyour.Pack
-	(*FilteredPack)(nil),          // 9: bringyour.FilteredPack
-	(*Ack)(nil),                   // 10: bringyour.Ack
-	(*Tag)(nil),                   // 11: bringyour.Tag
-	(*Auth)(nil),                  // 12: bringyour.Auth
-	(*Provide)(nil),               // 13: bringyour.Provide
-	(*ProvideKey)(nil),            // 14: bringyour.ProvideKey
-	(*StreamOpen)(nil),            // 15: bringyour.StreamOpen
-	(*StreamClose)(nil),           // 16: bringyour.StreamClose
-	(*StreamReset)(nil),           // 17: bringyour.StreamReset
-	(*NetworkPeer)(nil),           // 18: bringyour.NetworkPeer
-	(*NetworkPeersReset)(nil),     // 19: bringyour.NetworkPeersReset
-	(*NetworkPeersUpdate)(nil),    // 20: bringyour.NetworkPeersUpdate
-	(*ExchangeSignals)(nil),       // 21: bringyour.ExchangeSignals
-	(*ExchangeSignal)(nil),        // 22: bringyour.ExchangeSignal
-	(*CreateContract)(nil),        // 23: bringyour.CreateContract
-	(*CreateContractResult)(nil),  // 24: bringyour.CreateContractResult
-	(*Contract)(nil),              // 25: bringyour.Contract
-	(*StoredContract)(nil),        // 26: bringyour.StoredContract
-	(*CloseContract)(nil),         // 27: bringyour.CloseContract
-	(*PeerAudit)(nil),             // 28: bringyour.PeerAudit
-	(*ControlPing)(nil),           // 29: bringyour.ControlPing
-	(*ProvidePing)(nil),           // 30: bringyour.ProvidePing
-	(*EncryptedKey)(nil),          // 31: bringyour.EncryptedKey
-	(*ClientKey)(nil),             // 32: bringyour.ClientKey
-	(*EncryptedControl)(nil),      // 33: bringyour.EncryptedControl
-	(*ResidentMigrate)(nil),       // 34: bringyour.ResidentMigrate
-	(*Frame)(nil),                 // 35: bringyour.Frame
-	(MessageType)(0),              // 36: bringyour.MessageType
+	(SequenceRole)(0),              // 0: bringyour.SequenceRole
+	(ProvideMode)(0),               // 1: bringyour.ProvideMode
+	(SignalType)(0),                // 2: bringyour.SignalType
+	(ContractError)(0),             // 3: bringyour.ContractError
+	(EncryptedControlType)(0),      // 4: bringyour.EncryptedControlType
+	(*TransferPath)(nil),           // 5: bringyour.TransferPath
+	(*TransferFrame)(nil),          // 6: bringyour.TransferFrame
+	(*FilteredTransferFrame)(nil),  // 7: bringyour.FilteredTransferFrame
+	(*Pack)(nil),                   // 8: bringyour.Pack
+	(*FilteredPack)(nil),           // 9: bringyour.FilteredPack
+	(*Ack)(nil),                    // 10: bringyour.Ack
+	(*Tag)(nil),                    // 11: bringyour.Tag
+	(*Auth)(nil),                   // 12: bringyour.Auth
+	(*Provide)(nil),                // 13: bringyour.Provide
+	(*ProvideKey)(nil),             // 14: bringyour.ProvideKey
+	(*StreamOpen)(nil),             // 15: bringyour.StreamOpen
+	(*StreamClose)(nil),            // 16: bringyour.StreamClose
+	(*StreamReset)(nil),            // 17: bringyour.StreamReset
+	(*NetworkPeer)(nil),            // 18: bringyour.NetworkPeer
+	(*NetworkPeersReset)(nil),      // 19: bringyour.NetworkPeersReset
+	(*NetworkPeersUpdate)(nil),     // 20: bringyour.NetworkPeersUpdate
+	(*ExchangeSignals)(nil),        // 21: bringyour.ExchangeSignals
+	(*ExchangeSignal)(nil),         // 22: bringyour.ExchangeSignal
+	(*CreateContract)(nil),         // 23: bringyour.CreateContract
+	(*CreateContractResult)(nil),   // 24: bringyour.CreateContractResult
+	(*Contract)(nil),               // 25: bringyour.Contract
+	(*StoredContract)(nil),         // 26: bringyour.StoredContract
+	(*CloseContract)(nil),          // 27: bringyour.CloseContract
+	(*PeerAudit)(nil),              // 28: bringyour.PeerAudit
+	(*ControlPing)(nil),            // 29: bringyour.ControlPing
+	(*ProvidePing)(nil),            // 30: bringyour.ProvidePing
+	(*EncryptedKey)(nil),           // 31: bringyour.EncryptedKey
+	(*ClientKey)(nil),              // 32: bringyour.ClientKey
+	(*EncryptedControl)(nil),       // 33: bringyour.EncryptedControl
+	(*ResidentMigrate)(nil),        // 34: bringyour.ResidentMigrate
+	(*NetworkSessionsChanged)(nil), // 35: bringyour.NetworkSessionsChanged
+	(*StreamAuthorization)(nil),    // 36: bringyour.StreamAuthorization
+	(*Frame)(nil),                  // 37: bringyour.Frame
+	(MessageType)(0),               // 38: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
 	5,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	35, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	36, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	37, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	38, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
 	8,  // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
 	10, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
 	0,  // 5: bringyour.TransferFrame.session_role:type_name -> bringyour.SequenceRole
 	5,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	35, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
-	35, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	37, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	37, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
 	11, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
-	35, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	37, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
 	11, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
 	14, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
 	1,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
@@ -3189,7 +3450,7 @@ func file_transfer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   30,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

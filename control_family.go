@@ -216,10 +216,19 @@ func controlFamilyDemote(family int) bool {
 		return false
 	}
 
-	other := 4
+	// IPv4 is the control plane the fleet runs on today; the IPv6/dual-stack
+	// rollout is still in its early stages. A global demotion of IPv4 would
+	// steer every control dial, extender and h3 pick onto that early-rollout
+	// path, which is the opposite of the intended posture. It is also unsafe
+	// evidence: the strikes arrive from handshake timeouts, and a proxy-relayed
+	// or CPU-starved dial times out without saying anything about this device's
+	// IPv4 route.
 	if family == 4 {
-		other = 6
+		return false
 	}
+
+	// family is 6 here: IPv6 may be narrowed in favour of IPv4.
+	other := 4
 
 	controlFamilyLedger.mu.Lock()
 
