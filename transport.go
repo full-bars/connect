@@ -2164,7 +2164,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		releaseReconnect()
-		self.recordGovernedAttempt(err, attemptStats, true)
+		// local teardown is not a backend outcome, and a canceled dial's error
+		// can miss context.Canceled when it was snapshotted before the cancel
+		if err == nil || self.ctx.Err() == nil {
+			self.recordGovernedAttempt(err, attemptStats, true)
+		}
 		if err != nil {
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
@@ -3073,7 +3077,11 @@ func (self *PlatformTransport) runH3(
 		releaseReconnect()
 		// H3 is UDP, so it never goes through a proxy and carries no attempt
 		// stats. A mode beside H1 in Auto is never a health signal.
-		self.recordGovernedAttempt(err, nil, self.countsAsGovernHealth(ptMode))
+		// Local teardown is not a backend outcome, and a canceled dial's error
+		// can miss context.Canceled when it was snapshotted before the cancel.
+		if err == nil || (ctx.Err() == nil && attemptCtx.Err() == nil) {
+			self.recordGovernedAttempt(err, nil, self.countsAsGovernHealth(ptMode))
+		}
 		if err != nil {
 			attemptCanceled := attemptCtx.Err() != nil
 			releaseAttempt()
