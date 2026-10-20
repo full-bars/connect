@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -2869,6 +2870,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					drain(controlSend, controlLane)
 				}()
 				speedTest := false
+				var speedTestId uint32
 
 				for {
 					select {
@@ -2911,6 +2913,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								switch message[0] {
 								case TransportControlSpeedStart:
 									speedTest = true
+									speedTestId = binary.BigEndian.Uint32(message[1:5])
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
@@ -2946,8 +2949,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							continue
 						}
-						if speedTest {
-							// speed test echo
+						if speedTest && IsTransportSpeedTestProbe(message, speedTestId) {
+							// Echo only this test's probes. The platform interleaves
+							// real Transfer frames, which still belong to receive.
 							if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 								return
 							}
