@@ -9291,22 +9291,28 @@ sendSequenceLoop:
 				// loss-driven recovery (selective gap, probes) is not the
 				// amplifier this bounds.
 				isHead := len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber == item.sequenceNumber
-				if selection.kind == sendRecoveryNone &&
-					!resendIsFree(item.sendCount, isHead) &&
-					!retryAllowed(len(item.transferFrameBytes)) {
-					recordTransferResendDeferred(len(item.transferFrameBytes))
-					resendTime := sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
-					if !retainPastAckTimeout && resendTime.After(item.sendTime.Add(item.ackTimeout)) {
-						resendTime = item.sendTime.Add(item.ackTimeout)
+				resendDebit := 0
+				if selection.kind == sendRecoveryNone && !resendIsFree(item.sendCount, isHead) {
+					allowed, debited := retryAllowed(len(item.transferFrameBytes))
+					if !allowed {
+						recordTransferResendDeferred(len(item.transferFrameBytes))
+						resendTime := sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+						if !retainPastAckTimeout && resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+							resendTime = item.sendTime.Add(item.ackTimeout)
+						}
+						// the item is already in the resend queue (this loop
+						// peeks it); only its due time moves
+						self.setResendTime(item, resendTime)
+						continue sendSequenceLoop
 					}
-					// the item is already in the resend queue (this loop peeks
-					// it); only its due time moves
-					self.setResendTime(item, resendTime)
-					continue sendSequenceLoop
+					resendDebit = debited
 				}
 				// ACK preemption and item-local expiry return to this same
 				// owner boundary before another original is admitted.
-				self.writeSelectedRecovery(item, selection)
+				if resendErr := self.writeSelectedRecovery(item, selection); resendErr != nil {
+					// the frame never went out, so give back what it was charged
+					refundRetry(resendDebit)
+				}
 				continue sendSequenceLoop
 			}
 		}
@@ -13609,12 +13615,15 @@ const (
 type sendItem struct {
 	transferItem
 
-	contractId         *Id
-	sendTime           time.Time
-	resendTime         time.Time
-	ackTimeout         time.Duration
-	ackLifetimeIndex   int
-	sendCount          int
+	contractId       *Id
+	sendTime         time.Time
+	resendTime       time.Time
+	ackTimeout       time.Duration
+	ackLifetimeIndex int
+	sendCount        int
+	// successful recovery writes, which do not advance sendCount because that
+	// stays the timeout-backoff counter. Resend depth is their sum.
+	recoveryWriteCount int
 	transferFrameBytes []byte
 	acks               sendAckSet
 	// The paced wire envelope is credited once on delivery. The first-write

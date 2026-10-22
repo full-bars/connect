@@ -79,16 +79,29 @@ func (self *transferRetryBudget) earn(byteCount int) {
 	self.tokens = min(self.tokens+retryBudgetRatio*float64(byteCount), retryBudgetBurstBytes)
 }
 
-// allow pays for a resend of byteCount bytes, or refuses without charging.
-func (self *transferRetryBudget) allow(byteCount int) bool {
+// allow pays for a resend of byteCount bytes, or refuses without charging. The
+// second result is what it debited so a write that never happens can be refunded.
+func (self *transferRetryBudget) allow(byteCount int) (bool, int) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 	self.refillLocked()
 	if float64(byteCount) <= self.tokens {
 		self.tokens -= float64(byteCount)
-		return true
+		return true, byteCount
 	}
-	return false
+	return false, 0
+}
+
+// refund returns tokens a resend was charged for and never used, up to the burst
+// cap. A failed write did not put bytes on the wire, so it did not spend them.
+func (self *transferRetryBudget) refund(byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.refillLocked()
+	self.tokens = min(self.tokens+float64(byteCount), retryBudgetBurstBytes)
 }
 
 // reset sets the balance. For tests.
@@ -105,11 +118,16 @@ var transferResendBudget = newTransferRetryBudget(time.Now)
 
 // retryAllowed asks whether a resend of byteCount bytes may go out. Only enforce
 // mode ever refuses; shadow and off behave as before the budget existed.
-func retryAllowed(byteCount int) bool {
+func retryAllowed(byteCount int) (bool, int) {
 	if currentGovernMode() != governEnforce {
-		return true
+		return true, 0
 	}
 	return transferResendBudget.allow(byteCount)
+}
+
+// refundRetry gives back what a refused or failed resend was charged.
+func refundRetry(byteCount int) {
+	transferResendBudget.refund(byteCount)
 }
 
 // resendIsFree reports whether the next send of an item is exempt from the budget.

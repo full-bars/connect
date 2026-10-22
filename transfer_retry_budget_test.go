@@ -17,7 +17,7 @@ func newTestRetryBudget() (*transferRetryBudget, *time.Time) {
 
 func TestRetryBudget_StartsWithAGrantSoAFreshProcessCanRecover(t *testing.T) {
 	b, _ := newTestRetryBudget()
-	if !b.allow(1000) {
+	if ok, _ := b.allow(1000); !ok {
 		t.Fatal("a fresh budget must allow a resend")
 	}
 }
@@ -26,14 +26,14 @@ func TestRetryBudget_ResendsAreChargedAgainstWhatWasFirstSent(t *testing.T) {
 	b, _ := newTestRetryBudget()
 	b.reset(0)
 
-	if b.allow(1) {
+	if ok, _ := b.allow(1); ok {
 		t.Fatal("an empty budget must refuse")
 	}
 	b.earn(10_000) // 10 KB first-sent earns 25%
-	if !b.allow(2500) {
+	if ok, _ := b.allow(2500); !ok {
 		t.Fatal("2.5 KB of resends is exactly the 25% earned")
 	}
-	if b.allow(1) {
+	if ok, _ := b.allow(1); ok {
 		t.Fatal("that spent it all")
 	}
 }
@@ -42,10 +42,10 @@ func TestRetryBudget_FloorRefillsOverTimeSoQuietFlowsStillRecover(t *testing.T) 
 	b, now := newTestRetryBudget()
 	b.reset(0)
 	*now = now.Add(time.Second)
-	if !b.allow(retryBudgetFloorBytesPerSecond) {
+	if ok, _ := b.allow(retryBudgetFloorBytesPerSecond); !ok {
 		t.Fatal("one second must refill the floor rate")
 	}
-	if b.allow(1000) {
+	if ok, _ := b.allow(1000); ok {
 		t.Fatal("but not more than the floor rate")
 	}
 }
@@ -55,10 +55,10 @@ func TestRetryBudget_BurstIsCapped(t *testing.T) {
 	b.reset(0)
 	b.earn(1 << 40)
 	*now = now.Add(24 * time.Hour)
-	if !b.allow(retryBudgetBurstBytes) {
+	if ok, _ := b.allow(retryBudgetBurstBytes); !ok {
 		t.Fatal("a full bucket must pay out its burst")
 	}
-	if b.allow(1) {
+	if ok, _ := b.allow(1); ok {
 		t.Fatal("the bucket never holds more than the burst, however long it sits")
 	}
 }
@@ -66,10 +66,10 @@ func TestRetryBudget_BurstIsCapped(t *testing.T) {
 func TestRetryBudget_RefusalsAreNotCharged(t *testing.T) {
 	b, _ := newTestRetryBudget()
 	b.reset(100)
-	if b.allow(1000) {
+	if ok, _ := b.allow(1000); ok {
 		t.Fatal("too big")
 	}
-	if !b.allow(100) {
+	if ok, _ := b.allow(100); !ok {
 		t.Fatal("a refused resend must leave the tokens alone")
 	}
 }
@@ -141,16 +141,16 @@ func TestSendSequence_ResendBudgetIsOnlyEnforcedInEnforceMode(t *testing.T) {
 	savedTokens, savedLast := transferResendBudget.snapshotForTest()
 	defer transferResendBudget.restoreForTest(savedTokens, savedLast)
 	transferResendBudget.reset(0)
-	if !retryAllowed(1000) {
+	if ok, _ := retryAllowed(1000); !ok {
 		t.Fatal("shadow mode must never refuse a resend")
 	}
 	defer setGovernModeForTest(governOff)()
-	if !retryAllowed(1000) {
+	if ok, _ := retryAllowed(1000); !ok {
 		t.Fatal("off mode must never refuse a resend")
 	}
 	restore := setGovernModeForTest(governEnforce)
 	defer restore()
-	if retryAllowed(1000) {
+	if ok, _ := retryAllowed(1000); ok {
 		t.Fatal("enforce mode refuses when the budget is empty")
 	}
 }
