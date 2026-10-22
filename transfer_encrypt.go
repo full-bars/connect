@@ -1902,6 +1902,12 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 	// If this epoch has already been reset out from under us, don't emit
 	// an identity proof bound to a dead handshake — just wake subscribers
 	// so they re-read the (now superseded) state.
+	// Count the completed handshake even when the epoch has since been
+	// superseded. NoteAttempt already counted this attempt, so skipping it
+	// here would make a successful TLS handshake look like a failure.
+	if err == nil && self.manager != nil {
+		self.manager.notePqeEstablished(pqeCurveOf(e))
+	}
 	if !self.isCurrentEpoch(e) {
 		return
 	}
@@ -1909,9 +1915,6 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		logTlsHandshake(self.client.log, self.logTag, err)
 	}
 	if err == nil {
-		if self.manager != nil {
-			self.manager.notePqeEstablished(pqeCurveOf(e))
-		}
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof(
 				"[tls]%s completeHandshake: cipher derived, exporter %d bytes — starting identity proof exchange\n",
@@ -2108,6 +2111,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 	// set under the lock when e is promoted, for the capability evidence below
 	sealed := false
 	sealedCurveId := tls.CurveID(0)
+	// firstIdentityFailure distinguishes the call that marked this epoch
+	// failed from a concurrent call verifying the same already-failed proof.
+	firstIdentityFailure := false
 	identityFailed := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -2127,6 +2133,7 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 			}
 			return false
 		} else {
+			firstIdentityFailure = !e.identityFailed
 			e.identityFailed = true
 			e.identityFailedTerminal = true
 			if e.establishmentDone != nil && !isClosed(e.establishmentDone) {
@@ -2172,7 +2179,7 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		self.manager.notifySessionSealed(self)
 	} else {
 		if identityFailed {
-			if self.manager != nil {
+			if self.manager != nil && firstIdentityFailure {
 				self.manager.notePqeIdentityFailed()
 			}
 			if e.cancel != nil {
