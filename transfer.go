@@ -9284,9 +9284,35 @@ sendSequenceLoop:
 						continue
 					}
 				}
+				// Pay for a timeout resend out of what first sends earned. A
+				// resend the budget refuses is rescheduled, not sent and not
+				// counted as a send, so a slow far end cannot make us send many
+				// times what we deliver. Only timeout resends are gated;
+				// loss-driven recovery (selective gap, probes) is not the
+				// amplifier this bounds.
+				isHead := len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber == item.sequenceNumber
+				resendDebit := 0
+				if selection.kind == sendRecoveryNone && !resendIsFree(item.sendCount, isHead) {
+					allowed, debited := retryAllowed(len(item.transferFrameBytes))
+					if !allowed {
+						recordTransferResendDeferred(len(item.transferFrameBytes))
+						resendTime := sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+						if !retainPastAckTimeout && resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+							resendTime = item.sendTime.Add(item.ackTimeout)
+						}
+						// the item is already in the resend queue (this loop
+						// peeks it); only its due time moves
+						self.setResendTime(item, resendTime)
+						continue sendSequenceLoop
+					}
+					resendDebit = debited
+				}
 				// ACK preemption and item-local expiry return to this same
 				// owner boundary before another original is admitted.
-				self.writeSelectedRecovery(item, selection)
+				if resendErr := self.writeSelectedRecovery(item, selection); resendErr != nil {
+					// the frame never went out, so give back what it was charged
+					refundRetry(resendDebit)
+				}
 				continue sendSequenceLoop
 			}
 		}
@@ -11160,6 +11186,10 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	if ack {
 		if err == nil {
 			self.observeCarrierWrite(item, writeDisposition)
+			// A frame that actually went out earns the right to be resent
+			// later; the retry budget is paid out of what first sends earned.
+			recordTransferFirstSend(len(item.transferFrameBytes))
+			transferResendBudget.earn(len(item.transferFrameBytes))
 			recoveryStart := sendTime
 			if item.pacingByteCount > 0 && item.rttH1 && item.pacingSentAtNanos != 0 {
 				// Local pacing precedes the first physical attempt. It cannot
@@ -13585,12 +13615,15 @@ const (
 type sendItem struct {
 	transferItem
 
-	contractId         *Id
-	sendTime           time.Time
-	resendTime         time.Time
-	ackTimeout         time.Duration
-	ackLifetimeIndex   int
-	sendCount          int
+	contractId       *Id
+	sendTime         time.Time
+	resendTime       time.Time
+	ackTimeout       time.Duration
+	ackLifetimeIndex int
+	sendCount        int
+	// successful recovery writes, which do not advance sendCount because that
+	// stays the timeout-backoff counter. Resend depth is their sum.
+	recoveryWriteCount int
 	transferFrameBytes []byte
 	acks               sendAckSet
 	// The paced wire envelope is credited once on delivery. The first-write
