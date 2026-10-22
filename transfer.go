@@ -9284,6 +9284,24 @@ sendSequenceLoop:
 						continue
 					}
 				}
+				// Pay for a timeout resend out of what first sends earned. A
+				// resend the budget refuses is rescheduled, not sent and not
+				// counted as a send, so a slow far end cannot make us send many
+				// times what we deliver. Only timeout resends are gated;
+				// loss-driven recovery (selective gap, probes) is not the
+				// amplifier this bounds.
+				isHead := len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber == item.sequenceNumber
+				if selection.kind == sendRecoveryNone &&
+					!resendIsFree(item.sendCount, isHead) &&
+					!retryAllowed(len(item.transferFrameBytes)) {
+					recordTransferResendDeferred(len(item.transferFrameBytes))
+					item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+					if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+						item.resendTime = item.sendTime.Add(item.ackTimeout)
+					}
+					self.addResendItem(item)
+					continue sendSequenceLoop
+				}
 				// ACK preemption and item-local expiry return to this same
 				// owner boundary before another original is admitted.
 				self.writeSelectedRecovery(item, selection)
@@ -11160,6 +11178,10 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	if ack {
 		if err == nil {
 			self.observeCarrierWrite(item, writeDisposition)
+			// A frame that actually went out earns the right to be resent
+			// later; the retry budget is paid out of what first sends earned.
+			recordTransferFirstSend(len(item.transferFrameBytes))
+			transferResendBudget.earn(len(item.transferFrameBytes))
 			recoveryStart := sendTime
 			if item.pacingByteCount > 0 && item.rttH1 && item.pacingSentAtNanos != 0 {
 				// Local pacing precedes the first physical attempt. It cannot
