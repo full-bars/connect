@@ -455,6 +455,7 @@ func (self *SendSequence) writeSelectedRecovery(item *sendItem, selection sendRe
 		self.observeCarrierWrite(item, resendDisposition)
 		self.resendWriteCount.Add(1)
 		self.resendWriteByteCount.Add(uint64(len(transferFrameBytes)))
+		recordTransferResend(len(transferFrameBytes), item.sendCount+1)
 	}
 	self.client.recordSendRecovery(recoveryKind, resendErr)
 	if recoveryKind == sendRecoverySelectiveGap && 0 < item.timeoutDeferCount {

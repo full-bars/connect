@@ -88,6 +88,8 @@ func countRewritesToSilentPeer(t *testing.T, mode governMode) (rewrites int, def
 	previousNow := transferResendBudget.now
 	transferResendBudget.now = func() time.Time { return frozen }
 	defer func() { transferResendBudget.now = previousNow }()
+	savedTokens, savedLast := transferResendBudget.snapshotForTest()
+	defer transferResendBudget.restoreForTest(savedTokens, savedLast)
 	transferResendBudget.reset(2_000)
 	before := TransferSendStatsNow()
 	synctest.Test(t, func(t *testing.T) {
@@ -136,6 +138,8 @@ func TestSendSequence_ResendsToANonAckingPeerAreBudgeted(t *testing.T) {
 // shadow and off never delay a resend
 func TestSendSequence_ResendBudgetIsOnlyEnforcedInEnforceMode(t *testing.T) {
 	defer setGovernModeForTest(governShadow)()
+	savedTokens, savedLast := transferResendBudget.snapshotForTest()
+	defer transferResendBudget.restoreForTest(savedTokens, savedLast)
 	transferResendBudget.reset(0)
 	if !retryAllowed(1000) {
 		t.Fatal("shadow mode must never refuse a resend")

@@ -48,6 +48,20 @@ func newTransferRetryBudget(now func() time.Time) *transferRetryBudget {
 	return &transferRetryBudget{now: now, tokens: retryBudgetInitialBytes, last: now()}
 }
 
+// snapshotForTest captures the balance so a test can put it back. A test-scoped
+// reset otherwise leaks into later tests sharing the binary.
+func (self *transferRetryBudget) snapshotForTest() (float64, time.Time) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	return self.tokens, self.last
+}
+
+func (self *transferRetryBudget) restoreForTest(tokens float64, last time.Time) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.tokens, self.last = tokens, last
+}
+
 // refillLocked adds the floor refill for the time since the last call.
 func (self *transferRetryBudget) refillLocked() {
 	now := self.now()

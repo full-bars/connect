@@ -9295,11 +9295,13 @@ sendSequenceLoop:
 					!resendIsFree(item.sendCount, isHead) &&
 					!retryAllowed(len(item.transferFrameBytes)) {
 					recordTransferResendDeferred(len(item.transferFrameBytes))
-					item.resendTime = sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
-					if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
-						item.resendTime = item.sendTime.Add(item.ackTimeout)
+					resendTime := sendTime.Add(self.resendIntervalForItem(item, item.sendCount+1))
+					if !retainPastAckTimeout && resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+						resendTime = item.sendTime.Add(item.ackTimeout)
 					}
-					self.addResendItem(item)
+					// the item is already in the resend queue (this loop peeks
+					// it); only its due time moves
+					self.setResendTime(item, resendTime)
 					continue sendSequenceLoop
 				}
 				// ACK preemption and item-local expiry return to this same
