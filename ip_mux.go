@@ -206,24 +206,39 @@ func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideM
 	return upstream(source, provideMode, packet, timeout)
 }
 
-// Consumes a packet burst after grouping it by exact directional flow. Each
-// group is classified once at the routing boundary while content-aware
-// observers still inspect its packets in order.
+// Consumes a packet burst grouped by exact directional flow and TCP SYN
+// generation. Each generation is classified/admitted as a whole; a later SYN
+// cannot move its old-generation prefix to a replacement NAT identity.
 func (self *IpMux) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
 	timeout time.Duration,
 ) int {
+	upstream, upstreamGroupSend := self.getUpstreams()
+	return self.sendPacketBatchWithUpstreams(source, provideMode, packets, timeout, upstream, upstreamGroupSend, false)
+}
+
+// Takes a burst under one immutable upstream snapshot. Native callbacks keep
+// local interception unchanged and refuse remote pressure without a continuation.
+func (self *IpMux) sendPacketBatchWithUpstreams(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	upstream IpMuxSend,
+	upstreamGroupSend ipPacketGroupSend,
+	nativeIngress bool,
+) int {
 	groups, rejectedPackets := groupIpPackets(packets)
+	groups = splitAffinitySynGroups(groups, nil)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
 	}
 	sentPacketCount := 0
-	upstream, upstreamGroupSend := self.getUpstreams()
 	batch := ipPacketGroupBatch{
 		timeout:   timeout,
-		readyPass: 1 < len(groups) && timeout != 0,
+		readyPass: !nativeIngress && 1 < len(groups) && timeout != 0,
 		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
 			return upstreamGroupSend(source, provideMode, group, sendTimeout)
 		},

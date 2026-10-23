@@ -18,7 +18,6 @@ const (
 	networkQualitySubprotocolId              SubprotocolId = 1
 	networkQualityMessageByteCount                         = len(Id{}) + 8
 	networkQualityMaximumRememberedPeerCount               = 1024
-	networkQualityNotificationRetryInterval                = 100 * time.Millisecond
 )
 
 type networkQualityPeer struct {
@@ -42,6 +41,9 @@ type networkQualityPendingPeer struct {
 type networkQualityPendingLocal struct {
 	at         time.Time
 	generation uint64
+	// the network path generation the notification came from; a newer one
+	// than a send sequence last accepted bypasses its quiet interval
+	pathGeneration uint64
 }
 
 // One client-owned worker keeps OS listener and shared receive callbacks
@@ -50,9 +52,13 @@ type clientNetworkQualityState struct {
 	client     *Client
 	instanceId Id
 	worker     *coalescingCallbackWorker
+	// from the client's settings at construction, before its send buffer exists
+	quietInterval             time.Duration
+	notificationRetryInterval time.Duration
 
 	stateLock                    sync.Mutex
 	lastLocalNotification        time.Time
+	lastLocalPathGeneration      uint64
 	localGeneration              uint64
 	pendingLocal                 networkQualityPendingLocal
 	pendingRemotePeerIdAts       map[Id]time.Time
@@ -70,12 +76,14 @@ type clientNetworkQualityState struct {
 
 func newClientNetworkQualityState(client *Client) *clientNetworkQualityState {
 	state := &clientNetworkQualityState{
-		client:                   client,
-		instanceId:               NewId(),
-		pendingRemotePeerIdAts:   map[Id]time.Time{},
-		pendingPeerNotifications: map[Id]networkQualityPendingPeer{},
-		observedPeers:            map[Id]networkQualityPeer{},
-		remoteGenerations:        map[Id]networkQualityRemoteGeneration{},
+		client:                    client,
+		instanceId:                NewId(),
+		quietInterval:             client.settings.SendBufferSettings.WindowQualityRemeasureInterval,
+		notificationRetryInterval: client.settings.NetworkQualityNotificationRetryInterval,
+		pendingRemotePeerIdAts:    map[Id]time.Time{},
+		pendingPeerNotifications:  map[Id]networkQualityPendingPeer{},
+		observedPeers:             map[Id]networkQualityPeer{},
+		remoteGenerations:         map[Id]networkQualityRemoteGeneration{},
 	}
 	state.worker = newCoalescingCallbackWorker(client.ctx, state.applyPending)
 	removeSubprotocolListener, err := client.addReservedSubprotocolRawCallback(
@@ -97,13 +105,17 @@ func (self *Client) NetworkQualityChanged() {
 	if self == nil || self.networkQuality == nil {
 		return
 	}
-	self.networkQuality.dispatchLocal(time.Now())
+	self.networkQuality.dispatchLocal(time.Now(), networkPathGeneration.Load())
 }
 
-func (self *clientNetworkQualityState) dispatchLocal(at time.Time) {
+// dispatchLocal coalesces notifications inside the quiet interval, except one
+// from a newer network path generation (a hard change): that starts a new
+// generation at once.
+func (self *clientNetworkQualityState) dispatchLocal(at time.Time, pathGeneration uint64) {
 	self.stateLock.Lock()
 	if !self.lastLocalNotification.IsZero() &&
-		at.Sub(self.lastLocalNotification) <= windowQualityRemeasureInterval {
+		pathGeneration <= self.lastLocalPathGeneration &&
+		at.Sub(self.lastLocalNotification) <= self.quietInterval {
 		if at.After(self.lastLocalNotification) {
 			self.lastLocalNotification = at
 		}
@@ -111,10 +123,12 @@ func (self *clientNetworkQualityState) dispatchLocal(at time.Time) {
 		return
 	}
 	self.lastLocalNotification = at
+	self.lastLocalPathGeneration = max(self.lastLocalPathGeneration, pathGeneration)
 	self.localGeneration += 1
 	self.pendingLocal = networkQualityPendingLocal{
-		at:         at,
-		generation: self.localGeneration,
+		at:             at,
+		generation:     self.localGeneration,
+		pathGeneration: self.lastLocalPathGeneration,
 	}
 	self.stateLock.Unlock()
 	self.worker.Dispatch()
@@ -247,7 +261,7 @@ func (self *clientNetworkQualityState) applyPending() {
 		beforeApplyForTest()
 	}
 	if local.generation != 0 {
-		self.client.sendBuffer.networkQualityChanged(Id{}, local.at)
+		self.client.sendBuffer.networkQualityChangedOnPath(Id{}, local.at, local.pathGeneration)
 		self.queuePeerNotifications(local.generation)
 		if afterLocalApplyForTest != nil {
 			afterLocalApplyForTest(local.generation)
@@ -264,10 +278,10 @@ func (self *clientNetworkQualityState) applyPending() {
 			afterRemoteApplyForTest(peerId)
 		}
 	}
-	if self.sendPeerNotifications() {
+	if self.sendPeerNotifications() && 0 < self.notificationRetryInterval {
 		select {
 		case <-self.client.ctx.Done():
-		case <-time.After(networkQualityNotificationRetryInterval):
+		case <-time.After(self.notificationRetryInterval):
 			self.worker.Dispatch()
 		}
 	}

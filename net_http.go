@@ -34,11 +34,6 @@ import (
 type HttpPostRawFunction func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error)
 type HttpGetRawFunction func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error)
 
-// DefaultMaxHttpResponseBodyBytes bounds API responses that are materialized
-// in memory. API calls return JSON/control data rather than streamed payloads;
-// larger payloads must use an explicitly streaming transport.
-const DefaultMaxHttpResponseBodyBytes int64 = 2 * 1024 * 1024
-
 var ErrHttpResponseBodyTooLarge = errors.New("http response body exceeds memory limit")
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
@@ -61,8 +56,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		DohSettings: DefaultDohSettings(),
 		DnsTlds:     [][]byte{[]byte(DefaultExtenderDnsTld)},
 
-		HelloRetryTimeout:        5 * time.Second,
-		MaxHttpResponseBodyBytes: DefaultMaxHttpResponseBodyBytes,
+		HelloRetryTimeout: 5 * time.Second,
+		// API calls return JSON/control data rather than streamed payloads;
+		// larger payloads must use an explicitly streaming transport
+		MaxHttpResponseBodyBytes: 2 * 1024 * 1024,
 
 		GetRetryCount:               1,
 		GetRetryStatusCodes:         []int{http.StatusBadGateway, http.StatusServiceUnavailable},
@@ -72,6 +69,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
+
+		ReconnectFastPathLimit:    4,
+		ReconnectFastPathMaxDelay: 250 * time.Millisecond,
+		KickReconnectLimit:        12,
 
 		Http2SendPingTimeout: 10 * time.Second,
 		Http2PingTimeout:     5 * time.Second,
@@ -201,8 +202,9 @@ type ClientStrategySettings struct {
 	HelloRetryTimeout time.Duration
 
 	// MaxHttpResponseBodyBytes is the largest response body the strategy will
-	// materialize. Values <= 0 use DefaultMaxHttpResponseBodyBytes so a partial
-	// settings struct cannot accidentally restore an unbounded io.ReadAll.
+	// materialize in memory. Values <= 0 use the default
+	// (DefaultClientStrategySettings) so a partial settings struct cannot
+	// accidentally restore an unbounded io.ReadAll.
 	MaxHttpResponseBodyBytes int64
 
 	// Embedded low-memory transports set explicit connection-resident buffer
@@ -254,6 +256,29 @@ type ClientStrategySettings struct {
 
 	MinNextConnectDelay time.Duration
 	MaxNextConnectDelay time.Duration
+	// ReconnectFastPathLimit caps how many callers may hold the reconnect
+	// fast path (NextReconnectTime) at once. A device runs a handful of
+	// platform transports per strategy, so the default covers the common
+	// migration re-dial burst while the platform LB never sees more unpaced
+	// dials than this from one strategy; callers past the cap fall back to the
+	// serialized NextConnectTime staircase. A kick re-dial
+	// (NextKickReconnectTime) holds its own slot (KickReconnectLimit), not
+	// one of these. Non-positive disables the fast path.
+	ReconnectFastPathLimit int
+	// ReconnectFastPathMaxDelay is the independent per-caller jitter of a
+	// fast-path reconnect and of a kick re-dial: uniform in [0, this). Enough
+	// spread that concurrent reconnects do not hit the LB in the same instant,
+	// small enough that it never becomes the dominant term of a reconnect.
+	// Non-positive dials at once.
+	ReconnectFastPathMaxDelay time.Duration
+	// KickReconnectLimit caps how many callers may hold a kick re-dial
+	// (NextKickReconnectTime) at once. A kick re-dials every live transport on
+	// the strategy -- about 5 on iOS, up to about 11 on desktop -- and all of
+	// them at once is the point of the kick, so the default sits above that
+	// count: it changes nothing for a switch today and bounds a future growth
+	// in transports per device. Callers past the cap take the ordinary
+	// reconnect path (NextReconnectTime). Non-positive removes the cap.
+	KickReconnectLimit int
 
 	// ExtraHeaders, when set, are applied (Set semantics, overriding same-named
 	// headers) to every request this strategy issues: http serial/parallel,
@@ -322,6 +347,9 @@ type ClientStrategy struct {
 	// means all slots free, so a bare test-constructed strategy works
 	// unchanged.
 	reconnectFastPathCount int
+	// kickReconnectCount is the number of kick re-dial slots currently held
+	// (see NextKickReconnectTime). Guarded by mutex; zero means all free.
+	kickReconnectCount int
 
 	// Delivery evidence scales static route weights and controls serial
 	// preference. NetworkChanged advances a private path generation; hosts
@@ -954,21 +982,6 @@ func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 	return nextConnectTime, release
 }
 
-const (
-	// reconnectFastPathLimit caps how many callers may hold the reconnect
-	// fast path (NextReconnectTime) at once. A device runs a handful of
-	// platform transports (h1 + the h3/pt variants), so 4 covers the common
-	// migration re-dial burst while guaranteeing the platform LB never sees
-	// more than 4 unpaced dials from one strategy -- callers past the cap fall
-	// back to the serialized NextConnectTime staircase.
-	reconnectFastPathLimit = 4
-	// reconnectFastPathMaxDelay is the independent per-caller jitter for a
-	// fast-path reconnect: uniform in [0, 250ms). Enough spread that
-	// concurrent reconnects do not hit the LB in the same instant, small
-	// enough that it never becomes the dominant term of a reconnect.
-	reconnectFastPathMaxDelay = 250 * time.Millisecond
-)
-
 // NextReconnectTime is the scoped fast path of NextConnectTime for a caller
 // whose transport was connected and just lost its connection.
 //
@@ -983,10 +996,11 @@ const (
 // once.
 //
 // So a caller that self-identifies as reconnecting draws a small INDEPENDENT
-// jitter (0-250ms) that neither reads nor advances the shared timestamp. The
-// fast path is capped at reconnectFastPathLimit concurrent holders (a
-// semaphore on the strategy) so the platform LB still never sees an unbounded
-// herd; a caller past the cap falls back to the serialized path. The returned
+// jitter (ReconnectFastPathMaxDelay) that neither reads nor advances the
+// shared timestamp. The fast path is capped at ReconnectFastPathLimit
+// concurrent holders (a semaphore on the strategy) so the platform LB still
+// never sees an unbounded herd; a caller past the cap falls back to the
+// serialized path. The returned
 // release func frees the slot and MUST be called once the dial attempt
 // completes (success or failure); it is idempotent and never nil. Callers use
 // this only for the FIRST dial after a lost connection -- retries after a
@@ -997,7 +1011,7 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
-		if self.reconnectFastPathCount < reconnectFastPathLimit {
+		if self.reconnectFastPathCount < self.settings.ReconnectFastPathLimit {
 			self.reconnectFastPathCount += 1
 			acquired = true
 		}
@@ -1023,8 +1037,16 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 			self.reconnectFastPathCount -= 1
 		})
 	}
-	jitter := time.Duration(mathrand.Int63n(int64(reconnectFastPathMaxDelay)))
-	return time.Now().Add(jitter), release
+	return time.Now().Add(self.reconnectFastPathJitter()), release
+}
+
+// reconnectFastPathJitter is one draw of the fast path's independent jitter,
+// uniform in [0, ReconnectFastPathMaxDelay); none when that is non-positive.
+func (self *ClientStrategy) reconnectFastPathJitter() time.Duration {
+	if maxDelay := self.settings.ReconnectFastPathMaxDelay; 0 < maxDelay {
+		return time.Duration(mathrand.Int63n(int64(maxDelay)))
+	}
+	return 0
 }
 
 // The weight of each dialer an eval may use. `webSocketOnly` drops the
@@ -1032,6 +1054,40 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]float32 {
 	weights, _ := self.dialerWeightsUnlimited(webSocketOnly)
 	return weights
+}
+
+// NextKickReconnectTime is the reconnect fast path for the re-dial a network
+// change asked for: the same small independent jitter, on slots of its own. A
+// kick re-dials each live transport once, so the burst is bounded by the
+// transports on this strategy, and the fast path's cap would stagger the
+// window's exits behind each other on the staircase -- the delay the kick
+// exists to remove. KickReconnectLimit sits above that count and only bounds
+// a growth in transports per device; a caller past it takes the ordinary
+// reconnect path (NextReconnectTime). The release contract is
+// NextReconnectTime's: call it once the dial attempt completes.
+func (self *ClientStrategy) NextKickReconnectTime() (time.Time, func()) {
+	acquired := false
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if limit := self.settings.KickReconnectLimit; limit <= 0 || self.kickReconnectCount < limit {
+			self.kickReconnectCount += 1
+			acquired = true
+		}
+	}()
+	if !acquired {
+		return self.NextReconnectTime()
+	}
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			self.kickReconnectCount -= 1
+		})
+	}
+	return time.Now().Add(self.reconnectFastPathJitter()), release
 }
 
 // The weights of dialerWeights with every limited extender dialer left out
@@ -1152,7 +1208,7 @@ func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, erro
 		return nil, fmt.Errorf("http response has no body")
 	}
 	if maxBytes <= 0 {
-		maxBytes = DefaultMaxHttpResponseBodyBytes
+		maxBytes = DefaultClientStrategySettings().MaxHttpResponseBodyBytes
 	}
 	if maxBytes < response.ContentLength {
 		return nil, fmt.Errorf(
@@ -3456,7 +3512,7 @@ func httpPostStreamRaw(
 	}
 
 	defer releaseHttpResponseBody(ctx, res)
-	bodyBytes, err := readHttpResponseBody(res, DefaultMaxHttpResponseBodyBytes)
+	bodyBytes, err := readHttpResponseBody(res, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}

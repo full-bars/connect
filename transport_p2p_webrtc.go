@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -123,8 +124,9 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 // contract (CODESTYLE: receive callbacks must not block), such sends use
 // timeout 0 — enqueue if there is room, drop otherwise — instead of the
 // sender-context default of blocking for backpressure. Recovery depends on
-// kind: an offer may replay on WaitingForSdpOffer, while a refused answer or
-// flushed candidate may need the outer transport's generation reconnect.
+// kind: an offer may replay on WaitingForSdpOffer, and a cached answer may
+// replay on an identical offer from the accepted generation. Without another
+// offer, a refused answer or flushed candidate may still need generation reconnect.
 // A refusal alone does not establish recovery or usable exchange fallback.
 // Blocking here can wedge signal delivery for every peer.
 type signalSendNonBlocking struct{}
@@ -300,15 +302,19 @@ func receiveSignalsFromClient(
 	receiver SignalReceiver,
 ) (*clientSignalDispatcher, func()) {
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
-	bufferSize := defaultTransferBufferSize
+	var bufferSize int
 	if client.settings != nil && client.settings.ReceiveBufferSettings != nil {
 		bufferSize = client.settings.ReceiveBufferSettings.SequenceBufferSize
+	} else {
+		bufferSize = DefaultReceiveBufferSettings().SequenceBufferSize
 	}
 	bufferSize = max(1, bufferSize)
-	workerCount := 4
+	var workerCount int
 	if client.settings != nil && client.settings.WebRtcSettings != nil &&
 		0 < client.settings.WebRtcSettings.SignalReceiveWorkerCount {
 		workerCount = client.settings.WebRtcSettings.SignalReceiveWorkerCount
+	} else {
+		workerCount = DefaultWebRtcSettings().SignalReceiveWorkerCount
 	}
 	workerCount = min(bufferSize, max(1, workerCount))
 	dispatcher := &clientSignalDispatcher{
@@ -990,7 +996,7 @@ type WebRtcSettings struct {
 	// SignalReceiveWorkerCount hashes each peer/stream onto one ordered
 	// worker. Separate peers negotiate concurrently, while each stream's SDP
 	// and ICE ordering and the bounded receive callback backpressure remain
-	// intact.
+	// intact. Non-positive uses the default (DefaultWebRtcSettings).
 	SignalReceiveWorkerCount int
 	EnableSctpSnap           bool
 	EnableSctpZeroChecksum   bool
@@ -3726,8 +3732,17 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if self.active {
 			return
 		}
-		if self.offerSignal() != nil {
-			// already accepted an offer; ignore the duplicate
+		if offerSignal := self.offerSignal(); offerSignal != nil {
+			// The first answer can be refused by zero-wait Client admission.
+			// Replay only for the exact accepted offer/generation; applying SDP
+			// again would advance Pion's already-stable state machine.
+			if senderGenerationSet == self.remoteSignalGenerationSet &&
+				(!senderGenerationSet || senderGenerationId == self.remoteSignalGeneration) &&
+				bytes.Equal(signal.Sdp, offerSignal.Sdp) {
+				if answerSignal := self.answerSignal(); answerSignal != nil {
+					toSend = []*protocol.ExchangeSignal{answerSignal}
+				}
+			}
 			return
 		}
 		// Decode and apply before committing our cached offer. A malformed or
