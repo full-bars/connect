@@ -289,12 +289,34 @@ func controlDialThrottle(key string) *logThrottle {
 	return t
 }
 
+// ControlDialObserver is an optional interface for the Logger a transport is
+// configured with. When the logger implements it, every control dial reports
+// its typed result: the path tag ("platform", "api", "dns"), the network and
+// address that were dialed, and the error, nil on success. The call is made
+// for every dial, not only the ones that reach the log, and must not block.
+//
+// An embedder that runs one transport per proxy gives each its own logger, so
+// the observer knows which proxy a failed dial belongs to. A failure inside
+// the proxy's own connect step is a *net.OpError whose Op names the socks
+// command, which separates "this proxy cannot carry traffic" from "the
+// platform is unreachable".
+type ControlDialObserver interface {
+	ObserveControlDial(tag string, network string, addr string, err error)
+}
+
 // logControlDialResult emits the per-dial evidence line. Quiet unless an
 // egress interface is forced, so mobile and app builds are unaffected.
 // `bound` is whether this dial path rides the egress-bound dialer — false
 // names a path that is in-tunnel by design (e.g. the mux's tunnel DoH).
 func logControlDialResult(log Logger, tag string, bound bool, network string, addr string, conn net.Conn, err error) {
 	l := loggerOrDefault(log)
+
+	// A logger that wants the typed result gets it before any throttling, so
+	// an embedder can tell which leg of a proxied dial failed (a net.OpError
+	// from the socks dialer names the proxy) without parsing the log line.
+	if observer, ok := l.(ControlDialObserver); ok {
+		observer.ObserveControlDial(tag, network, addr, err)
+	}
 
 	// The family line is NOT gated on egressBound(). The [egress]dial line
 	// below is desktop-only by design -- it reports an interface binding that
