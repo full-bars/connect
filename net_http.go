@@ -2140,6 +2140,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 type DialerInfo struct {
 	Description string
 	ExtenderIp  netip.Addr
+	// a relay -- an extender or a VLESS server -- carries the dial and
+	// resolves its destination name itself (resident_move.go)
+	relay bool
 	// The scoring identity is private; public telemetry keeps the family name.
 	strategyKey string
 	// Private attempt ownership is never serialized or uploaded.
@@ -2227,6 +2230,12 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		info := self.dialerInfo(dialer)
+		// a strict move dials its target direct: a relay resolves the
+		// platform name itself and cannot reach the target. Refused before
+		// the dial, so the relay's health is untouched (resident_move.go).
+		if override := moveDialOverrideFromContext(handleCtx); override != nil && override.strict && dialer.relays() {
+			return causes.track(&evalResult{dialerInfo: info, err: errResidentMoveRelay})
+		}
 		timing := &dialTiming{}
 		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, timing.wrapDialer(dialer.WsDialer(self.settings)), H1FramerProtocol, maximum, enabled, stats)
 		terminal, refusalOnly := httpUpgradeTerminalCauses(err)
@@ -2728,6 +2737,7 @@ func (self *clientDialer) Info() *DialerInfo {
 	info := &DialerInfo{
 		Description: self.description,
 		strategyKey: self.dialerKey(),
+		relay:       self.extenderConfig != nil || self.vlessConfig != nil,
 	}
 	if self.extenderConfig != nil {
 		info.ExtenderIp = self.extenderConfig.Ip.Unmap()
@@ -3050,6 +3060,12 @@ func (self *clientDialer) IsExtender() bool {
 	defer self.mutex.Unlock()
 
 	return self.extenderConfig != nil
+}
+
+// Whether the dialer reaches its destination through a relay -- an extender
+// or a VLESS server -- that resolves the destination name itself.
+func (self *clientDialer) relays() bool {
+	return self.IsExtender() || self.vlessConfig != nil
 }
 
 // Reports whether the latest completed outcome succeeded. The caller holds
