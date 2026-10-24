@@ -22,6 +22,24 @@ var referenceMemoryBudgetByteCount = mib(64)
 
 var memoryBudgetByteCount atomic.Int64
 
+// defaultPlatformTransportCountLimit is the carrier count cap for a client
+// window: enough candidates to come up, few enough to bound expansion.
+const defaultPlatformTransportCountLimit = 16
+
+// platformTransportCountLimit is the process-wide carrier count cap. A
+// provider keeps one platform carrier per proxy slot, so the client default
+// leaves hundreds of slots queued in PlatformTransportBudget.Acquire forever.
+// An embedder raises it with SetPlatformTransportCountLimit.
+var platformTransportCountLimit atomic.Int64
+
+// platformTransportCountCap returns the cap a process budget is built with.
+func platformTransportCountCap() int {
+	if limit := int(platformTransportCountLimit.Load()); limit > 0 {
+		return limit
+	}
+	return defaultPlatformTransportCountLimit
+}
+
 func newDefaultPlatformTransportBudget(budgetByteCount ByteCount) *PlatformTransportBudget {
 	return newDefaultPlatformTransportBudgetWithParent(budgetByteCount, nil)
 }
@@ -36,9 +54,21 @@ func newDefaultPlatformTransportBudgetWithParent(
 		// floor, an explicit H3 selection on the 8 MiB legacy host target
 		// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim.
 		min(budgetByteCount, max(mib(3), budgetByteCount/4)),
-		16,
+		platformTransportCountCap(),
 		parent,
 	)
+}
+
+// SetPlatformTransportCountLimit raises the process-wide carrier count cap.
+// 0 restores the desktop default. A provider passes its proxy slot count: each
+// slot holds one carrier, and a 16-carrier cap with 500 slots leaves the rest
+// blocked in Acquire, which shows up as tens of thousands of goroutines and a
+// pool that drains and reconnects instead of serving.
+func SetPlatformTransportCountLimit(count int) {
+	if count < 0 {
+		count = 0
+	}
+	platformTransportCountLimit.Store(int64(count))
 }
 
 // NewPlatformTransportBudgetForMemoryTarget creates an independent carrier

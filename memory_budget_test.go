@@ -391,3 +391,27 @@ func TestMessagePoolAggregateStatsDoesNotAllocate(t *testing.T) {
 		t.Fatalf("GetMessagePoolAggregateStats allocated %.0f objects, want 0", allocations)
 	}
 }
+
+// TestPlatformTransportCountLimitRaisesProcessBudgetCap pins the provider fix:
+// the carrier cap was a hard-coded 16, so a provider with hundreds of proxy
+// slots queued in PlatformTransportBudget.Acquire forever. An embedder raises
+// it, and 0 restores the desktop default.
+func TestPlatformTransportCountLimitRaisesProcessBudgetCap(t *testing.T) {
+	previousLimit := platformTransportCountLimit.Load()
+	t.Cleanup(func() { platformTransportCountLimit.Store(previousLimit) })
+	SetMemoryBudget(mib(512))
+	t.Cleanup(func() { SetMemoryBudget(0) })
+
+	SetPlatformTransportCountLimit(500)
+	if got := DefaultPlatformTransportBudget().maxTransportCount; got != 500 {
+		t.Fatalf("carrier cap = %d, want 500", got)
+	}
+	if got := DefaultPlatformTransportBudget().totalByteCount; got <= 0 {
+		t.Fatalf("byte budget = %d, want positive", got)
+	}
+
+	SetPlatformTransportCountLimit(0)
+	if got := DefaultPlatformTransportBudget().maxTransportCount; got != defaultPlatformTransportCountLimit {
+		t.Fatalf("carrier cap after reset = %d, want %d", got, defaultPlatformTransportCountLimit)
+	}
+}
