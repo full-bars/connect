@@ -106,6 +106,11 @@ type ClientStrategySettings struct {
 	// `DefaultLogger()`.
 	Log Logger
 
+	// DisableExtenderNetwork, when true, stops the sdk network space built from
+	// these settings from starting the extender network client and the gossip
+	// member node. Zero value keeps today's behavior.
+	DisableExtenderNetwork bool
+
 	// expose consistent ips
 	// if true, enables ech
 	ExposeServerIps bool
