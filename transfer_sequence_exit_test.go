@@ -201,3 +201,39 @@ func TestSendSequenceExitDiscriminatorDueIdentity(t *testing.T) {
 		t.Log(lines[0])
 	})
 }
+
+// The ack-lifetime exit is the ordinary outcome for a destination with no
+// route, so it is trace: a logger with V(1) disabled must not see it, while
+// TestSendSequenceExitDiscriminatorBlockedRoute (same fixture, V enabled)
+// proves the fields are still emitted. Every other reason stays at info.
+func TestSendSequenceExitAckLifetimeIsTrace(t *testing.T) {
+	log := &traceOffRecordingLogger{recordingLogger: newRecordingLogger()}
+	runWindowInitialLifetimeFixture(t, 400*time.Millisecond, 500*time.Millisecond, false, func(t *testing.T, fixture *windowInitialLifetimeFixture) {
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		if len(fixture.failed) != 1 || len(fixture.written) != 0 || len(fixture.route) != cap(fixture.route) {
+			t.Fatal("blocked route did not produce the expiry this test needs")
+		}
+		if lines := log.linesWith("event=sequence_exit"); len(lines) != 0 {
+			t.Fatalf("ack-lifetime exit reached a default-verbosity log: %v", lines)
+		}
+	}, func(fixture *windowInitialLifetimeFixture) {
+		fixture.sequence.log = log
+		fixture.sequence.sendBufferSettings.WriteTimeout = time.Second
+		for range cap(fixture.route) {
+			wire := MessagePoolGet(16)
+			clear(wire)
+			fixture.route <- wire
+		}
+	})
+}
+
+// traceOffRecordingLogger records everything except lines gated behind V(1),
+// which is what a default-verbosity process sees.
+type traceOffRecordingLogger struct {
+	*recordingLogger
+}
+
+func (self *traceOffRecordingLogger) V(level int32) Verbose {
+	return noopVerbose{}
+}

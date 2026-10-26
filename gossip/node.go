@@ -331,6 +331,12 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		self.runStatus()
 	}, cancel)
 
+	// One line identifies the mesh member. Without it every later gossip line
+	// is anonymous and an operator cannot tell which peer joined which network
+	// space, or whether the node that is failing came up at all.
+	self.log.Infof("[gossip] peer=%s network=%s role=%s listen_addrs=%d operator_addrs=%d started\n",
+		self.host.ID(), self.settings.NetworkHost, self.settings.Role, len(self.host.Addrs()), len(self.settings.OperatorAddrs))
+
 	success = true
 	return self, nil
 }

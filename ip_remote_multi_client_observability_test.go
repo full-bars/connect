@@ -913,5 +913,12 @@ func (self *recordingLogger) Errorf(format string, args ...any) {
 }
 
 func (self *recordingLogger) V(level int32) Verbose {
-	return noopVerbose{}
+	return self
+}
+
+// Enabled reports every level, because these tests assert on lines emitted at
+// trace verbosity too (the ack-lifetime sequence exit is V(1) by design). A
+// recorder that dropped them would read as "nothing was logged".
+func (self *recordingLogger) Enabled() bool {
+	return true
 }

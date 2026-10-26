@@ -64,9 +64,24 @@ func (self *SendSequence) recordSendSequenceExit(reason string, item *sendItem, 
 	if self.client.ctx != nil {
 		parentErr = self.client.ctx.Err()
 	}
-	self.log.Infof("[s]event=sequence_exit reason=%s client=%s destination=%s sequence=%s stream=%s ctx=%v parent_ctx=%v cause=%v pending=%d message=%s number=%d sends=%d lifetime_start_ns=%d write_started_ns=%d lifetime_ns=%d deadline_ns=%d observed_ns=%d selective=%t route_written=%t reliable=%t unreliable=%t carrier_changed=%t retained=%t head_set=%t head_number=%d head_received_ns=%d pending_head=%d pending_sacks=%d pending_contracts=%d\n",
+	format := "[s]event=sequence_exit reason=%s client=%s destination=%s sequence=%s stream=%s ctx=%v parent_ctx=%v cause=%v pending=%d message=%s number=%d sends=%d lifetime_start_ns=%d write_started_ns=%d lifetime_ns=%d deadline_ns=%d observed_ns=%d selective=%t route_written=%t reliable=%t unreliable=%t carrier_changed=%t retained=%t head_set=%t head_number=%d head_received_ns=%d pending_head=%d pending_sacks=%d pending_contracts=%d\n"
+	args := []any{
 		reason, self.client.ClientTag(), self.destination, self.sequenceId, self.contractMultiRouteWriterAlias.StreamId,
 		contextErr, parentErr, cause, pending, message, number, sends, lifetimeStart, writeStarted,
 		lifetime, deadlineNanos, now.UnixNano(), selective, written, reliable, unreliable, carrierChanged, retained,
-		headSet, headNumber, headAt, pendingHead, pendingSacks, pendingContracts)
+		headSet, headNumber, headAt, pendingHead, pendingSacks, pendingContracts,
+	}
+	// An ack-lifetime expiry is the ordinary outcome for a destination with no
+	// route: one line per identity per start is a trace of that state, not an
+	// incident. The caller reports the state itself at info level (control
+	// plane not reached, how many identities, oldest age), so the per-message
+	// detail lives at V(1). Every other reason is an abnormal exit and keeps
+	// info, where an operator reads it without a verbosity flag.
+	if reason == "ack_lifetime" {
+		if log := self.log.V(1); log.Enabled() {
+			log.Infof(format, args...)
+		}
+		return
+	}
+	self.log.Infof(format, args...)
 }
