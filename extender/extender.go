@@ -1261,11 +1261,11 @@ func (self *ExtenderServer) addCarrierWithLock(carrier string) {
 	delete(self.carrierListenErrs, carrier)
 }
 
-// Reports one carrier bind failure (G2). The carrier is disabled; the log line
-// is unconditional because a bind that failed is a configuration fact an
-// operator needs, and the handler is what the sdk provider role reads.
+// Records one carrier bind failure (G2). The carrier is disabled; the handler is
+// what the sdk provider role reads. The bind helpers have already logged the
+// failure with its carrier, port and owner, which an operator needs whether or
+// not the bind is the first one.
 func (self *ExtenderServer) reportListenError(carrier string, err error) {
-	log.Printf("[extender] listen error (%s): %s", carrier, err)
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
