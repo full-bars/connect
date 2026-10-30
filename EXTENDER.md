@@ -1123,6 +1123,17 @@ one hello for both families and compares the address, not the port. The
 slept: a minute after waking from a sleep of 15 minutes or more, what came
 due during the sleep is due.
 
+A failed activation post and a failed hello each log one line,
+`[extender]activate v<n> err = ` and `[extender]activate hello err = `. An
+exhausted request's own message is the fixed text "http request attempts
+exhausted", so the line appends the cause each attempt retained, separated by
+`; `, with a cause that repeated shown once as `(x<count>)`. The causes are the
+unwrapped leaves (dial, tls, quic, dns, deadline), so the line names no request
+url, header or jwt; a url error kept whole is reduced to its operation. Any
+other error logs as its own message. Only the log line carries the causes: the
+family's recorded `LastError` stays the short message (net_http_exhaustion.go
+`httpRequestErrorWithCauses`, 04505b369).
+
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
 `--allowed_host` repeated, `--nlayer-hop` repeated (A11), `--state_dir`,
