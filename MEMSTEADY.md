@@ -1,5 +1,79 @@
 # Memory-budget performance research
 
+## 2026-10-26: native duplicate-ACK recovery checkpoint
+
+A local real-gVisor pilot exercised the full TUN/H1 path with GRO enabled, a verified **2 MiB** body and exactly one controlled first-segment loss after Transfer delivery. The effective constructor `ReturnResendTimeout` was **1 second in both arms**. The single normal pair measured:
+
+| Measurement | OLD | NEW |
+| --- | ---: | ---: |
+| Loss-case bulk download duration | **1,039.074125 ms** | **39.134917 ms** |
+| Receiver hole, drop to first replay | **999.169542 ms** | **8.710833 ms** |
+| Healthy bulk download duration | **34.331042 ms** | **34.031458 ms** |
+
+The OLD/NEW loss-duration ratio is **26.551** for this pair. It is not a statistical baseline, Fast.com result, page-TTFB measurement or SDK32/64 memory qualification. Both arms completed the same body hash; the healthy pair does not establish a statistically unchanged cost. All four normal/race pilot receipts are accepted: two expected OLD recovery failures, two OLD healthy passes and four NEW passes, with final source checks matching, recorded owners joined and the cache lease released. Race results qualify behavior, not speed. ACK observations and deterministic coverage are recorded in [RTOPT](RTOPT.md#2026-10-26-native-duplicate-ack-feedback-checkpoint).
+
+The production correction adds 27 lines across two files, with no added state fields, per-flow ledger, packet queue or RTO change. This source shape is not a measured memory saving. A separate ACK-plus-covered-DATA group concern remains a source-only hypothesis, without a runtime reproduction or production fix.
+
+These results used a tested overlay on **C23 before the incoming origin sync**; the merged source requires fresh qualification. The original 100-HTML/400-asset/99-overlap workload and five-second navigation limit, full six-repository correctness, 48 synthetic family invocations/60 benchmark processes, four native builds/112 physical cases, and the 32 MiB iOS-profile surrogate on Android/64 MiB Android memory profiles remain pending. Historical browsing attribution and full page-stall resolution remain unproven.
+
+Evidence: [normal-pair metrics](/private/tmp/urnetwork-gvisor-normal-pilot-metrics.PREP.bmyetujp/NORMAL-PAIR.json), SHA-256 `c545c03f6e26fe2e5f09a8d544c4fcbc7e2f67f0390b1bf244232d96f48ae879`; [closed pilot custody](/private/tmp/urnetwork-c23-gvisor-pilot-final.m9d8t3ub/FINAL-CUSTODY.json), SHA-256 `5bf3f12f2d27381b2983035df87005f14e2c65d91006bee0f2ed2f66b50314d9`.
+
+## 2026-10-25: cold-page evidence and selection-consistent duplicate suppression
+
+Focused qualification completed with all processes and monitors joined and the native cache released. This is not final workload or memory qualification.
+
+### Separate reproduced bugs from the original browsing incident
+
+The expanded workload keeps 100 HTML pages, 400 assets, 99 overlaps, 50–300 KiB per page, and the original five-second navigation limit. Page 1 opens a previously unvisited HTTPS destination while independently retained CSS/JavaScript bodies and an image overlap remain active. Inner H1 and H2 share the same outer H1 transport; no public H3, DNS-alt, P2P or video result is inferred.
+
+The uninstrumented C18 cellular H1 arm failed at page 1: tap-to-first-byte **5.620738542 s**, comprising **5.316345125 s TCP establishment**, **167.095750 ms TLS**, and **137.213125 ms request-to-first-byte**. The Wi-Fi H1/H2 normal/race arms passed. Later cellular arms were not run after that failure. The sampled memory/queue counters do not identify a lost packet or establish that memory caused the delay.
+
+One C19 instrumented cellular replay passed all 100/400/99 operations. Its cold page took **3.615751292 s**; the largest tap-to-first-byte measurement anywhere in that run was **4.385143750 s**. This is a diagnostic pass, not a measured fix or an OLD/NEW speed comparison. The original C18 failure remains unattributed.
+
+The complete diagnostic retained 42 tuple rows without overflow, 30 core events, and all SDK-call accounting. During the cold interval, all 19 SDK calls completed; the maximum was **205,208 ns**, with none at or above 50 ms. The two TUN dials started approximately two seconds apart. The second dial won after its next one-second SYN retry; the later SYNACK for the canceled first dial elicited a reset. This excludes a multi-second SDK send in this passing run only. ReadBatch timestamps are dequeue observations, not proof of when gVisor emitted a packet. Concatenate Go test Output fragments before decoding long records; parsing each JSONL Output independently loses split event lines.
+
+### Proven lost-SYN race
+
+A separate deterministic native-entry test demonstrated a real bug. The send path captured provider A and qualified its affinity. A provider failure then unbound A before the duplicate-suppression gate. The gate still used the captured A pointer and A's retained sequence coverage, rejecting the current SYN although the actual flow had no selected provider. The same public native offer returned false and delivered **zero SYNs to healthy B**. Both normal and race OLD processes produced that sole causal failure.
+
+The candidate evaluates every member of a group under one flow lock against one current immutable selection receipt. Bound admission uses that same receipt and rejects a stale receipt before source ownership. An error-free stale refusal can refresh into a current selection/race within the existing offer. No persistent packet cache, goroutine, timer policy, memory limit, or TCP/UDP ACK policy was added. UDP and disabled-collapse fast paths retain their unlocked behavior.
+
+The first candidate passed seven new cases in normal and race mode, but broader tests caught an important regression: it also retried an operation that returned a non-nil error after A→B→A. The existing exact-receipt error guard must finish that old failed operation without offering it to the new selection. V2 restricts refresh to **failure with no error**. The existing error-ownership case and the new refusal-recovery case now test opposite sides of that boundary. V2 passed 77 selected roots normally and 77 with the race detector, including 146 passing child cases per command. This is focused compatibility evidence, not a full Connect/SDK/Server pass.
+
+The predeclared healthy CPU/allocation screen completed in OLD/NEW/NEW/OLD order, with two fresh processes per variant and three samples per case/process. All 36 rows passed finite-value and census validation; no samples were excluded.
+
+| Existing microbenchmark | OLD median [min–max], ns/op | V2 median [min–max], ns/op | Median CPU change | B/op; allocs/op, unchanged |
+| --- | ---: | ---: | ---: | ---: |
+| Gate + commit | 133.9 [128.6–138.2] | 124.65 [123.5–125.9] | −6.91% | 352; 1 |
+| Parsed admission, one packet | 565.9 [561.0–572.8] | 562.55 [557.9–571.9] | −0.59% | 640; 10 |
+| Parsed admission, eight packets | 1,251 [1,223–1,282] | 1,267 [1,263–1,283] | +1.28% | 2,168; 17 |
+
+Within-variant max–min/median spread was 1.58–7.17%; none of the declared CPU-ratio >1.10, spread >10% or allocation-increase review screens fired. These nested samples are not six independent processes. This is a diagnostic microbenchmark screen, not a significance/equivalence test, network gain or baseline promotion. It supports retaining the correctness repair without an observed allocation increase; the full performance and memory workload qualification remains outstanding. The gate/commit benchmark uses a literal mutable-settings fixture, whose fallback can allocate a reliability-settings projection; shipping constructors cache that projection. Its absolute 352 B/op is not a demonstrated production per-packet allocation.
+
+### C20 uninstrumented matrix: separate request time from fixture serialization
+
+The first integrated-source cold-link matrix ended at its first failure: 17 root executions, 16 passes, one failure and no skips; the final three cellular cases were not run. All processes and monitors joined, source checks matched, and the native cache lease was released. Final custody: `78edb713e26cdb943dfe3e0c3a5564c97c509e22231c674867f1e2d4c1919479`.
+
+All six controls passed normally and under the race detector. Each of the four Wi-Fi full cases completed 100 HTML pages, 400 validated-or-canceled assets and 99 overlap proofs. Maximum tap-to-first-byte times were 1.139125625 s (inner H1 normal), 2.159961959 s (inner H2 normal), 3.142979083 s (inner H1 race), and 3.163630333 s (inner H2 race). Race runs are correctness evidence, not performance baselines. All used outer H1.
+
+Cellular/inner-H1 normal completed the same 100/400/99 workload but failed the unchanged five-second combined limit at page 1: 5.587167459 s. Actual navigation first-byte time was 3.645526583 s; the controller spent 1.941632084 s awaiting prior CSS/JS read progress before issuing HTML. Source inspection confirms that `beforeNavigation` records the tap, waits for the old body to reach 1 KiB, and only then permits the next request. The warm-H2 witness contains the same dependency. That test-induced serialization is being corrected; the failure remains retained and no corrected-matrix qualification is claimed.
+
+This does not explain away the original C18 failure: that page had 5.620698417 s actual navigation and only 0.000034292 s controller wait. Nor does the C20 result prove a causal network improvement: the controller wait changes traffic phasing. Preserve both boundaries and the original five-second gate. A valid correction must dispatch HTML immediately after the recorded tap while proving original unfinished request ownership without requiring more bytes to arrive. Missing/closed/released/replaced owners and genuine five-second HTTP delays must still fail deterministic controls. Retain the original image-tail proof, page sizes, profiles, origins, four-live-page bound and all failure records.
+
+The source-consistent SYN-gate repair remains independently qualified by its deterministic OLD failure and 154 positive normal/race executions. The original network-stall attribution, complete cold matrix, full six-repository correctness, full simulator/benchmark scope and physical 32/64 MiB qualification remain open.
+
+### Independent pool metadata repair
+
+Two deterministic encoder-size-growth cases exposed pool metadata being overwritten by append: aggregate take/return counts balanced while per-shard reconciliation retained two apparent roots/512 bytes. Limiting append capacity to payload bytes protects the twelve-byte pool footer; backing-array identity handles replacement output, and successful pooled aliases regain their full returnable view. Error and moved-output paths return their respective owned buffers exactly once.
+
+The encoder repair passed 16 normal and 16 race roots. Its earlier paired microkernel screen retained zero allocations in all ten cases: exact subprotocol medians 20.11→21.17 ns and protobuf 65.62→66.14 ns. These are noisy diagnostic measurements, not a speed improvement or proof that the separately observed cold-DoH 512-byte residue had this cause. The integrated ownership/encoder/directory checks also passed 41 normal and 41 race roots.
+
+### Remaining qualification
+
+The corrected source still needs the full six-repository correctness protocol, complete simulator/benchmark scope and fresh two-device hosted H1 MEMSTEADY/PERFVAR. Physical qualification uses separate **32 MiB iOS-surrogate** and **64 MiB Android** cohorts on the allowlisted phones, Wi-Fi/cellular, provider OFF and API-alt OFF. Its control/candidate builds are A/A from the same frozen source; they do not prove a causal speedup from a prior release or from 32→64 MiB. Each profile must pass startup, traffic, drain, 330 seconds quiet (300-second/21-sample qualifying window), teardown and joined cleanup. No native-iOS under-50-MiB footprint claim is possible without a real extension measurement.
+
+Evidence: C18 cold final `bb560f56661f50c2847e39b597d5f4cad64ba403e373f44af5d82880d0dc201b`; C19 trace final `426ed9d0e90bb638ab72c7993d4ea72d02e9a074b7ffc6f4e4a61e2c31defc70`; OLD lost-SYN proof `160e5320b1019a894131893d8d2403a211e9934ad8f2cb884a6849d63fc1ae2f`. V2 merged final custody `3bdb081d9a379287573f2e4e183ea3093e7b48e33d5797847b2e1f526f974bec`; final 36-row comparison `b7cebc07c2424b414189b5a5e1123ccde59d2e913db4079340f3e634df843f5e`. All source checks matched before, after and at final join. The uninstrumented cold-link fixture is now included in the PERFVAR source for the next full matrix.
+
 ## 2026-10-24 UTC: revised 100-page overlap qualification
 
 The `next-navigation-image-v2` fixture now proves an actual unfinished original
@@ -6013,3 +6087,307 @@ original source identities.
 Focused candidate qualification completed with all processes joined and cache
 released; final custody SHA-256
 `56a1ba54ba918fceefc732a63031db8d2236f1bb86a7d7a56efcdf3585ccacaf`.
+
+### Removing fixture-induced navigation serialization
+
+Deterministic controls reproduced two separate fixture errors: waiting for an old body to reach a read prefix before issuing the next HTML request, and rejecting a valid original asset request that had entered the HTTP transport but was still establishing TCP/TLS. Neither condition is a requirement of rapid browsing. The correction records the tap at the same boundary, validates exact live original request ownership without waiting for more bytes or TLS readiness, and dispatches the next HTML request. Observed TLS/session evidence is still validated when available; canceled, finished, released, duplicate, foreign, or replaced owners remain errors.
+
+The original image-tail overlap evidence, four-live-page bound, 100 HTML requests, 400 assets, 99 overlap transitions, page sizes, origins, matched profiles, application deadline and five-second tap-to-first-byte limit are unchanged. Deterministic controls also retain a genuine HTTP delay beyond that limit as a failure. This is a fixture correction, not evidence that the original C18 network stall is fixed.
+
+The pending-TLS counterfactual produced exactly two expected failures normally and two under the race detector. The corrected fixture completed 30/30 normal and 30/30 race checks with no skips or race reports. Normal raw evidence: `93314b5202d9b33333fca0af25a8d01966ed566ca326e8e021dc106f42df856b`; race raw evidence: `741266f80f9a03d3b3f6ed9232c1781cf7ec80fa501bdd4360217e5d64103247`. Final source/cleanup custody and full-matrix results remain required; these focused checks alone do not qualify the browsing workload.
+
+Final custody confirms all processes and monitors joined, the native cache lease was released, and source checks matched: `af0af017ecc6c91f5089e14f4c8daca460d31abe8268294e0616d05a4089dc6e`. The exact eleven fixture afterimages were integrated only after that final receipt. Full eight-case replay remains pending.
+
+### C21 replay: fixture correction passes, network stall remains
+
+After integrating the eleven fixture afterimages qualified by 30 normal and 30 race checks, the uninstrumented cellular inner-H1 case passed the original full workload: 100 HTML pages, 400 validated-or-canceled assets and 99 overlap proofs. Maximum navigation first byte was 3.621700167 s; maximum tap-to-first-byte was 3.621753875 s. The cold destination used existing healthy provider 5. Source verification passed. This is one passing replay, not causal attribution of the historical failure.
+
+Cellular inner-H2 then failed the unchanged five-second gate on page 1: actual navigation 6.1883245 s and tap-to-first-byte 6.188409542 s. Controller wait was only 76,500 ns; the fixture serialization fixed in C20 does not explain this failure. The HTTP trace records 5.775469667 s from ConnectStart to ConnectDone, 251.845625 ms for TLS and 160.931125 ms from request write to first byte. One HTTP GetConn attempt does not identify the underlying Tun dial attempts or prove which provider held the SYN.
+
+The failed case still completed 100 HTML pages, 400 assets and 99 overlaps, with 500 client acquisitions/server attempts and 98 same-session H2 transitions. The cold destination ultimately used provider 5; CSS ownership remained retained. The late-provider admission chain was unexercised. Public tracked accounting returned to zero after join. These are resource/correctness observations, not a runtime-memory qualification or evidence that earlier queue pressure was absent.
+
+The run stopped after this first failure; six later cases were not run. Preserve the failure and its raw SHA `e5408546cf68bcf5d9b1ccd291b02c695e16e9f3cabaadb1ff69e97c486636d4`. Separate derived report SHA: `4f44a297f0369213037d9f3038a941d6c31728d979f15ccfa03aa718623017b2`. The next diagnostic must correlate original SYN tuples, actual candidate admissions, serialized Transfer item identities, route write entry/return and provider receive boundaries. Instrumented timing is attribution evidence, not a performance baseline. No timeout widening or retry-to-green is justified.
+
+### C21 traced reproduction: explicit refusal waits for native retry
+
+The diagnostic compiled and passed all 38 finite normal/race controls, then reproduced the unchanged cellular inner-H2 failure: page 1 HTTP first-byte 6.02860475 s, tap-to-first-byte 6.028663375 s. It completed all 100 HTML pages, 400 assets and 99 overlap proofs, with public tracked accounting zero after workload cleanup. Instrumented timing is not a performance baseline.
+
+The complete bounded SDK transcript contains 46 rows, zero drops, and identifies source port 54151 as the winning second Tun dial. Positive matched events establish the following monotonic ordering relative to the first dial's source offer: the winner's final old-provider refusal reaches the client at 3.390362667 s; the next native offer occurs at 5.001877333 s; healthy provider 5 admits that same flow at 5.001987250 s. The refusal-to-admission gap is 1.611624583 s. The next source offer falls in the observed three-to-five-second native retransmission phase.
+
+The exact winning SYN's Transfer item materializes at 5.306550375 s. Its writer call takes 6.792 microseconds; its H1 write ends at 5.306575417 s. Provider H1 read is observed at 5.395037542 s and pre-callback receipt at 5.395098667 s. The positively matched reverse SYN-ACK acknowledges the original ISN plus one and reaches the source callback at 5.447793 s. The later HTTP GotConn local port confirms this winner. This places a substantial delay before admission to the healthy exit, rather than inside that winning write call.
+
+The lower-level collector's global completeness is false: it reports contention, history loss and four items without complete observed chains. These findings use specific positively matched records, not absence of unrecorded events or a claim of lossless tracing. The SDK transcript's own complete 46-row scope and the winning item's observed chain remain separate evidence. Anchored extraction SHA: `7f1afb3bc6279053e1ddb6c533a5f68ea48f0d1f9ad504b101d68538ea4a582c`; raw SHA: `359a0cc7ad32d8b8567ea764dd5576823f331a54ca2be4baee7e6b78c4701230`.
+
+The next deterministic counterfactual must accept an original SYN, deliver an explicit capacity refusal after the last native offer, make a healthy alternative available, and provide no further native packet. The fix should retry only the unestablished flow from bounded, credited original-SYN custody; it must preserve generations, collapse rules, cancellation, established egress identity, nonblocking callbacks and balanced ownership. No timer widening, ACK-policy toggle, memory-budget increase or resident teardown is justified by this evidence. Full correctness, uninstrumented performance and device memory qualification remain required.
+
+### Explicit SYN retry and retained-control ownership (focused qualification)
+
+A deterministic native/Client/Transfer counterfactual supplies one original SYN, explicitly refuses its incumbent exit, and supplies no later native retransmission. Both original normal and race runs failed because the healthy exit received no SYN. The candidate retains one credited full SYN, including options/TFO, at actual serialization and dispatches a bounded retry through the existing flow reaper. It does not change TCP/Transfer timeout defaults or infer failure from silence. Exact source, selection and generation checks exclude established, replaced, closed, warned and removed authority. Packet bytes and metadata share existing admission credit; a cache reference and a queued/inflight worker reference independently protect the retained backing until final release outside locks.
+
+Adjacent deterministic tests exposed a ControlSync error loop when its send buffer was permanently closed while the Client context remained live, and incorrect replacement-frame cleanup on cancellation. OLD normal/race produced ten exact causal failures across five roots. The correction stops only terminal admission failure, preserves transient-error retries, and releases the current frame owner rather than a replaced base frame. Healthy other-client control and real ACK-retry/join controls remain required.
+
+The initial combined candidate passed 46 normal tests but failed its RST ownership assertion under race instrumentation. A logging-only follow-up passed 46 normal and 46 race tests with correct observed ownership; this did not erase the original failure. A separate deterministic ordering then proved an adjacent retirement gap: a source-dequeued RST can close an uncommitted race candidate before its producer commits. The existing retirement boundary canceled the flow without revoking its retained-SYN cache. Both OLD normal and race runs observed the retired flow with cache_present=true and refs=2 while the retry worker was held. The targeted correction revokes the cache under the existing flow lock; the worker retains its own packet/credit reference until exit. Queued-RST and FIN half-close/sibling-flow controls cover adjacent boundaries.
+
+NEW normal and race each passed all 49 selected roots, including all three forced close-order tests, with no skips or race reports. The unchanged eight-case 100-page suite, full correctness/synthetic performance and real-device 32 MiB iOS-profile / 64 MiB Android-profile qualification remain pending. Focused final custody confirms matching source, all processes and monitors joined, and the native cache lease released (`6dee524ea2953977a094795fa122e932493738c2acfb2dbcee687616a177da08`). The seventeen guarded source afterimages were integrated only after that receipt. These focused ownership results do not establish runtime memory peaks, browsing performance or retrospective attribution of the earlier uninstrumented RST failure.
+
+
+### 2026-10-25 checkpoint: retained SYN recovery and remaining H2 response stall
+
+This checkpoint includes the retained-SYN retry, shared control-credit accounting,
+terminal control admission, candidate RST retirement, and adjacent ownership fixes.
+Focused qualification includes two causal OLD failures and 49 normal plus 49 race
+NEW passes for the final retirement change. These focused results do not qualify
+all workloads or either physical-device memory profile.
+
+The unchanged cold browsing matrix was attempted against frozen C22 source with
+100 HTML pages, 400 validated-or-canceled assets, 99 overlaps, and the original
+five-second navigation gate:
+
+| Case | Result | Maximum navigation TTFB |
+| --- | --- | --- |
+| Cellular, inner H2, normal | PASS | 1.911 s |
+| Cellular, inner H1, normal | PASS | 3.461 s |
+| Cellular, inner H1, race | PASS | 4.197 s |
+| Cellular, inner H2, race | FAIL, page 5 | 6.121 s |
+| Four Wi-Fi cases | NOT RUN after preserved first failure | — |
+
+The failed case still completed all 100/400/99 observations. Page 5 reused an
+established H2 connection: acquisition took 5,833 ns, with approximately 6.121 s
+between request write and first-byte observation. This differs from the earlier
+fresh-SYN admission gap. The retained report lacks per-request server-entry and
+write timestamps, so request delivery, response recovery, and observer callback
+cost remain unseparated; no new root cause is claimed. Aggregate retransmission
+and refusal counters cannot identify the stalled flow. Endpoint credit samples
+were below their caps, which does not exclude transient pressure between samples.
+
+All test and accounting processes joined, source matched its frozen closure, and
+the native build-cache lease was released. Final receipt:
+`cold-c22-canonical-direct-eight.PREP.kzir7mbt/FINAL-C22-CANONICAL-FULL8-FIRST-FAILURE-CUSTODY.json`,
+SHA-256 `5d9feea2e6f2374bda3ce7a09162e5fcc9c5e41957632fb35e212bece444e7cf`.
+The failing raw Go JSON SHA-256 is
+`175ce0423a58850bd5556ae3fa74cb8942455f5c716bc92484fc931f5fadd2a6`.
+Artifacts are retained beneath
+`/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/h1-disjoint-controls.PREP.7tk80_6o/`.
+
+A private test-only phase/packet diagnostic is in preparation and is not part of
+this application checkpoint. It must preserve the workload and five-second gate;
+instrumented results cannot establish a performance baseline. Rebind it to the
+post-sync source before execution. Remaining qualification includes all eight
+cold cases, the full six-suite correctness runner (including SN), full synthetic
+PERFVAR/benchmark coverage, and fresh physical 32 MiB iOS-surrogate and 64 MiB
+Android profiles. Simulator-wide heap readings and zero tracked post-join credit
+are not device-runtime memory qualification. The required SN Linux image was
+confirmed present; ordinary SN readiness and resource checks remain required.
+
+## 2026-10-26 UTC: C24 original eight-case browsing qualification
+
+The original Wi-Fi/cellular profile × inner H1/H2 × normal/race matrix passed all **eight cases** on C24, with outer H1 throughout. Each case retained the strict five-second gate and completed **100 HTML responses, 400 validated-or-canceled asset requests and 99 overlap proofs**. The asset total includes intentional cancellations; it is not a count of 400 complete bodies. Each checked post-join `TotalByteCount` was zero. All recorded test groups, process owners and monitors joined, source checks matched and the cache lease was released.
+
+The largest maximum combined tap-to-first-byte interval among the cases was **3.837206208 s**; the corresponding case's maximum request TTFB was **3.837168333 s**. The separate columns and per-case cancellation counts are in [the C24 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-26-utc-c24-original-eight-case-browsing-qualification).
+
+This qualifies one original eight-case execution at Connect `2849685f`, Server `ce2b19e0`, SDK `b5ea15df`, Tests `52a3e7fe`. It is not a statistical baseline, an isolated fix-effect estimate or historical-incident attribution. Earlier C23 failures remain retained. Zero checked post-join usage does not establish an actual iOS footprint or physical 32/64 MiB qualification. Full-six correctness, 48 family invocations plus 60 benchmark processes and native/physical memory qualification remain incomplete. This original-eight result predates the mixed-ACK candidate; its later scoped results are recorded below.
+
+Evidence: [closed C24 final custody](/private/tmp/urnetwork-c24-full8-final.cm__z6n0/FINAL-CUSTODY.json), SHA-256 `b80189ccea7a1dc0ca3197a495dce1f6adf659e30ac9022c8dfee5344871c942`.
+
+## 2026-10-27 UTC: Controlled mixed-ACK H1 recovery and allocation qualification
+
+The scoped pilot is qualified. Its exact executable afterimages have now been integrated locally; integrated-source full-suite and device qualification remain pending.
+
+The corrected local full-TUN/H1 experiment used real gVisor/native ACKs, GRO enabled, a hash-checked 2 MiB body, and controlled coalescing of ACKs with already-covered DATA. Loss cases deliberately dropped exactly one segment after Transfer. Both variants retained the constructor's one-second `ReturnResendTimeout`. This workload deliberately exercises the mixed-group recovery mechanism; attribution to natural browsing stalls remains unproven. [Measured observations](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/h1-disjoint-controls.PREP.7tk80_6o/c24-gvisor-clock-H1.PREP.gb7c703t/MATCHED-H1-OBSERVATIONS.json).
+
+| Normal-mode observation | OLD | NEW |
+| --- | ---: | ---: |
+| Healthy bulk duration | 33.448500 ms | 33.979875 ms |
+| One-loss bulk duration | 1,030.222209 ms | 38.961125 ms |
+| Receiver hole | 999.407333 ms | 7.990375 ms |
+| Matching ACKs generated / reaching provider | 51 / 0 | 45 / 45 |
+
+These are per-test bulk durations from one normal pair, with no statistical speedup claim. ACK counts are packet events over the complete loss flight, not API calls or counts of mixed-group offers. Race results establish functional behavior only: the OLD loss root produced its expected typed failure; both NEW roots passed.
+
+The [final custody receipt](/private/tmp/urnetwork-c24-clock-H1pilot-qualified-final.gi1el2d1/FINAL-CUSTODY.json) qualifies six commands and ten expected root outcomes: eight PASS plus two typed OLD failures, with no unexpected failures. Owner/controller/wrapper cleanup completed, process and group probes were clear, all 41,666 source rows matched, and cache custody was free. Qualification covers two canonical timer-origin controls and eight matched H1 outcomes on the C24 private overlay. The earlier observations file's pending-lifecycle flag is superseded by this final receipt.
+
+The [earlier failed pilot](/private/tmp/urnetwork-c24-H1pilot-failed-final.zxdfd18j/FINAL-CUSTODY.json) remains an unexpected failure in the record. Its receiver-hole oracle compared the later receiver drop against a timer that starts at provider retention. The corrected normal/race control observed retention-to-replay at exactly 1 s, with delivery/drop delayed 250 ms and a 750 ms receiver hole, without feedback. The real H1 pilot did **not** observe the internal retention timestamp; its OLD timeout explanation remains source-inferred. The correction removes the invalid receiver-hole comparison, adds no timer slack, and changes no production timer, threshold or API. [Clock correction](/private/tmp/urnetwork-gvisor-mixed-ack-clock-correction.PREP.m6c8l6b3/RECIPE.json) and [source review](/private/tmp/urnetwork-gvisor-mixed-ack-clock-correction.PREP.m6c8l6b3/FINAL-SOURCE-REVIEW.json).
+
+The independently [qualified 14 allocation/capacity outcomes](/private/tmp/urnetwork-c24-capacity-allocation-qualified-final.og3p912o/FINAL-CUSTODY.json) remain applicable: healthy equal-work offers used 980 allocations for ACK-only and 1,186 for fresh-DATA-plus-ACK in both variants. The covered case's 44→124 allocations accompanies 0→101 delivered ACKs and compares different completed work. No allocator wall-time or B/op result is claimed; neither allocation counts nor this H1 pilot establish device memory footprint.
+
+The original C24 eight browsing cases predate this candidate and do not qualify its integration. Integrated-source qualification remains pending: full six-repository correctness, 48 family invocations plus 60 benchmark processes, four fresh native builds and 112 physical cells, and 32 MiB iOS-profile / 64 MiB Android budgets. Historical 100-page attribution and actual iOS footprint remain unproven. This appendix is not a final postmortem or a claim that page stalls are fixed.
+
+Final H1 custody SHA-256: `e55baabbd27c1bf1fc99ff9b3533e5b8e364725d241bb3450aa3a01661fb351e`; observation packet: `1d657d5cac6fe0e55f1b97b20cf7fa60e6d69cdc141a2ad534c826a6dfdd0c6f`. Exact integration inventory and before/after hashes: [apply proof](/private/tmp/urnetwork-c24-adoption-applied._rn50v71/APPLY-PROOF.json), SHA-256 `a14305adfa15c353ecb8d9f3b10402e43a53d9dc8a1694dc1af6aa1ff04831af`.
+
+## 2026-10-27 UTC: C25 integrated fix, original eight browsing cases
+
+The canonical integrated mixed DATA/ACK source passed the original eight Wi-Fi/cellular × inner H1/H2 × normal/race browsing cases, with outer H1 throughout and no overlay. Every case retained the strict five-second gate, validated 100 HTML responses and 400 validated-or-canceled asset requests, and proved 99 overlaps. The largest case maxima were 4.771682 s request TTFB and 4.772368 s tap-to-first-byte, measured separately. Intentional asset cancellations are not complete response bodies. The per-case maxima and cancellation counts are in [the C25 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-27-utc-integrated-mixed-dataack-fix-original-eight-browsing-cases).
+
+Source: Connect `a0f892773fbeb48f22ef4c5f2310124a57d30b65`, Server `425b96306cc24e4ed03a89f5e33f853e1038d4d7`. The [closed C25 final custody](/private/tmp/urnetwork-c25-full8-qualified-final.0n97qksk/FINAL-CUSTODY.json), SHA-256 `a3dea0ea239cbefff55db5a687f7fc6a4fbff781156d836c15aeef3b6bf7a7a6`, accepts 8 PASS / 0 FAIL, joined owners and observers, matching source and released cache custody. No retry or source change occurred during the run.
+
+All checked post-join `ByteCountBudget` totals were zero. That is packet-budget ownership accounting, not Go heap/RSS, global quiescence or an actual iOS footprint. This qualifies the original-eight workload only: `baselineEligible=false`, with no statistical improvement or natural-session attribution claim. Full correctness, full PERF and fresh physical 32/64 MiB memory qualification remain outstanding; the broader goal is incomplete.
+
+## 2026-10-27 UTC: native qualification stopped at harness gates
+
+The first native attempt failed GLOBAL admission before command 1: two intermediate metadata directories were mode 0755, while the strict sampler requires owned private mode 0700. It ran no native builds or device calls. Its [closed failed receipt](/private/tmp/urnetwork-c25-native-admission-failed-final.6rrtzjk1/FINAL-CUSTODY.json), SHA-256 `1df8e8624e44845ea0c64fc219e91558cf0e894a0094f061f73289cff3f1d316`, preserves that failure.
+
+The revised private metadata materializer, SHA-256 `154aa84d70272e2a67ae9657b929ebde8503add27d8a2e6f50baa4c34d535026`, passed the actual umask-022 OLD typed-failure / NEW-pass control ([proof](/private/tmp/urnetwork-c25-privateparents-controls.tdm5u6l1/RESULT.json), SHA-256 `94e71358ee117df632216cfc28f084564661998d3ba89f920a47a52b01d6f7e1`). The next actual execution received fresh admission from the unchanged strict GLOBAL sampler.
+
+That `al9bofhe` execution passed all 10 setup commands, then command 11 (`native-four`) failed before the APK build because its PERF config was mode 0400 rather than the required owned private mode 0600. It completed zero native artifact builds and started none of the 112 physical cases. The [second closed failed receipt](/private/tmp/urnetwork-c25-native4-mode-failed-final.vjfdfa4m/FINAL-CUSTODY.json), SHA-256 `9486beca637a465f9901009c389f76f420cc2e32d2d3b17d1c56ef45f2a5cbed`, records joined owners and monitors, dead process/group probes, matching external source and released cache custody. Both failed owners remain preserved.
+
+These are harness preparation failures, not application regressions or memory passes. Config-mode correction and fresh preparation are in progress. The four native artifact builds, all 112 physical cells and physical 32 MiB iOS-profile / 64 MiB Android memory qualification remain pending. The original-eight browsing result does not close full correctness or full PERF, and no statistical baseline is promoted.
+
+## 2026-10-27 UTC: C26 physical H1 control memory observations; campaign failed
+
+Four fresh native control/candidate builds were attested against root SDK `54bc6eb37464d58c59fae0414dcd643689025c1c` and Connect `62f7c2c2f245e56ea386599fb18e83f39f2ab769`. The build source/content maps and retained code-input hashes match between arms: this is a same-source A/A collection, not an OLD-versus-NEW code comparison. The actual hosted-H1 campaign attempted 3 of 112 planned cells and stopped after the third failed before readiness; 109 cells did not run. Full device qualification remains incomplete.
+
+The first two cells used Pixel `3B161FDJG001KT`, Wi-Fi, the control arm, and provider disabled. Both final cell records have `memory_eligible=true` and `owners_joined=true`. All memory figures below are retained Go-runtime observations in MiB, not Android PSS/RSS or an iOS extension's total footprint.
+
+| Profile | Active peak MiB | All-observed peak MiB | Quiet median MiB | Quiet p95 MiB | Fast.com median Mbps | Wikipedia TTFB ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| iOS surrogate, 32 MiB | 28.08 | 28.28 | 23.65 | 24.63 | 15 | 130.4 |
+| Android, 64 MiB | 33.43 | 34.86 | 30.96 | 31.88 | 25 | 262.6 |
+
+Fast.com repetitions were 10/26/15 Mbps for the iOS surrogate and 29/25/14 Mbps for Android. Both medians missed the frozen 40 Mbps goal, so both cells retain `workload_eligible=false`; the speed misses were not rerolled or removed. These single control cells ran in separate public-provider sessions without matched providers or network conditions. They do not estimate the effect of increasing memory. The Android profile's observed headroom does not prove that larger queues would improve throughput. Candidate, Galaxy, cellular and repeated-block evidence is still required before tuning or claiming a performance gain.
+
+The retained Android64 ready-boundary diagnostics report both `go_limit_bytes` and `device_memory_target_bytes` as 67,108,864 (64 MiB). The same atomic batch reports `device_transport_budget_total_bytes=16,777,216` (16 MiB), `device_transport_budget_max_count=16`, and `nat_budget_total_bytes=6,710,886` (approximately 6.4 MiB). This confirms that the DeviceLocal target and its admission budgets scaled with the Go limit in the measured control cell. These capacities do not establish a throughput benefit; occupancy should follow useful demand and measured performance, without allocating merely to fill the 64 MiB cap. Diagnostic SHA-256: `25d98b9769291a07108fa8b72a894142e136148129d0e8c3613d491619df9a02`.
+
+The final bracket-bound summaries report complete teardown and no runtime cap breaches. Retained active/quiet event counts were 39/99 (iOS surrogate) and 33/98 (Android); these include multiple observation types and are not independent continuous samples. An earlier `00078` provisional iOS teardown summary was evaluated before its live gate was attached; it must not be interpreted as the final gate. Final Go `00095` and JS `00096` both passed.
+
+The third cell was Galaxy `R5CX21FY6ND`, candidate, cellular, iOS surrogate. Authentication discovery timed out before the password screen and before traffic. A retained credential-free SDK category and the 15-second request deadline establish request expiry, but do not identify DNS, dialing, TLS, headers, or an application defect. Its missing readiness/runtime/cleanup evidence correctly prevented memory qualification and stopped collection. No timeout, cap, schema, or traffic-policy change is justified by this failure alone.
+
+[Closed failed campaign](/private/tmp/urnetwork-c26-native-firstfailure-final.417g8w90/FINAL-CUSTODY.json), SHA-256 `7cf42391a3ea4be2be93dba48be192870fb97506d97fc7128d0273f86e709bd3`: all canonical owners and monitors joined, cache released, 530 input pins matched, and the fresh C26 source-after check matched 41,764 files and two symlinks. [Authentication analysis](/private/tmp/urnetwork-c26-cell003-auth-discovery.PREP.7c5g25yq/REPORT-FINAL.json), SHA-256 `2f8501cedfc15f4402a959f537867f0a0b4352bc783836a32171485866ae191f`. The original 100-page synthetic qualification remains separate; full correctness, full PERF and complete 32/64 MiB physical qualification are still outstanding.
+
+
+### 2026-10-28 checkpoint: partial-race recovery and browsing fixture authority
+
+The candidate continues a refused partial TCP race into unused healthy candidates while preserving race-generation, ownership and admission bounds. Winner overflow now preserves buffered packets through the existing commit path. Eight deterministic roots passed in three fresh normal and three fresh race processes (48 root passes).
+
+The browsing fixture now supplies five genuinely eligible initial quality providers plus one speed provider. Serialized discovery and roster controls distinguish provider identity from array position; their fresh normal/race runs produced 112 and 62 passing root executions respectively. These fixture changes preserve the 100-page workload and five-second navigation limit.
+
+A fresh matched-fixture pair completed 100 HTML responses, 400 validated-or-canceled assets and 99 overlapping navigations in both arms. Candidate/control controller times were 3.096/3.646 seconds; median page TTFB was 0.836/0.770 seconds, p95 2.120/2.092 seconds, and maximum 4.906/3.862 seconds. The mixed results do not establish an overall performance improvement or justify baseline promotion.
+
+The independent eight-arm replay passed cellular H2 normal and cellular H1 normal, then failed cellular H1 race: page 0 reached first byte at 6.364 seconds, including 5.235 seconds after HTTP request write. A separate provider-roster assertion also failed and has deterministic fixture corrections. The remaining five arms did not run. The page-zero pause remains unresolved.
+
+Nine diagnostic controls subsequently passed, but the traced H1 replay stopped on a real data race: blockActionDecision sorts an IP-association snapshot while updateClusters reads it. The sorting code is unchanged from the checkpoint base; this is not evidence that the partial-race candidate introduced it, nor proof that it causes the page pause. The failure and incomplete workload remain recorded as failures. All test processes joined and the shared cache lease was released.
+
+Full correctness/PERF and fresh two-device 32 MiB iOS-surrogate / 64 MiB Android qualification remain outstanding. Android measurements cannot qualify the iOS extension's total physical footprint. This checkpoint includes research candidates for a test build; it is not release qualification.
+
+Evidence: /private/tmp/urnetwork-c34-v2-strict-pair-metadata.zwt6ec5y/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-v2-browsing-eight-metadata.2bhpr64m/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-page0-control-successor-metadata.boqm1uf_/FINAL-CUSTODY.json.
+
+The checkpoint also includes a cache-miss-only clone before block-action cluster sorting, preserving immutable association snapshots and zero-copy cache hits. Three deterministic ownership/cache/publication tests are included but have not yet run; OLD-red/NEW-green and race validation remain pending.
+
+
+## 2026-10-29 UTC: retained-SYN readiness and shared association ownership checkpoint
+
+The candidate is now installed as physical Connect source so all six correctness suites, including SN's Docker-staged source, can test the same implementation. The previous C35 source (Connect `345fdd6d`, SDK `f1e24fc3`, Server `22026e05`) remains preserved. This is a research checkpoint, not release qualification.
+
+Deterministic OLD/NEW tests identified and addressed three ownership problems:
+
+- A real reliable-window ACK could free capacity without promptly retrying a retained native SYN. Directed, owner-bound readiness now retries that cached SYN without waiting for the native retransmission timer. Readiness metadata is admitted against the actual memory root before allocation and is withdrawn on cancellation, flow/race replacement, FIN/RST and source retirement.
+- A still-queued sibling SYN from the same wide race could invalidate its own retry owner. The exception is restricted to the live matching SYN, race, admission epoch, cache serial and source; unrelated close/reset barriers remain authoritative.
+- Block-action decisions cloned association clusters per destination. Publication now creates one sorted immutable view, which internal cache entries share; public results remain owned copies. Epoch/configuration fences prevent stale in-flight decisions from repopulating a cleared or closed cache. Probe courtesy resets also use zero-wait admission and the exact registered channel owner.
+
+The combined candidate passed **68 roots in normal mode and the same 68 under race detection**, with four child tests in each process and no failed/skipped roots. The complete integration contains eight production and fifteen test/helper files. Ten additional batch-credit roots were not selected by that focused run; the full suite must still execute them. Benchmark declarations and helper compilation are not benchmark results.
+
+### Host memory experiment
+
+One fresh OLD and NEW process ran at each 32/64 MiB profile with GOGC=25 and forced GC at measurement boundaries. Each fixture published 512 cluster members and cached 256 destinations.
+
+| Profile | OLD live HeapAlloc B | NEW live HeapAlloc B | Reduction |
+| --- | ---: | ---: | ---: |
+| 32 MiB | 4,715,752 | 1,248,456 | 3,467,296 B (3.31 MiB) |
+| 64 MiB | 4,716,904 | 1,247,944 | 3,468,960 B (3.31 MiB) |
+
+Retained address backing changed from **257 allocations / 3,487,728 B** to **one / 16,368 B**, a 99.53% reduction in that fixture. Event ownership retained the shared view until flush, then released it. These are host forced-GC ownership measurements, not natural steady memory, peak-RSS measurements, mobile throughput evidence, or qualification of the 32 MiB iOS-surrogate / 64 MiB Android gates.
+
+### Unresolved 100-page latency
+
+Every completed row below validated 100 HTML responses, 400 validated-or-canceled assets and 99 overlaps, with balanced managed-byte accounting after join. The original 5 s first-byte gate was unchanged.
+
+| Cellular H1 case | Maximum first byte | Result / limitation |
+| --- | ---: | --- |
+| Original normal | 5.109 s, page 28 | FAIL; 3.585 s from WroteRequest callback to first byte |
+| Original race | 5.202 s, page 93 | FAIL; connect 3.163 s, TLS 1.743 s, callback-to-first-byte 0.295 s |
+| Page-28 diagnostic, normal | 3.182 s | PASS; selected page 28 was 1.733 s; no failing interval reproduced |
+| Rolling diagnostic, normal | 2.879 s | PASS; no slow trigger; final-page trace qualified |
+| Rolling diagnostic, race | 4.927 s, page 0 | PASS; final page reused a connection, so retained packet attribution is UNKNOWN |
+| Tagged, untraced race control | 4.802 s, page 78 | PASS; one predeclared control, not a statistical comparison |
+
+The separate original cellular H2 normal arm passed at 2.272 s maximum. Five original browsing arms remain unrun. Later diagnostic passes do not erase either H1 failure, establish an observer effect, or promote a baseline. Tracing adds locks/decoding and can change packet ordering and queue admission; a fixed loss seed does not guarantee identical packet-to-loss assignments across executions.
+
+The rolling diagnostic passed fifteen race controls. It retains the first slow/error navigation in fixed storage, fences late callbacks by navigation epoch, and treats reused/unseen tuples, overflow and incomplete coverage as UNKNOWN without changing the workload verdict. No actual failing packet interval has yet been captured.
+
+Source inspection distinguishes inner custom TCP, outer gVisor TCP and Transfer recovery. The inner peer does not advertise SACK; established gVisor's configured 8 s maximum and the separate SYN-handshake backoff are different mechanisms. These are hypotheses for the next packet-level investigation, not attribution from a matching duration or justification for changing timers.
+
+Full unfiltered correctness, corrected public-SDK OLD/NEW tests, full synthetic PERF/server benchmarks, focused repeated memory-performance comparisons, and four fresh native builds plus all 112 scoped hosted-H1 device sessions remain pending. No Android result can qualify a physical iOS extension's total footprint.
+
+Evidence: focused normal/race raw hashes `8a66466279ec6cd468236c612bb05422e2e4311d3aa371de66f27c39aceff635` / `be28c99bf940bd3da38bfc15d00ffeabf4394a351954da4c9470dfefb4bbb6e6`; host memory comparison [receipt](/private/tmp/urnetwork-c35-host-memory-comparison.gyilpemo/COMPARISON.json); original H1 failures `2784510d68c3ec304f22972d5c1edb31ed2d2d491e14e93a39faebfbbd12b800` / `0df2b2c049db338e4894f7e66cdfd7ce166a1fed881e78a0541f6efb07863a00`; finite race [analysis](/private/tmp/urnetwork-c35-finite-race-pair-analysis.PREP.tg_ejyl1/PACKET.json). The previous forced-GC/physical observations above retain their original scope and limitations.
+
+
+### 2026-10-29 checkpoint: bounded-read overflow repair
+
+Fixed signed-overflow handling in pooled message reads, HTTP response-body
+limits, Extender request-body limits, and transport-delay WebSocket wire caps.
+Adding one lookahead byte to MaxInt64 previously wrapped negative and could
+return an empty successful read. Adding the framing header could also wrap a
+positive WebSocket cap negative, which Gorilla interprets as unlimited. The
+repair saturates arithmetic; ordinary finite limits and ownership remain intact.
+
+The primary focused comparison reproduced two old-code failures in both normal
+and race modes; the repair passed 32 root tests in each mode. The adjacent
+comparison reproduced one Connect and one Extender failure in each mode; the
+combined repair passed 33 Connect and 7 Extender root tests in each mode
+(80 root passes, no skips or race warnings). Both runs completed with all
+processes joined, source unchanged, and the test cache released.
+
+These are correctness results, not a measured throughput or memory improvement.
+They do not establish the cause of the historical 100-page stalls. The original
+eight browsing arms and five-second first-byte gate, full six-repository
+correctness, synthetic PERFVAR, focused memory benchmarks, and fresh hosted-H1
+device qualification for the 32 MiB iOS surrogate and 64 MiB Android profile
+remain outstanding. A private near-stall diagnostic is prepared but unrun; its
+4.5-second capture trigger leaves the five-second workload failure gate intact.
+
+
+### 2026-10-29: C38 original eight-arm browsing replay
+
+Connect `b360c4bb`, Server `3654e3d8`, SDK `ec826241`, and Tests `e623e541` completed the original eight-arm matrix without production overlays, tracing overrides, retries, or threshold changes. Outer transport was H1. Each arm exercised 100 HTML pages, 400 validated-or-canceled assets, 99 overlapping navigations, and four live pages under the original five-second first-byte gate.
+
+| Link | Inner protocol | Mode | Maximum first byte (s) | Median (s) | p95 (s) |
+|---|---|---|---:|---:|---:|
+| cell-edge-5m-down-1m-up | h2 | normal | 3.088 | 0.677 | 1.719 |
+| cell-edge-5m-down-1m-up | http/1.1 | normal | 3.584 | 1.312 | 2.725 |
+| cell-edge-5m-down-1m-up | http/1.1 | race | 3.280 | 1.663 | 2.806 |
+| cell-edge-5m-down-1m-up | h2 | race | 3.575 | 0.782 | 1.860 |
+| wifi-good | http/1.1 | normal | 0.162 | 0.080 | 0.105 |
+| wifi-good | h2 | normal | 0.220 | 0.027 | 0.052 |
+| wifi-good | http/1.1 | race | 0.255 | 0.099 | 0.174 |
+| wifi-good | h2 | race | 0.190 | 0.046 | 0.112 |
+
+All eight arms passed: 800 HTML pages, 3,200 assets, and 792 overlap proofs, with no first-byte failure at or above five seconds. Checked post-join managed-budget totals were zero; this is ownership accounting, not RSS or an iOS physical-footprint measurement.
+
+This qualifies this current workload execution, not a statistical baseline, a complete historical-stall explanation, full correctness/PERF, or physical 32 MiB iOS-profile / 64 MiB Android qualification. `baselineEligible=false`, admission-chain coverage remains unexercised, and physical pause attribution remains unknown.
+
+Evidence: `/private/tmp/urnetwork-c38-original8-metadata.vy2_wvjd/FINAL-CUSTODY.json`, SHA-256 `b5f0a1d1e0147e09ab6ab6129a819b6bc8a897413c38d3abaef5d6100010f680`.
+
+
+### 2026-10-29: C40 eight-arm browsing replay and native build prerequisite
+
+Connect `a6d16288`, Server `1355bc7d`, SDK `fa7ffc7a`, and Tests `b5f82774` completed the same eight-arm synthetic browsing matrix. Outer transport remained H1; no production overlay, tracing override, retry, or threshold change was used. Each arm retained 100 HTML pages, 400 validated-or-canceled assets, 99 overlapping navigations, four live pages, and the original five-second first-byte gate.
+
+| Link | Inner protocol | Mode | Maximum first byte (s) | Median (s) | p95 (s) |
+|---|---|---|---:|---:|---:|
+| cell-edge-5m-down-1m-up | h2 | normal | 2.401 | 0.623 | 1.727 |
+| cell-edge-5m-down-1m-up | http/1.1 | normal | 2.744 | 1.424 | 2.178 |
+| cell-edge-5m-down-1m-up | http/1.1 | race | 4.855 | 1.721 | 3.413 |
+| cell-edge-5m-down-1m-up | h2 | race | 3.070 | 0.865 | 2.340 |
+| wifi-good | http/1.1 | normal | 0.215 | 0.080 | 0.111 |
+| wifi-good | h2 | normal | 0.202 | 0.028 | 0.097 |
+| wifi-good | http/1.1 | race | 0.225 | 0.100 | 0.167 |
+| wifi-good | h2 | race | 0.273 | 0.048 | 0.118 |
+
+All eight commands passed: 800 HTML pages, 3,200 assets, 792 overlap proofs, zero navigation stalls, and no race warnings. Every checked post-join managed-budget total was zero. This is managed ownership accounting, not process RSS, natural Go-runtime steady memory, or an iOS extension footprint.
+
+The cell H1 race maximum was 4.855 s. Its slowest navigation spent about 3.171 s connecting and 0.909 s in TLS; the remaining reply interval was about 0.776 s. These phase observations do not identify a retransmitted packet, establish the historical stall cause, or justify changing timers. A single replay does not establish statistical improvement over C38 or update a performance baseline. Admission-chain coverage remained unexercised; the separate retained-SYN causal control is still pending.
+
+The fresh four-APK build attempt failed before APK compilation or installation: the offline Go cache lacked dependencies for the host `warpctl` build (`GOPROXY=off`). Its eight reported missing module versions have pinned checksum pairs available to the bounded cache-acquisition repair. No APK build was attested and no device session ran. This is a build prerequisite failure, not a 32 MiB iOS-surrogate or 64 MiB Android memory result.
+
+Full unfiltered six-repository correctness, synthetic PERFVAR and server benchmarks, repeated memory comparisons, and all 112 scoped hosted-H1 device sessions remain outstanding. The iOS profile is measured on the two allowlisted Android devices; it cannot qualify physical iOS total footprint.
+
+Evidence: `/private/tmp/urnetwork-c40-root-original8-results.json`, SHA-256 `a3d027502f4e55be6985409dff3fd27edfe85bc6c9732c32d770cfef128dd6d6`; native `physical-build-only-result.json`, SHA-256 `64aad731049b59cedb2d1e48bf53d14fe870fde35e697f7041c351210c099868`, under `physical-c38-build-cache.PREP.nvwey6qp/native4-full112-c40-6taq995o/native-build/perf/scoped-h1`. Both runs completed cleanup with all owners joined, source unchanged, and cache leases released. Browsing outer-final SHA-256: `55fc04f901a63dc4f0c49ccaab80864dcb069b3da75e9067bd0ddabc59b8d81e`; failed native outer-final SHA-256: `45511c537d62ff432b2992fcc7c82239a0ea71285b280bfda1d7a80bcec7f0a3`.

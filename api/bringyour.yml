@@ -48,12 +48,12 @@ info:
     Operations marked `x-internal: true` are not part of the public API:
     the server-to-server webhooks (payment processors, app stores and the
     email provider), the operator's provider probe control plane, the admin
-    reports, the operator's own evidence publishing, the provider work
-    intake (the signed originals the SDK and the independent work
-    authorities post), the acceptance-test routes and the extender
-    directory calls the SDK makes on its own. They stay in this document so
-    the server's route and conformance checks cover them; the public API
-    reference leaves them out.
+    reports, the operator's own evidence publishing, the validator's head
+    summary upload, the provider work intake (the signed originals the SDK
+    and the independent work authorities post), the acceptance-test routes
+    and the extender directory calls the SDK makes on its own. They stay in
+    this document so the server's route and conformance checks cover them;
+    the public API reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -297,6 +297,33 @@ paths:
         "503":
           description: The clock has not completed its initial block-9 backfill.
 
+  /health:
+    get:
+      tags: [Other]
+      summary: Network Health
+      description: |
+        The public health status of the network, as the ur.io status pill and
+        banner show it. `status` is `healthy`; one of `degraded`, `partial`,
+        `major` or `full`, the level an operator set while fixing a problem;
+        or `unknown` when the status cannot be read. A level other than
+        healthy carries `reason`, one line of public text, and `since` and
+        `updated`: when the network left healthy and when the level or reason
+        last changed. No other field is set.
+
+        Each API process keeps a status it read for 10 seconds. A known
+        status may be cached for 30 seconds (`Cache-Control: public,
+        max-age=30`); unknown is not cached. This is not a readiness check:
+        `/status` is.
+      operationId: networkHealth
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkHealthResult"
+
   /stats/last-90:
     get:
       tags: [Stats]
@@ -534,24 +561,28 @@ paths:
         = "blocks", current streak of consecutive finalized epochs with points)
         with competition ranks (1, 2, 2, 4), and every ranked network is
         listed: the pages form one continuous list. A row carries the network
-        name only when that network turned on
+        name and the network id only when that network turned on
         /network/points-ranking-visibility (its "show my network name"
-        switch); otherwise the row is anonymous. The emoji tag (/network/emoji)
-        shows on every row that set one.
+        switch); otherwise the row is anonymous and never identifies its
+        network. The emoji tag (/network/emoji) shows on every row that set
+        one.
         Each sort has its own tie-break order, every key descending, then the
         network id ascending so the order is total: `points` = (points,
         streak, blocks), `blocks` = (blocks, streak, points), `streak` =
         (streak, blocks, points). The pages come in exactly that order, and a
-        rank is shared only by networks whose three values all tie.
+        rank is shared only by networks whose three values all tie. A row's
+        `position` is its place in that order; anonymous rows carry no id to
+        order by, so a client orders rows by `position`.
         Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
         epoch finalizes, when a payout plan commits, and hourly); a cursor
         whose snapshot was pruned returns `restart: true` and the client
         reloads from the top. No authentication is required; with a bearer
         token the response also carries `me`, the caller's own row with its
-        network name for the caller's own card, whether or not it opted in.
-        In the list itself the caller's row is anonymous like everyone
-        else's until it opts in: the caller sees what everyone sees, and the
-        apps only highlight that row.
+        network name and id for the caller's own card, whether or not it
+        opted in. In the list itself the caller's row keeps its name hidden
+        until it opts in, like everyone else's: the caller sees what everyone
+        sees. That row has `is_me` set and carries the caller's own network
+        id, so the apps can highlight it.
       operationId: statsPointsLeaderboard
       # optional auth: anonymous callers get the list, a bearer adds `me`
       security:
@@ -1767,16 +1798,22 @@ paths:
         it in the directory (connect/EXTENDER.md C2).
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
-        attributed to a network and a client, and is rate limited per user
-        (6 per hour). Call it on the family api host of the family being
-        activated -- `api-v4.bringyour.com` for an IPv4 address,
-        `api-v6.bringyour.com` for an IPv6 one -- so the caller address the
-        operator probes back has exactly one family. An operator without
-        family hosts (a development operator on an ip literal, say) is
-        activated through its plain api url instead, and the family of the
-        outcome is the one the result reports. NEVER call it through an
-        extender: the address that is probed and published is the address this
-        request arrived from.
+        attributed to a network and a client. It is rate limited per address
+        family: 6 per hour per client and 60 per hour per account, for IPv4
+        and for IPv6 each. A budget is spent only when the operator is about
+        to probe, so a request refused before the probe (malformed arguments,
+        the wrong family, a spent budget) costs nothing, and a refusal by a
+        spent budget says how long until it has room again. Call it on the
+        family api host of the family being activated --
+        `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
+        an IPv6 one -- so the caller address the operator probes back has
+        exactly one family. An activation posted to one family's host that
+        arrives over the other family is refused before it is probed. An
+        operator without family hosts (a development operator on an ip
+        literal, say) is activated through its plain api url instead, and the
+        family of the outcome is the one the result reports. NEVER call it
+        through an extender: the address that is probed and published is the
+        address this request arrived from.
 
         Nothing is taken on the caller's word. Inside the request, and within
         a 10 second budget, the operator dials BACK to the caller's own
@@ -2486,6 +2523,35 @@ paths:
         "429":
           description: Too many inquiries from this source address; try again later.
 
+  /friends/apply:
+    post:
+      tags: [Other]
+      summary: Apply to Friends of the Network
+      description: |
+        Apply to host a Friends of the Network research node: a Raspberry Pi
+        the URnetwork research team runs network tests on. This is the
+        endpoint behind the ur.io Friends of the Network form, and it needs no
+        authentication. Applications are not stored by the api; they are
+        forwarded to the URnetwork team. Requests are rate limited per source
+        address.
+      operationId: friendsApply
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FriendsApplyArgs"
+      responses:
+        "200":
+          description: The application was received.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FriendsApplyResult"
+        "429":
+          description: Too many applications from this source address; try again later.
+
   /log/{clientId}/upload:
     post:
       tags: [Other]
@@ -2793,20 +2859,110 @@ paths:
         and are cached per network for about 5 minutes. The appearance
         histograms are read fresh on every call. The caller's own client
         comes first when it is a provider. At most 32 provider clients are
-        decided per answer; `truncated` is set when the network has more.
+        decided per answer, the first 32 in client id order; `truncated` is
+        set when the network has more, and `total_clients` says how many it
+        has.
 
-        Anti-abuse checks are reported only as the generic reason
-        `not_eligible`. Which check applies is never returned.
+        With `client_id`, the answer is the status of that one client: a
+        provider client of the caller's network, or the caller's own
+        client. Its admission and ranking are cached per client for about 5
+        minutes, and its histogram is read fresh. Every other id gets one
+        answer, whether it is unknown, another network's client, a removed
+        or child client, or a client of the network that is not a
+        provider: no providers and `error.message` "Provider client not
+        found in this network."
+
+        With `format=compact`, the answer has the same statuses in the same
+        order without their English texts (`GetProviderStatusCompactResult`).
+        Without a query, the answer is unchanged.
+
+        A refused query answers 200 with no providers and `error.message`:
+        "Invalid client_id." for a `client_id` that is not a uuid, and
+        "Invalid format." for a `format` other than `full` or `compact`.
+
+        Every 200 answer, a refused query's included, carries an `ETag`: a
+        digest of the caller's network, the query and the exact body, so it
+        changes exactly when the body does, and two networks or two queries
+        never share one. A request whose `If-None-Match` names the current
+        `ETag` is answered `304 Not Modified` with no body. The body changes
+        when the cached admission and ranking are decided again, at most
+        every 5 minutes, when a histogram counts an appearance, and every
+        minute as the histograms' hour moves on; a repeat poll in between is
+        answered 304. There is no `since` parameter: the `ETag` already
+        answers a poll whose answer has not changed, and a delta would have
+        to carry removed clients and the moved histograms besides.
+
+        Every status gives its reason as a stable code, `reason_code`, of
+        what the provider's operator can act on. Anti-abuse checks are
+        reported only as the generic reason `not_eligible` and the code
+        `withheld`, alike for every check. Which check applies is never
+        returned.
       operationId: networkProviderStatus
       security:
         - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          required: false
+          description: |
+            One client to answer for: a provider client of the caller's
+            network, or the caller's own client. Without it, the answer is
+            the network's provider clients.
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: format
+          required: false
+          description: |
+            `full`, the default, gives every status with its English texts.
+            `compact` gives the same statuses without them.
+          schema:
+            type: string
+            enum:
+              - full
+              - compact
+        - in: header
+          name: If-None-Match
+          required: false
+          description: |
+            The `ETag` of an earlier answer to the same query. When the
+            answer is unchanged, it is `304 Not Modified` with no body.
+          schema:
+            type: string
       responses:
         "200":
-          description: OK.
+          description: |
+            OK. `GetProviderStatusResult`, or `GetProviderStatusCompactResult`
+            with `format=compact`.
+          headers:
+            ETag:
+              description: A strong tag of the answer, in double quotes. It changes exactly when the body does.
+              schema:
+                type: string
+            Cache-Control:
+              description: "`private, no-cache`: a cache may keep the answer for the caller alone, and revalidates it with the `ETag` before every reuse."
+              schema:
+                type: string
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GetProviderStatusResult"
+                anyOf:
+                  - $ref: "#/components/schemas/GetProviderStatusCompactResult"
+                  - $ref: "#/components/schemas/GetProviderStatusResult"
+        "304":
+          description: |
+            Not Modified: `If-None-Match` names the current `ETag`, so the
+            answer is the one the caller has. No body.
+          headers:
+            ETag:
+              description: The current tag, the one named.
+              schema:
+                type: string
+            Cache-Control:
+              description: "`private, no-cache`, as for the 200."
+              schema:
+                type: string
 
   /network/user:
     get:
@@ -6952,10 +7108,15 @@ paths:
       summary: Sn Head
       description: |
         The caller network's standing for a head mining spot (Top 200,
-        WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
-        distinct routable egress-IP breadth from the live trail egress index,
-        `floor` the score of the last network inside `cutoff` (0 while fewer
-        networks score), `rank_estimate` 1-based (0 without a score).
+        WHITEPAPER 8.4), read from the Protocol leaderboard's newest snapshot
+        (`GET /sn/top`), so this route, the Top 200 page and the Protocol tab
+        agree: `score` is the network's `projected_score`, `floor` the
+        snapshot's `projected_cutoff` (the projected 200th score), and
+        `rank_estimate` the network's 1-based `position` (0 when it is not
+        ranked). Before the board's first snapshot they come from the live
+        estimate instead: split-adjusted distinct routable egress-IP breadth
+        from the live trail egress index, with `floor` the score of the last
+        network inside `cutoff` (0 while fewer networks score).
         `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
         "server" until validators publish consensus scores on chain; a chain
         outage degrades to the estimate, never an error.
@@ -6999,6 +7160,180 @@ paths:
                 $ref: "#/components/schemas/SnHeadBindingResult"
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/head-summary:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Upload the validator's signed head summary
+      description: |
+        The validator uploads its signed head result for one native tempo
+        (sn docs/spec/head-summary-v1.md; server LEADERTOP.md §6.1): every
+        eligible head UID in rank order with its exact score, its fleet
+        identities and whether it was selected, and no private inputs. The
+        Protocol leaderboard shows it as the validator's own ranking of
+        claimed fleets (`validator_score`, `validator_rank`,
+        `validator_rank_of` and `selected` in `GET /sn/top`).
+
+        The bearer is the validator's API session, the client JWT it uploads
+        attempt artifacts with. The session authorizes nothing by itself: the
+        summary's authority is the validator hotkey's sr25519 signature over
+        its canonical encoding, and the body must be exactly that encoding,
+        at most 16 MiB. One summary is kept
+        per netuid, validator hotkey and native epoch: a summary with a later
+        `native_snapshot_block` replaces it, and any other is answered 204
+        and leaves it in place.
+      operationId: snUploadHeadSummary
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHeadSummary"
+      responses:
+        "204":
+          description: Stored, or a summary at least as recent is already stored.
+        "400":
+          description: The body is malformed, not canonical, inconsistent or wrongly signed, or its `schema` is unknown.
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The signature verifies, but the operator does not accept `validator_hotkey` as a validator of `netuid`.
+        "413":
+          description: The body is over 16 MiB.
+        "429":
+          description: Rate limited; `Retry-After` may be set.
+        "5XX":
+          description: A transient operator failure; the validator retries.
+
+  /sn/top:
+    get:
+      tags: [Other]
+      summary: The Protocol leaderboard
+      description: |
+        The Protocol leaderboard (server LEADERTOP.md): networks ranked the
+        way the SN25 validator picks its Top 200 head fleets, so a network
+        that has not claimed a UID can see whether it would make the head if
+        it claimed now. Each network is scored as one hypothetical fleet of
+        its verify-eligible providers with the validator's head formula: the
+        distinct /29 (IPv4) or /48 (IPv6) egress prefixes they provide from,
+        each shared prefix split among every network and claimed fleet on it,
+        smoothed with the validator's EMA of a quarter per tempo. Claimed
+        networks also list their fleets, with the validator's own ranking and
+        the on-chain incentive where those are known.
+
+        The board is a snapshot computed once per tempo (360 blocks, about 72
+        minutes); `stale` is set when the newest one is more than 3 tempos
+        old. `projected_cutoff`, the projected score of the 200th unit
+        (network or claimed fleet), is the line every `margin` and `label`
+        is measured against.
+
+        `rows` cover the top 400 positions only, so networks just outside
+        the 200 line can follow their progress. Pages use a keyset `cursor`
+        pinned to the snapshot of the page that returned it: pass `next` as
+        `cursor` until it is null. `snapshot` pins the first page to one
+        snapshot, and `filter` lists `unclaimed` or `claimed` networks only.
+        Before the board's first snapshot the answer has no rows, and its
+        snapshot has an empty `id`.
+
+        No authentication is required. With a bearer token the response also
+        carries `me`, the caller's own row wherever it ranks, and the
+        caller's row in `rows` has `is_me` set. Rows are anonymous by
+        default: no row carries a network id, and a row in `rows` has a
+        `name` only when its network turned on the "show my network name"
+        switch (/network/points-ranking-visibility), the one switch for this
+        board and the points leaderboard. An anonymous claimed row is known
+        only by its fleets' UIDs. Prefix hashes and addresses are never
+        returned, only counts.
+      operationId: snTop
+      # optional auth: anonymous callers get the board, a bearer adds `me`
+      security:
+        - {}
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          description: Page size, default 50, at most 200; a larger one is served as 200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: cursor
+          required: false
+          description: |
+            Continues from a previous page's `next`. Opaque, and pinned to the
+            snapshot of the page that returned it. Omit for the first page.
+          schema:
+            type: string
+        - in: query
+          name: filter
+          required: false
+          description: |
+            Which networks to list: every ranked network, the ones that have
+            not claimed a UID, or the ones that have.
+          schema:
+            type: string
+            enum: [all, unclaimed, claimed]
+            default: all
+        - in: query
+          name: snapshot
+          required: false
+          description: |
+            A snapshot `id` to read the first page from. Absent means the
+            newest snapshot.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnTopResult"
+        "400":
+          description: |
+            A query parameter is malformed: a `limit` that is not a whole
+            number, an unknown `filter`, a `cursor` or `snapshot` that does
+            not parse, or a `cursor` from another `filter` or `snapshot` than
+            the ones given.
+        "401":
+          description: A bearer token was sent and does not authenticate.
+        "404":
+          description: "`snapshot` names no snapshot."
+        "410":
+          description: The cursor's snapshot expired; reload from the first page.
+
+  /sn/top/me:
+    get:
+      tags: [Other]
+      summary: The caller's Protocol leaderboard detail
+      description: |
+        The caller network's standing on the Protocol leaderboard
+        (`GET /sn/top`), from the same snapshot: its row; the score it would
+        have if it claimed alone today, with no other network or fleet on its
+        prefixes claiming; its distinct and shared prefix counts and how many
+        other networks and claimed fleets share them; why the validator
+        cannot measure it, when it cannot; and its rank and score for each
+        day of up to the last 90, for a progress chart. Counts only, never
+        prefix hashes or addresses. A network that is not ranked has a row
+        with `position` 0 and the label `not_measurable`.
+      operationId: snTopMe
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnTopMeResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /sn/pool/claim:
     get:
@@ -9065,6 +9400,35 @@ components:
           type: string
           format: date-time
           description: UTC start time of since_block.
+
+    NetworkHealthResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, partial, major, full, unknown]
+          description: |
+            `healthy`, a level an operator set (`degraded`, `partial`,
+            `major`, `full`, mildest first), or `unknown` when the status
+            cannot be read.
+        reason:
+          type: string
+          maxLength: 160
+          description: |
+            What is wrong, as one line of public text. Set for a level other
+            than healthy.
+        since:
+          type: string
+          format: date-time
+          description: |
+            When the network left healthy, in UTC. A change of level or reason
+            keeps it.
+        updated:
+          type: string
+          format: date-time
+          description: When the level or reason last changed, in UTC.
 
     ProvideMode:
       type: integer
@@ -11440,6 +11804,82 @@ components:
             message:
               type: string
 
+    FriendsGarment:
+      type: object
+      required:
+        - fit
+        - size
+      properties:
+        fit:
+          description: "`m` for men's fit, `f` for women's fit."
+          type: string
+          enum: [m, f]
+        size:
+          type: string
+          enum: [XS, S, M, L, XL, 2XL, 3XL]
+
+    FriendsApplyArgs:
+      type: object
+      required:
+        - name
+        - email
+        - country_code
+        - connection_type
+        - consent
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        country_code:
+          description: |
+            ISO 3166-1 alpha-2 country the node would be hosted in. Nodes ship
+            under US export controls, so some countries are refused.
+          type: string
+        connection_type:
+          type: string
+          enum: [wifi, ethernet, cellular, satellite, other]
+        consent:
+          description: The applicant agrees to do their best to keep the node online. Must be true.
+          type: boolean
+        credit:
+          description: Credit the applicant in the published research reports.
+          type: boolean
+        credit_name:
+          description: The name to credit, when it differs from `name`.
+          type: string
+        t_shirts:
+          description: Up to two t-shirts.
+          type: array
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/FriendsGarment"
+        hoodies:
+          description: Up to two hoodies.
+          type: array
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/FriendsGarment"
+        notes:
+          description: Optional notes, comments or questions.
+          type: string
+
+    FriendsApplyResult:
+      type: object
+      required: []
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
     FindLocationsArgs:
       type: object
       required: []
@@ -11634,6 +12074,29 @@ components:
             `v6-only` are the exact categories.
           type: string
           enum: ["", v4-capable, v6-capable, dualstack, v4-only, v6-only]
+        post_quantum_encryption:
+          description: |
+            Keep only providers whose latest provide with a Public or Network
+            key declared post-quantum encryption sessions, in every draw,
+            providers named by `client_id` included. A provider that never
+            declared them, as no provider did before the declaration existed,
+            is left out. A client whose connections require post-quantum
+            encryption sets it; unset keeps the capability-blind answer.
+          type: boolean
+        require_modern_provider:
+          description: |
+            Keep only modern providers, in every draw, providers named by
+            `client_id` included. A provider holding a Public key is modern
+            when the platform's capability probe measured it, within the last
+            seven days, negotiating end-to-end post-quantum encryption with
+            resizable transfer windows. A provider holding only a Network key,
+            which the probe cannot reach, is modern when its latest provide
+            with a Network key declared post-quantum encryption sessions. A
+            provider holding neither key is never modern. With
+            `post_quantum_encryption` too, both filters apply. A client whose
+            connections require end-to-end encryption sets it; unset keeps
+            the capability-blind answer.
+          type: boolean
 
     LocationCoordinates:
       description: |
@@ -14633,7 +15096,7 @@ components:
     PointsLeaderboardRow:
       type: object
       required:
-        - network_id
+        - is_me
         - anonymous
         - total_points
         - blocks_with_points
@@ -14645,7 +15108,16 @@ components:
         - position
       properties:
         network_id:
+          description: |
+            The network's id, present only on a named row (the network turned
+            on points_leaderboard_public, /network/points-ranking-visibility)
+            and on the signed-in caller's own row, and absent otherwise: an
+            anonymous row never identifies its network.
           type: string
+          format: uuid
+        is_me:
+          description: The row is the signed-in caller's own network; false without a bearer token.
+          type: boolean
         network_name:
           description: Present only when the network turned on points_leaderboard_public (/network/points-ranking-visibility)
           type: string
@@ -15072,19 +15544,71 @@ components:
         - providers
       properties:
         providers:
-          description: the caller's own client first when it is a provider, then the network's other provider clients in client id order
+          description: the caller's own client first when it is a provider, then the network's other provider clients in client id order; with `client_id`, that one client; empty for a refused query
           type: array
           items:
             $ref: "#/components/schemas/ProviderStatus"
         truncated:
           description: the network has more provider clients than one answer decides
           type: boolean
+        total_clients:
+          description: |
+            How many provider clients the network has (active, top-level
+            clients with a provide key), the ones `providers` is drawn from,
+            counted up to 10000. With `truncated`, all but the first 32 in
+            client id order are left out, except the caller's own client,
+            which is listed first. Only in the network's answer: absent with
+            `client_id`, whose answer is one client and never truncated, and
+            for a refused query.
+          type: integer
+        error:
+          description: a refused query, which has no providers
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              description: |
+                "Provider client not found in this network." for every
+                `client_id` the caller does not read, "Invalid client_id." or
+                "Invalid format."
+              type: string
+
+    GetProviderStatusCompactResult:
+      description: |
+        The answer with `format=compact`: the statuses of
+        `GetProviderStatusResult`, in the same order, without their English
+        texts.
+      type: object
+      required:
+        - providers
+      properties:
+        providers:
+          description: the statuses `GetProviderStatusResult.providers` lists, in the same order
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderStatusCompact"
+        truncated:
+          description: the network has more provider clients than one answer decides
+          type: boolean
+        total_clients:
+          description: as `GetProviderStatusResult.total_clients`
+          type: integer
+        error:
+          description: a refused query, which has no providers; as `GetProviderStatusResult.error`
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     ProviderStatus:
       type: object
       required:
         - client_id
         - reason
+        - reason_code
         - reason_text
         - admission
         - ranking
@@ -15107,11 +15631,17 @@ components:
             - reliability_warming_up
             - reliability_low
             - not_eligible
+            - egress_no_success
+            - egress_low_success
             - egress_unprobed
+            - egress_warming_up
             - egress_failing
+            - not_modern
             - speed_test_missing
             - slow
             - none
+        reason_code:
+          $ref: "#/components/schemas/ProviderStatusReasonCode"
         reason_text:
           description: the reason in English
           type: string
@@ -15122,7 +15652,8 @@ components:
             The numbers find-providers2 admits and orders the provider by, in
             display order. The mode-level numbers (`weight_*`, `tier_*`) are
             left out when the provider is in no pool (not_providing,
-            not_connected, location_invalid, not_eligible).
+            not_connected, location_invalid, not_eligible, egress_no_success,
+            egress_low_success).
           type: array
           items:
             $ref: "#/components/schemas/ProviderRankingNumber"
@@ -15134,6 +15665,50 @@ components:
           format: date-time
         appearances:
           $ref: "#/components/schemas/ProviderAppearanceHistogram"
+
+    ProviderStatusReasonCode:
+      description: |
+        The reason as a stable code of what the provider's operator can act
+        on, with the reasons each codes. A code is coarser than the reason
+        and outlives it: a reason added later is given one of these codes.
+
+        - `not_providing`: providing is off on the device; turn it on
+          (`not_providing`).
+        - `not_connected`: the device isn't connected (`not_connected`).
+        - `location_invalid`: the device connects from more than one
+          address, or its location is unknown (`location_invalid`).
+        - `network_only`: the device provides only to the network's own
+          devices; choose Always to share with everyone (`network_only`).
+        - `warming_up`: a measurement is still accruing (reliability
+          history, network checks or a speed test), and the reason clears on
+          its own (`reliability_warming_up`, `egress_warming_up`,
+          `egress_unprobed`, `speed_test_missing`).
+        - `reliability_low`: reliability over the last hour is below the
+          floor; keep the device connected (`reliability_low`).
+        - `withheld`: an anti-abuse check holds the provider back. Every
+          check gives this one code, and which applies is never returned
+          (`not_eligible`).
+        - `egress_failing`: test sites fail to load through the connection;
+          check its internet connection and any firewall, VPN or DNS filter
+          (`egress_no_success`, `egress_low_success`, `egress_failing`).
+        - `not_modern`: the network check hasn't confirmed the modern
+          provider build, end-to-end post-quantum encryption with resizable
+          transfer windows; update the app (`not_modern`).
+        - `slow`: the connection measured slower than clients need (`slow`).
+        - `none`: nothing holds the provider back (`none`).
+      type: string
+      enum:
+        - not_providing
+        - not_connected
+        - location_invalid
+        - network_only
+        - warming_up
+        - reliability_low
+        - withheld
+        - egress_failing
+        - not_modern
+        - slow
+        - none
 
     ProviderAdmission:
       type: object
@@ -15262,6 +15837,111 @@ components:
           items:
             type: integer
             format: int64
+
+    ProviderStatusCompact:
+      description: A `ProviderStatus` without `reason_text` and the explanations.
+      type: object
+      required:
+        - client_id
+        - reason
+        - reason_code
+        - admission
+        - ranking
+        - evaluate_time
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        reason:
+          description: |
+            The first rule, in this order, that holds the provider back; `none`
+            when it passes them all. `not_eligible` covers every anti-abuse
+            check and never says which.
+          type: string
+          enum:
+            - not_providing
+            - not_connected
+            - location_invalid
+            - network_only
+            - reliability_warming_up
+            - reliability_low
+            - not_eligible
+            - egress_no_success
+            - egress_low_success
+            - egress_unprobed
+            - egress_warming_up
+            - egress_failing
+            - not_modern
+            - speed_test_missing
+            - slow
+            - none
+        reason_code:
+          $ref: "#/components/schemas/ProviderStatusReasonCode"
+        admission:
+          $ref: "#/components/schemas/ProviderAdmission"
+        ranking:
+          description: the numbers of `ProviderStatus.ranking`, in the same order
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderRankingNumberCompact"
+        country:
+          $ref: "#/components/schemas/ProviderStatusCountryCompact"
+        evaluate_time:
+          description: when the admission and ranking were decided
+          type: string
+          format: date-time
+        appearances:
+          $ref: "#/components/schemas/ProviderAppearanceHistogram"
+
+    ProviderRankingNumberCompact:
+      description: |
+        A `ProviderRankingNumber` without its explanation. `value`, `minimum`
+        and `maximum` are present only when the number has one (`has_value`,
+        `has_minimum` and `has_maximum` in the full form). `count` and `total`
+        are present only for a counted number with a value (`url_checks`).
+      type: object
+      required:
+        - name
+        - passes
+      properties:
+        name:
+          description: as `ProviderRankingNumber.name`
+          type: string
+        value:
+          type: number
+          format: double
+        minimum:
+          description: the selection's floor
+          type: number
+          format: double
+        maximum:
+          description: the selection's ceiling
+          type: number
+          format: double
+        passes:
+          description: false when the number holds the provider back
+          type: boolean
+        count:
+          type: integer
+        total:
+          type: integer
+
+    ProviderStatusCountryCompact:
+      description: A `ProviderStatusCountry` without its explanation.
+      type: object
+      required:
+        - country_code
+        - country
+        - observed_country_code
+      properties:
+        country_code:
+          description: the country clients are offered the provider under
+          type: string
+        country:
+          type: string
+        observed_country_code:
+          description: the country the latest network check saw the connection exit in, empty for none
+          type: string
 
     SolanaPaymentIntentArgs:
       type: object
@@ -16166,15 +16846,21 @@ components:
           description: The estimate places the network inside the cutoff.
           type: boolean
         score:
-          description: Split-adjusted distinct routable egress-IP breadth (server estimate).
+          description: |
+            The network's `projected_score` in the Protocol leaderboard's
+            newest snapshot; before the first snapshot, the live estimate of
+            split-adjusted distinct routable egress-IP breadth.
           type: number
           format: double
         floor:
-          description: Score of the last network inside the cutoff; 0 while fewer networks score.
+          description: |
+            The snapshot's `projected_cutoff`, the projected 200th score;
+            before the first snapshot, the score of the last network inside
+            the cutoff (0 while fewer networks score).
           type: number
           format: double
         rank_estimate:
-          description: 1-based estimated rank; 0 without a score.
+          description: The network's 1-based `position` on the board; 0 when it is not ranked.
           type: integer
         cutoff:
           description: Head-tier size (200).
@@ -16309,6 +16995,580 @@ components:
           properties:
             message:
               type: string
+
+    SnHeadSummary:
+      type: object
+      description: |
+        The validator's signed head result for one native tempo, version 1
+        (sn docs/spec/head-summary-v1.md). The members appear in exactly this
+        order with no insignificant whitespace, and the body must equal that
+        canonical encoding byte for byte. Integers are exact to 64 bits; a
+        consumer outside Go parses them as 64-bit integers.
+
+        `signing_hash` is `sha256:` and the hex of SHA-256 over the domain
+        "urnetwork/validator/head-summary/v1", a zero byte and the canonical
+        encoding with `signing_hash` and `signature` set to "". `signature`
+        is the validator hotkey's sr25519 signature over that digest, in the
+        Substrate signing context `substrate`.
+      additionalProperties: false
+      required:
+        - schema
+        - netuid
+        - native_epoch
+        - native_snapshot_block
+        - native_snapshot_hash
+        - evm_snapshot_block
+        - evm_snapshot_hash
+        - settlement_epoch
+        - policy_id
+        - policy_hash
+        - measurement_artifact_hash
+        - validator_hotkey
+        - validator_uid
+        - maximum_head_fleets
+        - entries
+        - selected_uids
+        - rejected_uids
+        - signed_at
+        - signature_scheme
+        - signing_hash
+        - signature
+      properties:
+        schema:
+          type: string
+          const: urnetwork-validator-head-summary-v1
+        netuid:
+          description: The subnet (25 on mainnet).
+          type: integer
+          minimum: 1
+          maximum: 65535
+        native_epoch:
+          description: |
+            The tempo index: the subnet's epoch index at
+            `native_snapshot_block`, the steering intent's `subnet_epoch`.
+          type: integer
+          minimum: 0
+        native_snapshot_block:
+          description: The finalized native block the decision was taken at.
+          type: integer
+          minimum: 1
+        native_snapshot_hash:
+          description: That block's hash.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        evm_snapshot_block:
+          description: The finalized EVM block whose coordinator binding census was read.
+          type: integer
+          minimum: 1
+        evm_snapshot_hash:
+          description: That block's hash.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        settlement_epoch:
+          description: The coordinator settlement epoch at `evm_snapshot_block`.
+          type: integer
+          minimum: 0
+        policy_id:
+          description: The signed policy's id.
+          type: integer
+          minimum: 1
+        policy_hash:
+          description: The signed policy's hash, as the coordinator pins it.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        measurement_artifact_hash:
+          description: The content address of the validator's private measurement artifact for this intent; it reveals nothing.
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        validator_hotkey:
+          description: The validator's sr25519 public key, nonzero.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        validator_uid:
+          description: The validator's UID on `netuid`.
+          type: integer
+          minimum: 0
+          maximum: 65535
+        maximum_head_fleets:
+          description: The policy's head size (200 on mainnet).
+          type: integer
+          minimum: 1
+          maximum: 65535
+        entries:
+          description: |
+            Every eligible head UID in rank order: score descending, then UID
+            ascending, with ranks 1 to n. Empty when the head is empty.
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/SnHeadSummaryEntry"
+        selected_uids:
+          description: The UIDs of the selected entries, in rank order.
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 65535
+        rejected_uids:
+          description: The UIDs of the other entries, in rank order.
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 65535
+        signed_at:
+          description: The UTC signing time, RFC 3339 with up to nine fraction digits and no trailing fraction zeros, ending in Z.
+          type: string
+          format: date-time
+        signature_scheme:
+          type: string
+          const: sr25519
+        signing_hash:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        signature:
+          description: The 64-byte sr25519 signature.
+          type: string
+          pattern: "^0x[0-9a-f]{128}$"
+
+    SnHeadSummaryEntry:
+      type: object
+      description: One eligible head UID of a head summary.
+      additionalProperties: false
+      required:
+        - rank
+        - uid
+        - hotkey
+        - score
+        - selected
+        - fleets
+      properties:
+        rank:
+          description: The 1-based position among the eligible entries.
+          type: integer
+          minimum: 1
+        uid:
+          description: The head UID.
+          type: integer
+          minimum: 0
+          maximum: 65535
+        hotkey:
+          description: The hotkey holding `uid` at `evm_snapshot_block`, nonzero.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        score:
+          $ref: "#/components/schemas/SnHeadSummaryRational"
+        selected:
+          description: Exactly when `rank` is at most `maximum_head_fleets`.
+          type: boolean
+        fleets:
+          description: |
+            The live fleet identities that make up `score`, ordered by
+            `fleet_id` bytes and then `generation`, with no duplicates.
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/SnHeadSummaryFleet"
+
+    SnHeadSummaryFleet:
+      type: object
+      description: One fleet identity of a head UID, with the entry's `uid` and `hotkey`.
+      additionalProperties: false
+      required:
+        - fleet_id
+        - generation
+      properties:
+        fleet_id:
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        generation:
+          type: integer
+          minimum: 1
+
+    SnHeadSummaryRational:
+      type: object
+      description: |
+        An exact head score in its unique reduced form: the greatest common
+        divisor of the two is 1, and the denominator is at least 1.
+      additionalProperties: false
+      required:
+        - numerator
+        - denominator
+      properties:
+        numerator:
+          type: string
+          pattern: "^(0|[1-9][0-9]*)$"
+        denominator:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+
+    SnTopResult:
+      type: object
+      description: One page of the Protocol leaderboard (`GET /sn/top`).
+      required:
+        - snapshot
+        - rows
+        - me
+        - next
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/SnTopSnapshot"
+        rows:
+          description: The page's rows in position order, within the top 400 positions.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnTopRow"
+        me:
+          description: |
+            The caller's own row wherever it ranks; null when the request is
+            not signed in or the caller's network is not ranked.
+          oneOf:
+            - $ref: "#/components/schemas/SnTopRow"
+            - type: "null"
+        next:
+          description: The `cursor` of the next page; null on the last page.
+          type: [string, "null"]
+
+    SnTopSnapshot:
+      type: object
+      description: |
+        One per-tempo computation of the Protocol leaderboard. Every page and
+        `GET /sn/top/me` say which snapshot they were read from.
+      required:
+        - id
+        - tempo_index
+        - block
+        - computed_at
+        - settlement_epoch
+        - total_ranked
+        - head_seats
+        - claimed_fleets
+        - open_seats
+        - projected_cutoff
+        - claimed_cutoff
+        - binding_open
+        - binding_note
+        - measured_providers
+        - cohort_capacity
+        - validator_summary_at
+        - incentive_at
+        - precision_at_200
+        - stale
+      properties:
+        id:
+          description: |
+            Opaque; the `snapshot` query parameter of `GET /sn/top` reads from
+            it. Empty before the board's first snapshot.
+          type: string
+        tempo_index:
+          description: The SN25 tempo the snapshot folds in.
+          type: integer
+          format: int64
+        block:
+          description: The chain block the snapshot was computed at.
+          type: integer
+          format: int64
+        computed_at:
+          type: string
+          format: date-time
+        settlement_epoch:
+          description: The settlement epoch whose pinned prefix hashes the snapshot uses.
+          type: integer
+          format: int64
+        total_ranked:
+          description: Networks ranked in the snapshot.
+          type: integer
+        head_seats:
+          description: Head seats on SN25 (200).
+          type: integer
+        claimed_fleets:
+          description: Fleets bound on SN25.
+          type: integer
+        open_seats:
+          description: Head seats that claimed fleets leave open.
+          type: integer
+        projected_cutoff:
+          description: |
+            The projected score of the 200th unit (network or claimed fleet):
+            the line every `margin` and `label` is measured against.
+          type: number
+          format: double
+        claimed_cutoff:
+          description: The current floor among claimed fleets; null when no fleet has claimed.
+          type: [number, "null"]
+          format: double
+        binding_open:
+          description: |
+            Fleet binding is open on mainnet. While it is closed no fleet can
+            claim a head seat, and the apps say that claiming isn't open yet.
+          type: boolean
+        binding_note:
+          description: |
+            The state of fleet binding in English, such as "Top 200 binding
+            isn't open on mainnet yet".
+          type: string
+        measured_providers:
+          description: Providers in the validator's verify cohort, the ones it can measure.
+          type: integer
+        cohort_capacity:
+          description: How many providers the verify cohort holds.
+          type: integer
+        validator_summary_at:
+          description: When the validator's latest signed head summary arrived; null without one.
+          type: [string, "null"]
+          format: date-time
+        incentive_at:
+          description: When on-chain incentive was last read; null before the first read.
+          type: [string, "null"]
+          format: date-time
+        precision_at_200:
+          description: |
+            The measured precision of the projected top 200 against the
+            validator's selection, from 0 to 1; null until fleets bind. The
+            `likely` label switches on at 0.9.
+          type: [number, "null"]
+          format: double
+        stale:
+          description: The snapshot was computed more than 3 tempos ago.
+          type: boolean
+
+    SnTopRow:
+      type: object
+      description: |
+        One network on the Protocol leaderboard, scored as one hypothetical
+        fleet of its verify-eligible providers. No row carries a network id.
+      required:
+        - position
+        - name
+        - tag
+        - projected_score
+        - raw_last_tempo
+        - margin
+        - trend
+        - prefixes
+        - shared_prefixes
+        - presence
+        - label
+        - measurable
+        - verify_eligible
+        - claim_prompt
+        - is_me
+        - fleets
+      properties:
+        position:
+          description: |
+            The 1-based position in the snapshot's total order; 0 in
+            `GET /sn/top/me` when the network is not ranked.
+          type: integer
+          minimum: 0
+        name:
+          description: |
+            The network name, set in `rows` only when the network turned on
+            its "show my network name" switch
+            (/network/points-ranking-visibility); "" when the row is
+            anonymous.
+          type: string
+        tag:
+          description: The network's emoji tag; "" when unset.
+          type: string
+        projected_score:
+          description: The projected head score, smoothed with the validator's EMA.
+          type: number
+          format: double
+        raw_last_tempo:
+          description: The projected raw score of the last tempo, before smoothing.
+          type: number
+          format: double
+        margin:
+          description: |
+            The `projected_score` relative to the snapshot's
+            `projected_cutoff`, as a fraction of the cutoff: positive above
+            the Top 200 line, negative below it.
+          type: number
+          format: double
+        trend:
+          description: Positions moved since the previous tempo's snapshot; positive is up.
+          type: integer
+        prefixes:
+          description: Distinct /29 (IPv4) or /48 (IPv6) egress prefixes the network's providers provide from.
+          type: integer
+        shared_prefixes:
+          description: How many of those prefixes another network or claimed fleet also provides from.
+          type: integer
+        presence:
+          description: How present the network's providers were over the last tempo, from 0 to 1.
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        label:
+          description: |
+            The recommendation. `not_measurable` when the validator cannot
+            measure the network (`measurable` is false). Otherwise `estimate`
+            until the snapshot's `precision_at_200` reaches 0.9, and after
+            that `likely` (a `margin` of +0.20 or more, and measurable in at
+            least 3 of the last 4 tempos), `borderline` (a `margin` within
+            0.20 of the line either way) or `unlikely` (a `margin` of -0.20
+            or less).
+          type: string
+          enum: [estimate, likely, borderline, unlikely, not_measurable]
+        measurable:
+          description: The validator can measure the network; its providers are in the verify cohort.
+          type: boolean
+        verify_eligible:
+          description: The network has verify-eligible providers.
+          type: boolean
+        claim_prompt:
+          description: |
+            The apps prompt the network to claim a head seat: it is
+            `measurable`, its `position` is 200 or better, and it has no
+            active claimed fleet. A network that already claimed is not
+            prompted. Apps use this flag rather than computing it.
+          type: boolean
+        is_me:
+          description: The row is the caller's own network; false without a bearer token.
+          type: boolean
+        fleets:
+          description: The network's claimed fleets; empty when it has not claimed.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnTopFleet"
+
+    SnTopFleet:
+      type: object
+      description: |
+        One fleet a network has claimed, bound on SN25 to a hotkey UID. A UID
+        that changed hands earns and ranks for its new holder, so the
+        validator's data and the incentive are shown only while the fleet's
+        hotkey still holds the UID, and are null otherwise.
+      required:
+        - uid
+        - generation
+        - valid_to_epoch
+        - replica_score
+        - validator_score
+        - validator_rank
+        - validator_rank_of
+        - selected
+        - incentive
+        - incentive_stale
+      properties:
+        uid:
+          description: The fleet's UID on SN25.
+          type: integer
+        generation:
+          description: The binding generation.
+          type: integer
+          format: int64
+        valid_to_epoch:
+          description: The settlement epoch the binding is valid until.
+          type: integer
+          format: int64
+        replica_score:
+          description: The board's replica of the validator's head score for the fleet, from its complete trails.
+          type: number
+          format: double
+        validator_score:
+          description: The validator's own head score for the fleet, from its signed head summary; null without one.
+          type: [number, "null"]
+          format: double
+        validator_rank:
+          description: The fleet's 1-based rank among the fleets the validator ranked; null without a head summary.
+          type: [integer, "null"]
+        validator_rank_of:
+          description: How many fleets the validator ranked; null without a head summary.
+          type: [integer, "null"]
+        selected:
+          description: The validator selected the fleet into the Top 200; null without a head summary.
+          type: [boolean, "null"]
+        incentive:
+          description: |
+            The UID's share of SN25 incentive, a fraction from 0 to 1 (the
+            chain's `Incentive`, a share of 65535); null before it is first
+            read. 0.018 is 1.8%.
+          type: [number, "null"]
+          format: double
+          minimum: 0
+          maximum: 1
+        incentive_stale:
+          description: |
+            `incentive` is stale: the validator's weights on chain are its
+            fallback row, or they are outside the activity cutoff.
+          type: boolean
+
+    SnTopMeResult:
+      type: object
+      description: The caller's detail on the Protocol leaderboard (`GET /sn/top/me`).
+      required:
+        - snapshot
+        - me
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/SnTopSnapshot"
+        me:
+          $ref: "#/components/schemas/SnTopMe"
+
+    SnTopMe:
+      type: object
+      description: The caller network's standing on the Protocol leaderboard, with what is behind it.
+      required:
+        - row
+        - solo_score
+        - distinct_prefixes
+        - shared_prefixes
+        - shared_with_units
+        - not_measurable_reason
+        - history
+      properties:
+        row:
+          $ref: "#/components/schemas/SnTopRow"
+        solo_score:
+          description: |
+            The score the network would have if it claimed alone today, with
+            no other network or fleet on its prefixes claiming.
+          type: number
+          format: double
+        distinct_prefixes:
+          description: Distinct /29 (IPv4) or /48 (IPv6) egress prefixes the network's providers provide from.
+          type: integer
+        shared_prefixes:
+          description: How many of those prefixes another network or claimed fleet also provides from.
+          type: integer
+        shared_with_units:
+          description: How many other networks and claimed fleets share the network's prefixes.
+          type: integer
+        not_measurable_reason:
+          description: |
+            Why the validator cannot measure the network; "" when it can.
+            `not_in_cohort`: its providers aren't in the verify cohort.
+            `shared_egress`: its providers share an egress address with
+            another network. `not_providing`: none of its devices provides.
+          type: string
+          enum: ["", not_in_cohort, shared_egress, not_providing]
+        history:
+          description: The network's projected rank and score for each day, at most 90 days.
+          type: array
+          maxItems: 90
+          items:
+            $ref: "#/components/schemas/SnTopHistoryPoint"
+
+    SnTopHistoryPoint:
+      type: object
+      description: The network's projected rank and score on one day.
+      required:
+        - day
+        - rank
+        - score
+      properties:
+        day:
+          description: The day, YYYY-MM-DD.
+          type: string
+          format: date
+        rank:
+          type: integer
+        score:
+          type: number
+          format: double
 
     SnPoolClaimResult:
       type: object

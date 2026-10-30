@@ -465,6 +465,15 @@ type RouteManager struct {
 	pendingWriterSnapshots            map[*routeSnapshot]bool
 	pendingWriterSnapshotsByTransport map[Transport]map[*routeSnapshot]bool
 	pendingWriterSnapshotsBySelector  map[*MultiRouteSelector]map[*routeSnapshot]bool
+
+	// every transport of the client publishes its delay stats here
+	// (DELAY.md §9); the route manager is the one object they all hold
+	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
+	// whether the latest edge answer to the delay header offer of one of the
+	// client's platform connections accepted it; false until an edge answers.
+	// New active P2P generations offer the header only while it holds
+	// (DELAY.md §6.1).
+	transportDelayEdgeAccepted atomic.Bool
 	// Verified final destinations outlive individual transfer sequences. A
 	// live endpoint StreamSequence owns the matching alias scope; verified
 	// contracts may arrive before that scope opens and remain recorded until an
@@ -523,7 +532,34 @@ func NewRouteManagerWithLogger(ctx context.Context, clientTag string, log Logger
 		pendingWriterSnapshots:                map[*routeSnapshot]bool{},
 		pendingWriterSnapshotsByTransport:     map[Transport]map[*routeSnapshot]bool{},
 		pendingWriterSnapshotsBySelector:      map[*MultiRouteSelector]map[*routeSnapshot]bool{},
+		transportDelayStatsCallbacks:          NewCallbackList[TransportDelayStatsFunction](),
 	}
+}
+
+// addTransportDelayStatsCallback subscribes to the delay stats of every
+// transport registered on this route manager (DELAY.md §9).
+func (self *RouteManager) addTransportDelayStatsCallback(callback TransportDelayStatsFunction) func() {
+	callbackId := self.transportDelayStatsCallbacks.Add(callback)
+	return func() {
+		self.transportDelayStatsCallbacks.Remove(callbackId)
+	}
+}
+
+// publishTransportDelayStats runs on the transport goroutine that closed the
+// interval, so subscribers must not block.
+func (self *RouteManager) publishTransportDelayStats(stats *TransportDelayStats) {
+	for _, callback := range self.transportDelayStatsCallbacks.Get() {
+		HandleError(func() {
+			callback(stats)
+		})
+	}
+}
+
+// noteTransportDelayEdgeAnswer records an edge's answer to the delay header
+// offer of one of the client's platform connections, on its 101 or its auth
+// response. The latest answer wins (DELAY.md §6.1).
+func (self *RouteManager) noteTransportDelayEdgeAnswer(accepted bool) {
+	self.transportDelayEdgeAccepted.Store(accepted)
 }
 
 func (self *RouteManager) DowngradeReceiverConnection(source TransferPath) {

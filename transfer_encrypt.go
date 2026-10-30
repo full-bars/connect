@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1011,9 +1012,9 @@ type peerEncryptionSession struct {
 	// key-exchange family so close() reports the matching family exactly once.
 	pqeOpenReported bool
 	pqeWasOpen      bool
-	client  *Client
-	peerId  Id // the other client's ClientId; the session is shared across every transport/route/stream to this peer
-	role    sequenceTlsRole
+	client          *Client
+	peerId          Id // the other client's ClientId; the session is shared across every transport/route/stream to this peer
+	role            sequenceTlsRole
 	// companion is this session's identity companion (see the file header),
 	// stamped onto every EncryptedControl it emits. Client role: the creating
 	// SendSequence's flag. Server role: the initiator's bit from the inbound
@@ -3773,6 +3774,32 @@ func (self *EncryptionSessionManager) PQECounts() PQECounts {
 
 func (self *EncryptionSessionManager) RequireEncryption() bool {
 	return self.settings != nil && self.settings.Mode == EncryptionModeRequired
+}
+
+// ServesPostQuantumEncryption reports whether this manager answers a peer that
+// requires a post-quantum session (`EncryptionModeRequired`): the session
+// layer is on, the identity such a peer verifies the session against is set
+// up (the published TLS certificate, signed with the client identity key),
+// and the receiver-role TLS config offers the X25519MLKEM768 hybrid. Every
+// `Provide` the contract manager sends advertises it. Provider discovery
+// narrows a client that requires post-quantum encryption to modern providers,
+// and the advertisement is what makes a provider holding only a Network key
+// modern, since the capability probe cannot reach it; a request that sets
+// `post_quantum_encryption` keeps only advertising providers. It is a claim
+// for discovery, never for admission: the requiring peer still verifies every
+// session it seals with.
+func (self *EncryptionSessionManager) ServesPostQuantumEncryption() bool {
+	if self.settings == nil || self.settings.Mode == EncryptionModeOff || self.clientKeyManager == nil {
+		return false
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed || self.serverTlsConfig == nil || len(self.selfCertPem) == 0 {
+		return false
+	}
+	// an empty list is the crypto/tls default, which leads with the hybrid
+	curves := self.serverTlsConfig.CurvePreferences
+	return len(curves) == 0 || slices.Contains(curves, tls.X25519MLKEM768)
 }
 
 // SendNoSession reports whether a SendSequence to `destinationId` should run

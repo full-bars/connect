@@ -685,6 +685,13 @@ type PlatformTransportSettings struct {
 	DnsTlds        [][]byte
 	V2H1Auth       bool
 	FramerSettings *FramerSettings
+	// TransportDelay, when set, offers the per-message delay header on this
+	// transport's connections and publishes their delay stats to the route
+	// manager (DELAY.md). Each edge's answer is recorded there too, for the
+	// client's new P2P generations to follow (§6.1). Nil offers nothing. Only
+	// non-provider client transports set it (D3); a connection declaring
+	// provide intent never offers.
+	TransportDelay *TransportDelaySettings
 
 	PtDnsSlowMultiple int
 
@@ -771,6 +778,21 @@ type PlatformTransportSettings struct {
 	// move (resident_move.go). An owner sets it on the replacement's own copy
 	// of the settings only.
 	ResidentMoveDial *ResidentMoveDial
+	// Chooses the edge this transport dials when no move target or preference
+	// applies, for a client that runs on the platform and reads its edge load
+	// (platform_placement.go). Applies with or without `EnableMove`. Nil
+	// resolves the platform host.
+	Placement PlatformPlacement
+	// How long the client keeps the edge a placement chose, so its transports
+	// and reconnects return to the edge that holds its resident. Six hours by
+	// default, the move preference's duration. Non-positive keeps none: every
+	// dial asks the placement.
+	PlacementPreferDuration time.Duration
+	// How long a placed address whose dial failed is not dialed for a
+	// placement again. Ten minutes by default: long enough that a broken edge
+	// interface does not cost every reconnect a failed dial, short enough that
+	// a repaired one is used again. Non-positive holds none.
+	PlacementFailHold time.Duration
 
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
@@ -879,6 +901,9 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		MoveTargetFailHold:    1 * time.Hour,
 		MoveClientMinInterval: 30 * time.Minute,
 		MoveIdDedupeCount:     32,
+
+		PlacementPreferDuration: 6 * time.Hour,
+		PlacementFailHold:       10 * time.Minute,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -2424,6 +2449,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// the move targets this attempt dials in place of the platform host,
 		// nil to resolve it (transport_move.go). Set right before the dial.
 		var moveAttempt *platformMoveDialAttempt
+		// the delay header rides header auth only, where the first message
+		// after the 101 is the switch point, and never a connection that
+		// declares provide intent (DELAY.md §6, D3)
+		offerTransportDelay := self.settings.V2H1Auth && self.settings.TransportDelay.offered() && !auth.ProvideIntent
 		connect := func(dialCtx context.Context) (H1MessageConn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
@@ -2438,6 +2467,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
 				applyProvideIntentHeader(header, auth)
+				if offerTransportDelay {
+					applyTransportDelayH1Offer(header)
+				}
 			}
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
@@ -2654,6 +2686,29 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			continue
 		}
 
+		// a 101 that selected the delay header switches every message of this
+		// connection to the header wire (DELAY.md §5, §6). From here on every
+		// read and write goes through ws, which stamps and strips the header.
+		// nil keeps the legacy wire.
+		delayH1 := enableTransportDelayH1(ws, newTransportDelay(
+			self.settings.TransportDelay,
+			clientId,
+			TransportTypeH1,
+			self.routeManager.publishTransportDelayStats,
+		))
+		if offerTransportDelay {
+			// the edge's answer, which the client's new P2P generations
+			// follow (DELAY.md §6.1)
+			self.routeManager.noteTransportDelayEdgeAnswer(delayH1 != nil)
+		}
+		if delayH1 != nil {
+			ws = delayH1.conn
+			// re-apply the payload limit through the wrapper, which adds the
+			// header to the WebSocket limit. h1+ bounds the payload itself and
+			// clamps this to its maximum.
+			ws.SetReadLimit(self.h1MaxMessageByteCount())
+		}
+
 		c := func() {
 			defer ws.Close()
 
@@ -2837,6 +2892,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// connection worker then closes the remaining reader, watcher,
 				// and socket-writer ownership before completion is published.
 				connectionWaitGroup.Wait()
+				// no reader or writer remains, so the interval in progress is
+				// the connection's last
+				if delayH1 != nil {
+					delayH1.delay.flush()
+				}
 				h1Progress.event("h1_closed", nil, true, nil)
 				// No producer can enqueue after the join, so one deterministic
 				// drain releases every pooled message still sitting in either lane.
@@ -3160,6 +3220,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}()
 				speedTest := false
 				var speedTestId uint32
+				// The reader's time between reads, which is almost all spent
+				// handing the last message onward, censors the next delay
+				// sample: the next message waited in the socket for a local
+				// reason (DELAY.md §4.2). Zero when there is no delay header.
+				var handoffStartTime time.Time
 
 				for {
 					select {
@@ -3168,11 +3233,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					default:
 					}
 
+					if !handoffStartTime.IsZero() {
+						delayH1.noteHandoff(time.Since(handoffStartTime))
+					}
 					if err := ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
 						h1Progress.event("h1_read_deadline_error", nil, false, err)
 						return
 					}
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
+					if delayH1 != nil {
+						handoffStartTime = time.Now()
+					}
 					if err != nil {
 						h1Progress.event("h1_read_error", nil, false, err)
 						if self.log.V(2).Enabled() {
@@ -3410,6 +3481,9 @@ func (self *PlatformTransport) runH3(
 			sendDatagram   func([]byte) error
 			attempt        *h3DialAttempt
 			useH3Datagrams bool
+			// both lanes carry the delay header after the auth exchange
+			// (transport_delay_h3.go)
+			useTransportDelay bool
 		}
 
 		connect := func(attemptCtx context.Context) (*ConnStream, error) {
@@ -3429,6 +3503,7 @@ func (self *PlatformTransport) runH3(
 				ResidentMoveVersion: self.residentMoveVersion(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
+			SetTransportDelayH3Offer(authMessage, self.settings.TransportDelay, auth.ProvideIntent)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
 			if err != nil {
 				return nil, err
@@ -3521,6 +3596,7 @@ func (self *PlatformTransport) runH3(
 			}
 			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
 			useH3Datagrams := false
+			useTransportDelay := false
 			if responseBytes, err := framer.Read(stream); err != nil {
 				return nil, err
 			} else {
@@ -3544,16 +3620,29 @@ func (self *PlatformTransport) runH3(
 				if responseErr != nil {
 					return nil, responseErr
 				}
+				useTransportDelay, responseErr = negotiateTransportDelayH3AuthResponse(
+					authMessage,
+					authResponse,
+				)
+				if responseErr != nil {
+					return nil, responseErr
+				}
+				if authMessage.TransportDelayVersion != 0 {
+					// the edge's answer, which the client's new P2P
+					// generations follow (DELAY.md §6.1)
+					self.routeManager.noteTransportDelayEdgeAnswer(useTransportDelay)
+				}
 			}
 
 			success = true
 			return &ConnStream{
-				conn:           conn,
-				stream:         stream,
-				streamWriter:   streamWriter,
-				sendDatagram:   sendDatagram,
-				attempt:        attempt,
-				useH3Datagrams: useH3Datagrams,
+				conn:              conn,
+				stream:            stream,
+				streamWriter:      streamWriter,
+				sendDatagram:      sendDatagram,
+				attempt:           attempt,
+				useH3Datagrams:    useH3Datagrams,
+				useTransportDelay: useTransportDelay,
 			}, nil
 		}
 
@@ -3755,6 +3844,26 @@ func (self *PlatformTransport) runH3(
 			})
 
 			framer := NewFramer(self.framerSettings)
+			// The negotiated delay header rides every stream frame and DATAGRAM
+			// message of this generation (transport_delay_h3.go); nil keeps the
+			// legacy wire. The flush is deferred first so it runs after the
+			// teardown below has joined every lane.
+			var delayH3 *TransportDelayH3
+			var streamFraming h3StreamFraming = framer
+			if connStream.useTransportDelay {
+				delayH3 = newTransportDelayH3(
+					newTransportDelay(
+						self.settings.TransportDelay,
+						clientId,
+						transportTypeFromMode(ptMode),
+						self.routeManager.publishTransportDelayStats,
+					),
+					self.framerSettings,
+				)
+				defer delayH3.flush()
+				streamFraming = delayH3
+			}
+			delayHeaderByteCount := delayH3.HeaderByteCount()
 			var datagramFragmenter *H3DatagramFragmenter
 			var datagramReassembler *H3DatagramReassembler
 			if connStream.useH3Datagrams {
@@ -3877,9 +3986,11 @@ func (self *PlatformTransport) runH3(
 				sendCarrierProperties.UnreliableFlowIsolation = true
 				sendCarrierProperties.UnreliableFlowReserve = true
 				sendCarrierProperties.unreliableForMessageByteCount = func(messageByteCount int) bool {
-					return self.h3DatagramSettings.UseDatagramForPath(
+					// the delay header rides inside the envelope
+					return self.h3DatagramSettings.UseDatagramForPathWithHeader(
 						messageByteCount,
 						int(maxDatagramByteCount.Load()),
+						delayHeaderByteCount,
 					)
 				}
 			}
@@ -3997,7 +4108,8 @@ func (self *PlatformTransport) runH3(
 				}
 				messages := messageStorage[:1]
 				messages[0] = firstMessage
-				batchByteCount := len(firstMessage) + 4
+				// each frame takes its length prefix and any delay header
+				batchByteCount := len(firstMessage) + 4 + delayHeaderByteCount
 				sendOpen = true
 			drainReady:
 				for len(messages) < cap(messages) {
@@ -4010,7 +4122,7 @@ func (self *PlatformTransport) runH3(
 							sendOpen = false
 							break drainReady
 						}
-						framedByteCount := len(message) + 4
+						framedByteCount := len(message) + 4 + delayHeaderByteCount
 						if writeBatchMaxByteCount < batchByteCount+framedByteCount {
 							pendingMessage = message
 							break drainReady
@@ -4031,7 +4143,7 @@ func (self *PlatformTransport) runH3(
 				if writeBatchStorage == nil {
 					writeBatchStorage = make([]byte, writeBatchMaxByteCount)
 				}
-				err = framer.WriteBatchWithStorage(
+				err = streamFraming.WriteBatchWithStorage(
 					streamWriter,
 					messages,
 					writeBatchStorage,
@@ -4064,11 +4176,20 @@ func (self *PlatformTransport) runH3(
 			sendDatagramMessage := func(message []byte) (useStream bool, sendErr error) {
 				currentMaxDatagramByteCount := int(maxDatagramByteCount.Load())
 				var nextMaxDatagramByteCount int
-				useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
-					message,
-					currentMaxDatagramByteCount,
-					connStream.sendDatagram,
-				)
+				if delayH3 != nil {
+					useStream, nextMaxDatagramByteCount, sendErr = delayH3.SendHybrid(
+						datagramFragmenter,
+						message,
+						currentMaxDatagramByteCount,
+						connStream.sendDatagram,
+					)
+				} else {
+					useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
+						message,
+						currentMaxDatagramByteCount,
+						connStream.sendDatagram,
+					)
+				}
 				if nextMaxDatagramByteCount != currentMaxDatagramByteCount {
 					maxDatagramByteCount.Store(int64(nextMaxDatagramByteCount))
 				}
@@ -4133,7 +4254,8 @@ func (self *PlatformTransport) runH3(
 							streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
 							// Reuse the reliable writer's scratch if already allocated;
 							// heartbeat-only hybrid lanes keep their lazy memory shape.
-							if err := framer.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
+							// A negotiated heartbeat is stamped like any stream write.
+							if err := streamFraming.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
 								return
 							}
 							writeCounter.Add(1)
@@ -4203,9 +4325,10 @@ func (self *PlatformTransport) runH3(
 							if !ok {
 								return
 							}
-							useDatagram := self.h3DatagramSettings.UseDatagramForPath(
+							useDatagram := self.h3DatagramSettings.UseDatagramForPathWithHeader(
 								len(message),
 								int(maxDatagramByteCount.Load()),
+								delayHeaderByteCount,
 							)
 							if useDatagram {
 								useStream, err := sendDatagramMessage(message)
@@ -4240,6 +4363,12 @@ func (self *PlatformTransport) runH3(
 				reliability CarrierReliability,
 				receive chan<- []byte,
 			) bool {
+				// a reader held here leaves its next frame waiting for a local
+				// reason, which censors that frame's delay sample
+				var handoffStartTime time.Time
+				if delayH3 != nil {
+					handoffStartTime = time.Now()
+				}
 				open, delivered := self.offerReceive(
 					handleCtx.Done(),
 					ptMode,
@@ -4247,6 +4376,9 @@ func (self *PlatformTransport) runH3(
 					receive,
 					message,
 				)
+				if delayH3 != nil {
+					delayH3.NoteHandoff(reliability, time.Since(handoffStartTime))
+				}
 				if delivered {
 					if self.settings.afterH3ReceiveEnqueueForTest != nil {
 						self.settings.afterH3ReceiveEnqueueForTest(message)
@@ -4276,7 +4408,7 @@ func (self *PlatformTransport) runH3(
 						return
 					}
 					for {
-						message, err := framer.Read(stream)
+						message, err := streamFraming.Read(stream)
 						if err != nil {
 							return
 						}
@@ -4325,7 +4457,11 @@ func (self *PlatformTransport) runH3(
 						if err != nil {
 							return
 						}
-						message = datagramReassembler.Accept(datagram, time.Now())
+						if delayH3 != nil {
+							message = delayH3.Accept(datagramReassembler, datagram, time.Now())
+						} else {
+							message = datagramReassembler.Accept(datagram, time.Now())
+						}
 						if message == nil {
 							continue
 						}
@@ -4333,7 +4469,7 @@ func (self *PlatformTransport) runH3(
 					} else {
 						stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
 						var err error
-						message, err = framer.Read(stream)
+						message, err = streamFraming.Read(stream)
 						if err != nil {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 							return

@@ -37,8 +37,9 @@ import (
 // - a block stores entities on a dense uint16 index (addresses interned once per
 //   block) and pairs on a packed uint32 index-pair key, so the matrix costs a few
 //   bytes per pair instead of two addresses per pair.
-// - clustering runs on the `ClusterEpoch` only when new activity was recorded, over
-//   reusable scratch (the aggregate is refilled, not reallocated), and only over
+// - clustering runs on the `ClusterEpoch` only when new activity was recorded (with
+//   none, the run loop parks until the next activity instead of waking each epoch),
+//   over reusable scratch (the aggregate is refilled, not reallocated), and only over
 //   connected components of the co-association graph with at most
 //   `MaxComponentNodeCount` nodes — a larger component is a degenerate burst clique
 //   with quadratic split cost and little affinity value, and is skipped.
@@ -212,12 +213,16 @@ type IpAssoc struct {
 	// entity -> server base names (eTLD+1), bounded small
 	baseNames map[netip.Addr][]string
 	dirty     bool
+	// signaled when `dirty` rises, so the parked run loop resumes
+	dirtyWake chan struct{}
 	// generation increments when the matrix is dropped (shed or teardown), so an
 	// in-flight clustering pass does not publish a stale result over the freshly
 	// emptied clusters
 	generation uint64
 
 	unregisterShed func()
+	// Immutable after construction; runs after source and scratch locks are released.
+	afterShed func()
 
 	clusters atomic.Pointer[ipAssocClusters]
 
@@ -226,6 +231,9 @@ type IpAssoc struct {
 	// check its generation before publishing.
 	scratchLock sync.Mutex
 	scratch     ipAssocScratch
+
+	// Observes each epoch wake of the run loop. Nil in production.
+	epochWakeForTest atomic.Pointer[func()]
 }
 
 // indirection so a nil interface can be stored/cleared atomically
@@ -234,14 +242,21 @@ type serverNameLookupHolder struct {
 }
 
 func NewIpAssoc(ctx context.Context, settings *IpAssocSettings) *IpAssoc {
+	return newIpAssoc(ctx, settings, nil)
+}
+
+// Installs the owning cache retirement before the association worker or pressure callback can run.
+func newIpAssoc(ctx context.Context, settings *IpAssocSettings, afterShed func()) *IpAssoc {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	ipAssoc := &IpAssoc{
 		ctx:        cancelCtx,
 		cancel:     cancel,
 		settings:   settings,
+		afterShed:  afterShed,
 		lastActive: map[netip.Addr]time.Time{},
 		baseNames:  map[netip.Addr][]string{},
+		dirtyWake:  make(chan struct{}, 1),
 	}
 	ipAssoc.clusters.Store(&ipAssocClusters{
 		version: 0,
@@ -310,6 +325,7 @@ func (self *IpAssoc) addActivity(addr netip.Addr) {
 	now := time.Now()
 
 	needBaseNames := false
+	wake := false
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -363,8 +379,15 @@ func (self *IpAssoc) addActivity(addr netip.Addr) {
 			needBaseNames = true
 		}
 
+		wake = !self.dirty
 		self.dirty = true
 	}()
+	if wake {
+		select {
+		case self.dirtyWake <- struct{}{}:
+		default:
+		}
+	}
 
 	if needBaseNames {
 		// the lookup calls an external object, so it must not hold the state lock
@@ -439,15 +462,36 @@ func (self *IpAssoc) run() {
 		self.ShedMemory()
 	}()
 
+	// one timer for the loop's life. With no new activity the loop parks until
+	// the next activity, then clusters an epoch after it
+	epochTimer := time.NewTimer(self.settings.ClusterEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.ClusterEpoch):
+		case <-epochTimer.C:
+		}
+		if wake := self.epochWakeForTest.Load(); wake != nil {
+			(*wake)()
 		}
 
 		self.updateClusters()
+		if !self.isDirty() {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.dirtyWake:
+			}
+		}
+		epochTimer.Reset(self.settings.ClusterEpoch)
 	}
+}
+
+func (self *IpAssoc) isDirty() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.dirty
 }
 
 // ShedMemory drops the association matrix, published clusters, and reusable workspace
@@ -476,6 +520,9 @@ func (self *IpAssoc) ShedMemory() {
 	self.scratchLock.Lock()
 	self.scratch = ipAssocScratch{}
 	self.scratchLock.Unlock()
+	if self.afterShed != nil {
+		self.afterShed()
+	}
 }
 
 func (self *IpAssoc) updateClusters() {
@@ -947,6 +994,8 @@ func clusterIpAssocScratch(
 				clusterAddrs = append(clusterAddrs, scratch.addrs[scratch.nodeMembers[m]])
 			}
 		}
+		// This new backing is canonical before any immutable reader receives it.
+		slices.SortFunc(clusterAddrs, func(a, b netip.Addr) int { return a.Compare(b) })
 		for _, addr := range clusterAddrs {
 			members[addr] = clusterAddrs
 		}
@@ -1150,10 +1199,17 @@ func (self *IpAssoc) GetCluster(path *IpPath) []*IpPath {
 	return memberPaths
 }
 
-// GetClusterAddrs returns the cluster member ips for an entity ip,
-// or nil if the entity is not in a multi-member cluster
+// Borrows immutable members and their version from one atomic publication.
+// Internal readers must not write or expose this backing to public callers.
+func (self *IpAssoc) clusterMembers(addr netip.Addr) (uint64, []netip.Addr) {
+	clusters := self.clusters.Load()
+	return clusters.version, clusters.members[addr.Unmap()]
+}
+
+// Returns caller-owned cluster member ips, or nil for an unclustered entity.
 func (self *IpAssoc) GetClusterAddrs(addr netip.Addr) []netip.Addr {
-	return self.clusters.Load().members[addr.Unmap()]
+	_, members := self.clusterMembers(addr)
+	return slices.Clone(members)
 }
 
 func (self *IpAssoc) Close() {

@@ -3,6 +3,7 @@ package connect
 import (
 	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -258,6 +259,52 @@ func (self *packetStatsCounters) snapshot() *PacketStats {
 	}
 	return packetStats
 }
+
+// unchangedSince reports what `packetStatsEqual(self.snapshot(), last)` would,
+// without building the snapshot: an epoch with no new packets reads the
+// counters in place and allocates nothing.
+func (self *packetStatsCounters) unchangedSince(last *PacketStats) bool {
+	if last == nil {
+		return false
+	}
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	if self.remoteEgressPacketCount.Load() != last.RemoteEgressPacketCount ||
+		ByteCount(self.remoteEgressByteCount.Load()) != last.RemoteEgressByteCount ||
+		self.remoteIngressPacketCount.Load() != last.RemoteIngressPacketCount ||
+		ByteCount(self.remoteIngressByteCount.Load()) != last.RemoteIngressByteCount ||
+		self.localEgressPacketCount.Load() != last.LocalEgressPacketCount ||
+		ByteCount(self.localEgressByteCount.Load()) != last.LocalEgressByteCount ||
+		self.localIngressPacketCount.Load() != last.LocalIngressPacketCount ||
+		ByteCount(self.localIngressByteCount.Load()) != last.LocalIngressByteCount ||
+		self.blockEgressPacketCount.Load() != last.BlockEgressPacketCount ||
+		ByteCount(self.blockEgressByteCount.Load()) != last.BlockEgressByteCount ||
+		self.blockIngressPacketCount.Load() != last.BlockIngressPacketCount ||
+		ByteCount(self.blockIngressByteCount.Load()) != last.BlockIngressByteCount {
+		return false
+	}
+	for _, transportType := range TransportTypes() {
+		// a snapshot carries every transport type, zero when never counted
+		lastStats := last.TransportStats[transportType]
+		if lastStats == nil {
+			return false
+		}
+		current := self.transportStats[transportType]
+		if current == nil {
+			current = &zeroPacketStats
+		}
+		if current.RemoteEgressPacketCount != lastStats.RemoteEgressPacketCount ||
+			current.RemoteEgressByteCount != lastStats.RemoteEgressByteCount ||
+			current.RemoteIngressPacketCount != lastStats.RemoteIngressPacketCount ||
+			current.RemoteIngressByteCount != lastStats.RemoteIngressByteCount {
+			return false
+		}
+	}
+	return true
+}
+
+// read only
+var zeroPacketStats PacketStats
 
 func normalizedTransportType(transportType TransportType) TransportType {
 	switch transportType {
@@ -621,6 +668,7 @@ type blockActionDecision struct {
 	blockerEnabled   bool
 	overridesVersion uint64
 	clusterVersion   uint64
+	cacheEpoch       uint64
 	expireTime       time.Time
 
 	// the destination's cluster. a destination with no cluster is
@@ -636,6 +684,12 @@ type blockActionCache struct {
 
 	stateLock sync.Mutex
 	decisions map[netip.Addr]*blockActionDecision
+	// A miss captures this before borrowing source members. Clears and learned
+	// names revoke in-flight builders without invalidating unrelated cached hits.
+	epoch            atomic.Uint64
+	clusterVersion   uint64
+	overridesVersion uint64
+	closed           bool
 }
 
 func newBlockActionCache(ttl time.Duration, maxCount int) *blockActionCache {
@@ -646,9 +700,18 @@ func newBlockActionCache(ttl time.Duration, maxCount int) *blockActionCache {
 	}
 }
 
+// Generations only advance. A stale reader cannot delete a newer decision or
+// acquire permission to repin an older immutable publication.
 func (self *blockActionCache) get(addr netip.Addr, overridesVersion uint64, clusterVersion uint64, blockerActive bool, now time.Time) *blockActionDecision {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil
+	}
+	if overridesVersion < self.overridesVersion || clusterVersion < self.clusterVersion {
+		return nil
+	}
+	self.advanceVersionsWithLock(overridesVersion, clusterVersion)
 	decision, ok := self.decisions[addr]
 	if !ok {
 		return nil
@@ -660,9 +723,32 @@ func (self *blockActionCache) get(addr netip.Addr, overridesVersion uint64, clus
 	return decision
 }
 
+// Retires all ownership of the preceding source/config generation at once.
+func (self *blockActionCache) advanceVersionsWithLock(overridesVersion uint64, clusterVersion uint64) {
+	if self.overridesVersion < overridesVersion || self.clusterVersion < clusterVersion {
+		clear(self.decisions)
+		self.overridesVersion = max(self.overridesVersion, overridesVersion)
+		self.clusterVersion = max(self.clusterVersion, clusterVersion)
+	}
+}
+
+// A directly supplied decision still respects monotonic generation and epoch
+// admission. Production builders also revalidate their actual source below.
 func (self *blockActionCache) put(addr netip.Addr, decision *blockActionDecision) {
+	self.putForSource(addr, decision, nil)
+}
+
+// No source lock is acquired: publication is read atomically while the cache
+// serializes its own epoch and high-water generation.
+func (self *blockActionCache) putForSource(addr netip.Addr, decision *blockActionDecision, source *IpAssoc) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.closed || decision.cacheEpoch != self.epoch.Load() ||
+		decision.overridesVersion < self.overridesVersion || decision.clusterVersion < self.clusterVersion ||
+		source != nil && source.clusters.Load().version != decision.clusterVersion {
+		return
+	}
+	self.advanceVersionsWithLock(decision.overridesVersion, decision.clusterVersion)
 	if self.maxCount <= len(self.decisions) {
 		self.evictSoonestSampleLocked()
 	}
@@ -697,9 +783,32 @@ func (self *blockActionCache) evictSoonestSampleLocked() {
 	}
 }
 
+// Revokes old builders even when the cache was already empty.
 func (self *blockActionCache) clear() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.invalidateWithLock()
+	clear(self.decisions)
+}
+
+// Exhaustion permanently refuses new ownership rather than reusing an epoch.
+func (self *blockActionCache) invalidateWithLock() {
+	if epoch := self.epoch.Load(); epoch != ^uint64(0) {
+		self.epoch.Store(epoch + 1)
+	} else {
+		self.closed = true
+	}
+}
+
+// Closing cannot be undone by an in-flight lookup or later configuration clear.
+func (self *blockActionCache) close() {
+	if self == nil {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.closed = true
+	self.invalidateWithLock()
 	clear(self.decisions)
 }
 
@@ -710,6 +819,7 @@ func (self *blockActionCache) clear() {
 func (self *blockActionCache) delete(addr netip.Addr) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.invalidateWithLock()
 	delete(self.decisions, addr)
 }
 
@@ -1042,7 +1152,7 @@ func (self *blockActionCollector) flush() {
 // BlockAction.Ips stays disjoint from BlockAction.MatchedIps.
 func excludeMatchedIps(ips []netip.Addr, matched map[netip.Addr]bool) []netip.Addr {
 	if len(matched) == 0 {
-		return ips
+		return slices.Clone(ips)
 	}
 	out := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
@@ -1057,7 +1167,7 @@ func excludeMatchedIps(ips []netip.Addr, matched map[netip.Addr]bool) []netip.Ad
 // so BlockAction.Hosts stays disjoint from BlockAction.MatchedHosts.
 func excludeMatchedHosts(hosts []string, matched map[string]bool) []string {
 	if len(matched) == 0 {
-		return hosts
+		return slices.Clone(hosts)
 	}
 	out := make([]string, 0, len(hosts))
 	for _, host := range hosts {

@@ -144,10 +144,35 @@ func (self *multiClientChannelUpdate) canRecoverTcpWithLock(packet *parsedPacket
 		!self.pendingCollapseResetWithLock() && packet.spansTcpRecoveryAck(recovery.ack, len(packet.payload))
 }
 
+// Classifies immutable parsed metadata without reparsing borrowed packet bytes.
+func (self *parsedPacket) pureTcpAck() bool {
+	path := self.ipPath
+	return path != nil && path.Protocol == IpProtocolTcp && path.Ack && !path.Syn && !path.Fin && !path.Rst &&
+		path.TcpPayloadByteCount == 0 && len(self.payload) == 0
+}
+
+// Equivalent to IsTcpAckOnlyPacket for already-parsed group members. Repeated
+// ACKs carry loss/control feedback; Transfer deduplicates its own retries.
+// The whole group must qualify, preserving existing admission and budgets.
+func (self *parsedPacketGroup) onlyPureTcpAcks() bool {
+	if len(self.packets) == 0 {
+		return false
+	}
+	for index := range self.packets {
+		if !self.packets[index].pureTcpAck() {
+			return false
+		}
+	}
+	return true
+}
+
 // Recheck the offer atomically: overlapping concurrent retries share one
 // lease, while independent sequence/control progress keeps its usual path.
 // Reservation does not consume authority; refusal/disposal returns this token.
 func (self *parsedPacketGroup) reserveTcpRecoveryWithLock(update *multiClientChannelUpdate, parent *RemoteUserNatMultiClient, admission *tcpCollapseAdmission) bool {
+	if self.onlyPureTcpAcks() {
+		return true
+	}
 	client := update.client.Load()
 	for index := range self.packets {
 		packet := &self.packets[index]

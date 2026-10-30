@@ -331,6 +331,17 @@ message Auth {
     // migrates by name, which the platform never sends an advisory move.
     // This is the frame form of the H1 `X-UR-ResidentMoveVersion` header.
     uint32 resident_move_version = 10;
+
+    // the per-message delay header version the client offers (connect
+    // DELAY.md §6). Zero offers nothing. An old server's response does not
+    // carry the separate accepted field, so the connection keeps the legacy
+    // wire, as with h3_datagram_version.
+    uint32 transport_delay_version = 11;
+
+    // set by the server only when it accepts the offered delay header
+    // version; both directions of every lane then carry the header after the
+    // auth exchange.
+    uint32 transport_delay_accepted_version = 12;
 }
 
 
@@ -352,6 +363,12 @@ enum ProvideMode {
 
 message Provide {
     repeated ProvideKey keys = 1;
+    // The sender serves the per-peer post-quantum encryption sessions
+    // (`EncryptedControl`) that a client requiring post-quantum encryption
+    // opens. Provider discovery offers only such providers to that client. A
+    // provide without it, which includes every provide sent before this field
+    // existed, counts as not capable.
+    bool post_quantum_encryption = 2;
 }
 
 
@@ -387,6 +404,21 @@ message StreamClose {
 
 message StreamReset {
     repeated StreamOpen streams = 1;
+}
+
+// The platform's request that a client close contracts and sequences now,
+// sent only from the control id (server/CLIENTCLOSE.md). The platform sends
+// it when the other party of a contract has sent its final close, and to each
+// counterparty of a client removed through the api. For each contract the
+// client reports a final close: with the counts of the live sequence that
+// holds it, or with zero counts when no sequence holds it any more, since its
+// counts were reported before. For each peer the client closes every sequence
+// with the peer, reporting finals for their contracts.
+message CloseSequences {
+    // ulid
+    repeated bytes contract_ids = 1;
+    // ulid
+    repeated bytes peer_ids = 2;
 }
 
 
@@ -448,6 +480,12 @@ message ExchangeSignals {
     // which is the compatibility path: an old extender simply does not
     // answer.
     bool extender_carrier = 5;
+    // The per-message delay header version this peer speaks on the stream's
+    // data lanes (connect DELAY.md §6.1). The active side offers it with its
+    // offer batch; the passive side sets it on its answer batch only when it
+    // accepts. Both lanes carry the header after "rdy" when both set it. An
+    // older peer ignores the field, which keeps the legacy wire.
+    uint32 transport_delay_version = 6;
 }
 
 // signals are sent in real time to the destination of the peer pair
