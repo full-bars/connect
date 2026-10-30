@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 )
 
 // What the activator logs when an activation post fails (connect#229).
@@ -132,7 +135,7 @@ func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 			t.Fatalf("v4 status = %+v, expected a failed activation", status)
 		}
 
-		lines := log.linesWithPrefix("[extender]activate v4 err = ")
+		lines := log.linesWithPrefix("[extender] activate v4 failed ")
 		if len(lines) == 0 {
 			t.Fatal("the failed activation logged no error")
 		}
@@ -142,6 +145,7 @@ func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 			(&HttpRequestExhaustedError{}).Error(),
 			tcpCause.Error(),
 			udpCause.Error(),
+			"carriers=tcp", "api=192.0.2.4", "elapsed=", "attempts=",
 		} {
 			if !strings.Contains(line, expected) {
 				t.Errorf("the activation error log %q does not name %q", line, expected)
@@ -151,4 +155,74 @@ func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 			t.Errorf("the activation error log %q carries the jwt", line)
 		}
 	})
+}
+
+func TestActivationLogTextRedactsCredentialsAndNewlines(t *testing.T) {
+	token := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signatureSecret123"
+	text := activationLogText("bad\nhttps://user:pass@example.org?token=hidden "+token+" test-jwt", "test-jwt", "https://user:pass@example.org?token=hidden")
+	for _, secret := range []string{token, "test-jwt", "pass", "hidden", "\n"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("secret or newline in log: %q", text)
+		}
+	}
+	if !strings.Contains(text, "example.org") {
+		t.Fatal(text)
+	}
+}
+
+func TestExtenderActivationRefusalLog(t *testing.T) {
+	const jwt = "sensitive-test-jwt"
+	operator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/hello" {
+			fmt.Fprint(w, `{"client_address":"127.0.0.1"}`)
+			return
+		}
+		fmt.Fprint(w, `{"activated":false,"ip_version":4,"error":"quic carrier did not answer: sensitive-test-jwt"}`)
+	}))
+	defer operator.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.Log = NewNoopLogger()
+	strategySettings.ConnectSettings.Log = NewNoopLogger()
+	strategySettings.EnableResilient = false
+	strategy := NewDirectClientStrategy(ctx, strategySettings, 0)
+	defer strategy.Close()
+	logger := &testActivateLogger{}
+	settings := DefaultExtenderActivatorSettings()
+	settings.Log = logger
+	settings.ApiUrlV4 = operator.URL
+	settings.ByJwt = func() string { return jwt }
+	settings.ClientStrategy = strategy
+	settings.Carriers = func() []string { return []string{ExtenderCarrierQuic} }
+	settings.IpVersionSupported = func(int) bool { return true }
+	settings.AddNetworkChangeListener = func(func()) func() { return func() {} }
+	activator := NewExtenderActivator(ctx, settings)
+	defer activator.Close()
+	for {
+		version, changed := activator.ChangeMonitor().Get()
+		if version > 0 {
+			break
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	lines := logger.linesWithPrefix("[extender] activate v4 refused ")
+	if len(lines) != 1 {
+		t.Fatalf("refusal lines: %v", lines)
+	}
+	line := lines[0]
+	for _, want := range []string{"carriers=quic", "api=127.0.0.1:", "last_remote=127.0.0.1:", "elapsed=", "attempts=", "quic carrier did not answer", "[redacted]"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("missing %q from %q", want, line)
+		}
+	}
+	if strings.Contains(line, jwt) {
+		t.Fatal("jwt leaked")
+	}
+	t.Logf("refusal log: %s", line)
 }

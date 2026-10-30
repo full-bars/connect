@@ -7,10 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http/httptrace"
 	"net/netip"
+	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -859,6 +863,40 @@ func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time
 	return succeeded, succeeded && measurementCsr != ""
 }
 
+// Activation diagnostics count physical strategy requests, including hello
+// attempts used to find a working route, without changing their outcomes.
+type extenderActivationTraceKey struct{}
+type extenderActivationTrace struct {
+	attempts atomic.Int64
+	remote   atomic.Value
+}
+
+func traceExtenderActivationAttempt(ctx context.Context) {
+	if trace, ok := ctx.Value(extenderActivationTraceKey{}).(*extenderActivationTrace); ok {
+		trace.attempts.Add(1)
+	}
+}
+func activationLogAddress(apiURL string) string {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Hostname() == "" {
+		return "unknown"
+	}
+	return u.Host
+}
+
+var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
+
+func activationLogText(text, jwt, apiURL string) string {
+	if jwt != "" {
+		text = strings.ReplaceAll(text, jwt, "[redacted]")
+	}
+	if apiURL != "" {
+		text = strings.ReplaceAll(text, apiURL, activationLogAddress(apiURL))
+	}
+	text = activationJWT.ReplaceAllString(text, "[redacted]")
+	return strings.Join(strings.Fields(text), " ")
+}
+
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
 // fallback mode. `measurementCsr` is the request the post carries, empty for
@@ -888,17 +926,28 @@ func (self *ExtenderActivator) activateUrl(
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
+	trace := &extenderActivationTrace{}
+	trace.remote.Store("unknown")
+	ctx = context.WithValue(ctx, extenderActivationTraceKey{}, trace)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		if info.Conn != nil && info.Conn.RemoteAddr() != nil {
+			trace.remote.Store(info.Conn.RemoteAddr().String())
+		}
+	}})
+	started := time.Now()
+	jwt := self.byJwt()
 	result, err := PostExtenderActivate(
 		ctx,
 		self.settings.ClientStrategy,
 		apiUrl,
-		self.byJwt(),
+		jwt,
 		args,
 	)
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if err != nil {
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
-		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
+		self.log.Infof("[extender] activate v%d failed carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), elapsed, trace.attempts.Load(), activationLogText(httpRequestErrorWithCauses(err), jwt, apiUrl))
 		self.recordFailure(ipVersion, now, err.Error(), false)
 		return false
 	}
@@ -914,7 +963,7 @@ func (self *ExtenderActivator) activateUrl(
 		if message == "" {
 			message = "the operator refused the activation"
 		}
-		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		self.log.Infof("[extender] activate v%d refused carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), elapsed, trace.attempts.Load(), activationLogText(message, jwt, apiUrl))
 		self.recordFailure(ipVersion, now, message, true)
 		return false
 	}
