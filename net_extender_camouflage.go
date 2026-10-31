@@ -175,7 +175,7 @@ func dialExtenderTcpCamouflageConn(
 		}
 	}
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	// the camouflaged handshake always checks the leaf under the record key
 	// (B3), so the extender's Date is an authenticated time source
 	streamConn, response, err := extenderStreamRequest(

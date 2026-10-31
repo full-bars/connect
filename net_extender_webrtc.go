@@ -337,7 +337,7 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 	conn := newWebRtcDataChannelConn(detached, peerConnection, cancelResolve, int(self.settings.MaxMessageSize))
 	owned = true
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	// the challenge is checked after the response, so its Date is not an
 	// authenticated time source
 	streamConn, response, err := extenderStreamRequest(

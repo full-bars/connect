@@ -29,7 +29,7 @@ func TestProbeExtenderCarrierFailurePhases(t *testing.T) {
 			p, _ := strconv.Atoi(port)
 			return p, server.Close
 		}},
-		{"challenge", "challenge", func(t *testing.T, settings *ConnectSettings) (int, func()) {
+		{"request", "request", func(t *testing.T, settings *ConnectSettings) (int, func()) {
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusForbidden) }))
 			_, port, _ := net.SplitHostPort(server.Listener.Addr().String())
 			p, _ := strconv.Atoi(port)

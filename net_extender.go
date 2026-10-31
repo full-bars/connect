@@ -702,7 +702,7 @@ func dialExtenderTcpLegacyConn(
 		serverConn = tlsServerConn
 	}
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	// the extender's Date is an authenticated time source only when the leaf
 	// was checked under the record key (B3)
 	streamConn, response, err := extenderStreamRequest(
@@ -897,7 +897,7 @@ func dialExtenderQuic(
 	flight := quicSendFlightForConn(quicConn)
 	flight.bind(quicConn)
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	h3Transport := &http3.Transport{MaxResponseHeaderBytes: ExtenderMaxHeaderByteCount}
 	clientConn := h3Transport.NewClientConn(quicConn)
 	stream, err := clientConn.OpenRequestStream(ctx)
