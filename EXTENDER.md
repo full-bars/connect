@@ -6,8 +6,9 @@ bullet of the original is superseded, the decision that supersedes it says
 so. Implementation runs in the phases of section 5, in order, each with
 tests before the next starts.
 
-**Operators: open the ports first.** Activation tests them but never opens
-them. See "Before you activate: open the ports" below.
+**Operators: open the ports first.** Once activation is live, the probe
+tests them but never opens them. See "Before you activate: open the ports"
+below.
 
 The extender does not activate in production yet (urnetwork/connect#230).
 The port rules below describe what the role needs once activation is live;
@@ -15,10 +16,10 @@ they do not mean the extender works today.
 
 ## Before you activate: open the ports
 
-**Nothing opens these ports for you.** Activation only tests them. Open them
-on the host and on every cloud layer in front of it first (C2a states the
-rule; the note on the udp carriers below is where the implementation
-differs).
+**Nothing opens these ports for you.** Once activation is live, the probe only
+tests them. Open them on the host and on every cloud layer in front of it first
+(C2a states the rule; the note on the udp carriers below is where the
+implementation differs).
 
 | Port | Needed | Carrier |
 |---|---|---|
@@ -43,12 +44,17 @@ differs).
   carrier only when none of its listed ports answers. So a blocked udp 443
   fails activation, and a blocked 4053 does too unless 53 answers. Treat
   udp 443 and udp 4053 as required until that is fixed. Webrtc is not
-  accepted by the server yet either, so a host with no public tcp 443 cannot
-  activate.
-- Bind failures on the host are not the same as blocked ports. A carrier
-  that fails to bind is logged (`[extender] listen error (<carrier>)`) and
-  is not offered, so the activation request proceeds without offering that carrier,
-  except tcp 443: with no tcp listener the server refuses the activation.
+  accepted by the server yet either, so even once activation is live a host
+  with no public tcp 443 cannot activate.
+- Bind failures on the host are not the same as blocked ports. Bind attempts
+  run TCP first, then UDP; each carrier binds independently. A carrier that
+  fails to bind on the host is logged (`[extender] listen error (<carrier>)`)
+  and is not offered in the activation request. A failed UDP bind disables
+  just that carrier on the host without refusing the activation, but TCP 443
+  is required: with no TCP listener the server refuses the activation.
+  Conversely, if a UDP carrier binds on the host and is offered, but is
+  blocked by a firewall, the server probe fails and refuses the whole
+  activation.
 - In practice a blocked carrier shows up as `<carrier> carrier did not
   answer`, which reads like a server fault and is usually a host or cloud
   firewall. That text is on the `[extender]activate v<n> refused =` line.
@@ -756,7 +762,9 @@ see "Before you activate: open the ports" at the top.)
 - Optional, probed only when offered, never gating: udp 443 (quic), the dns
   carrier on udp 4053, and udp 53 on the sn miner. An optional carrier that
   fails its probe is left out of the stored `carriers`; it does not fail an
-  activation that passed a required test.
+  activation that passed a required test. (Implementation divergence:
+  `urnetwork/server` currently refuses activation if an offered quic probe
+  fails or if no offered dns port answers; see "Before you activate: open the ports".)
 - Not accepted: an extender that passes neither required test. Activation
   returns `activated: false` with the failed required tests in `error` and
   stores nothing.
