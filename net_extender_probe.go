@@ -55,7 +55,13 @@ type ExtenderProbeError struct {
 }
 
 func (e *ExtenderProbeError) Error() string {
-	return fmt.Sprintf("[extender] probe failed carrier=%s port=%d address=%s phase=%s error=%s", e.Carrier, e.Port, e.Address, e.Phase, strings.Join(strings.Fields(e.Err.Error()), " "))
+	// Err is set by every constructor, but Error() must not be the place a
+	// missing cause turns into a panic on a logging path.
+	cause := "<nil>"
+	if e.Err != nil {
+		cause = strings.Join(strings.Fields(e.Err.Error()), " ")
+	}
+	return fmt.Sprintf("[extender] probe failed carrier=%s port=%d address=%s phase=%s error=%s", e.Carrier, e.Port, e.Address, e.Phase, cause)
 }
 func (e *ExtenderProbeError) Unwrap() error { return e.Err }
 

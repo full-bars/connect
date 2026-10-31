@@ -243,6 +243,12 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 	if strings.Contains(line, jwt) {
 		t.Fatal("jwt leaked")
 	}
+	// the recorded failure carries the same operator text as the log, so it
+	// must be sanitized too (Status().Family(4).LastError is what a diagnostic
+	// reader sees later)
+	if family := activator.Status().Family(4); family != nil && strings.Contains(family.LastError, jwt) {
+		t.Fatalf("jwt leaked into the recorded failure: %q", family.LastError)
+	}
 	t.Logf("refusal log: %s", line)
 }
 
@@ -315,5 +321,28 @@ func TestActivationLogTextSanitizesRefusalMessage(t *testing.T) {
 		if strings.Contains(text, secret) {
 			t.Fatalf("%q survived in refusal text: %q", secret, text)
 		}
+	}
+}
+
+// An IP-literal endpoint has no alpha TLD, so a matcher that required one let
+// the query through.
+func TestActivationLogTextStripsSchemalessIpLiteral(t *testing.T) {
+	for _, text := range []string{
+		"left 1.2.3.4?code=ip-secret behind",
+		"left [::1]?code=ip-secret behind",
+	} {
+		got := activationLogText(text, "", "")
+		if strings.Contains(got, "ip-secret") {
+			t.Fatalf("query survived for %q: %q", text, got)
+		}
+	}
+}
+
+// A probe error with no cause must render, not panic: this is a logging path.
+func TestExtenderProbeErrorWithoutCause(t *testing.T) {
+	e := &ExtenderProbeError{Carrier: "tcp", Port: 443, Phase: "dial"}
+	got := e.Error()
+	if !strings.Contains(got, "<nil>") || !strings.Contains(got, "carrier=tcp") {
+		t.Fatalf("unexpected rendering: %q", got)
 	}
 }

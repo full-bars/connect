@@ -892,8 +892,12 @@ var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\
 var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
 // A host carrying a query or fragment and no scheme is the leftover of a url
-// that an earlier literal replacement already stripped the scheme from.
-var activationSchemalessUrl = regexp.MustCompile(`\b[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}\S*[?#]\S*`)
+// that an earlier literal replacement already stripped the scheme from. The
+// final label may be numeric so an IP-literal endpoint (1.2.3.4?x=, or the
+// bracket form) is caught too. The leading group captures the character before
+// the host, which is put back: a word boundary cannot be expressed before a
+// bracket, and the bracket itself is not a word character.
+var activationSchemalessUrl = regexp.MustCompile(`(^|[^0-9A-Za-z])(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9]+)[^?\s#]*[?#]\S*`)
 
 const activationUrlTrailer = "\"'<>),;:."
 
@@ -910,7 +914,15 @@ func activationLogUrls(text string) string {
 		return "[url]" + trailer
 	}
 	text = activationUrl.ReplaceAllStringFunc(text, strip)
-	return activationSchemalessUrl.ReplaceAllStringFunc(text, func(string) string { return "[url]" })
+	return activationSchemalessUrl.ReplaceAllStringFunc(text, func(raw string) string {
+		// put back the character that preceded the host
+		if raw != "" {
+			if c := raw[0]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+				return raw[:1] + "[url]"
+			}
+		}
+		return "[url]"
+	})
 }
 
 func activationLogText(text, jwt, apiURL string) string {
