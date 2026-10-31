@@ -885,6 +885,20 @@ func activationLogAddress(apiURL string) string {
 }
 
 var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
+var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]+`)
+
+// Reduces any url in error text to its host. The url in an `http.Client.Do`
+// error has its password masked and the request path appended, so it does not
+// equal the configured api url, and its query and fragment can still carry
+// credentials.
+func activationLogUrls(text string) string {
+	return activationUrl.ReplaceAllStringFunc(text, func(raw string) string {
+		if u, err := url.Parse(raw); err == nil && u.Host != "" {
+			return u.Host
+		}
+		return "[url]"
+	})
+}
 
 func activationLogText(text, jwt, apiURL string) string {
 	if jwt != "" {
@@ -893,6 +907,7 @@ func activationLogText(text, jwt, apiURL string) string {
 	if apiURL != "" {
 		text = strings.ReplaceAll(text, apiURL, activationLogAddress(apiURL))
 	}
+	text = activationLogUrls(text)
 	text = activationJWT.ReplaceAllString(text, "[redacted]")
 	return strings.Join(strings.Fields(text), " ")
 }

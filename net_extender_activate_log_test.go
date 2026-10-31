@@ -170,6 +170,25 @@ func TestActivationLogTextRedactsCredentialsAndNewlines(t *testing.T) {
 	}
 }
 
+// http.Client.Do masks the password in the url of its error and appends the
+// request path, so the text no longer contains the configured api url (js/wasm
+// returns that error as is).
+func TestActivationLogTextSanitizesRedactedPathAppendedUrl(t *testing.T) {
+	text := activationLogText(
+		`http request failed: Post "https://user:xxxxx@example.org/v1/extender/activate?token=hidden#frag": EOF`,
+		"test-jwt",
+		"https://user:pass@example.org?token=hidden",
+	)
+	for _, secret := range []string{"user", "xxxxx", "hidden", "frag", "/v1/extender"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("%q leaked into log: %q", secret, text)
+		}
+	}
+	if !strings.Contains(text, "example.org") || !strings.Contains(text, "EOF") {
+		t.Fatalf("log lost the host or the cause: %q", text)
+	}
+}
+
 func TestExtenderActivationRefusalLog(t *testing.T) {
 	const jwt = "sensitive-test-jwt"
 	operator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
