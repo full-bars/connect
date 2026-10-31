@@ -9,30 +9,49 @@ tests before the next starts.
 **Operators: open the ports first.** Activation tests them but never opens
 them. See "Before you activate: open the ports" below.
 
+The extender does not activate in production yet (urnetwork/connect#230).
+The port rules below describe what the role needs once activation is live;
+they do not mean the extender works today.
+
 ## Before you activate: open the ports
 
 **Nothing opens these ports for you.** Activation only tests them. Open them
-on the host and on every cloud layer in front of it first (C2a is the rule
-this follows).
+on the host and on every cloud layer in front of it first (C2a states the
+rule; the note on the udp carriers below is where the implementation
+differs).
 
 | Port | Needed | Carrier |
 |---|---|---|
-| tcp 443 | required (or webrtc, for a host with no public inbound address) | tcp |
-| udp 443 | optional, needed for full carrier coverage | quic |
-| udp 4053 | optional, needed for full carrier coverage | dns |
+| tcp 443 | required. The server refuses an activation that does not offer tcp, so webrtc alone is not accepted yet | tcp |
+| udp 443 | offered when bound. If offered and blocked, the activation is refused | quic |
+| udp 4053 | offered when bound. Refused when no dns port answers, so in practice required | dns |
 
-- The sn miner also serves udp 53 (A1). Same rule: optional.
+- udp 53 (the sn miner only, A1) is privileged: binding it needs root or
+  `CAP_NET_BIND_SERVICE`. The role binds it only when `--dns_privileged_port`
+  (connectctl) or `ProvideExtenderDnsPrivilegedPort` (sn) is set. If that
+  bind fails, the failure is logged, 53 is not offered, and the dns carrier
+  keeps 4053, so activation still runs. A blocked 53 does not refuse an
+  activation while 4053 answers; the record lists only the dns ports that
+  answered.
 - Host firewall changes do not open AWS security groups, GCP VPC firewall,
   Azure NSGs, router NAT or Docker's published ports. Each is a separate
   layer with its own switch.
 - C2a specifies that only a required carrier gates acceptance and that the
-  udp carriers are optional, probed only when offered. Do not rely on that
-  today: the activation controller in `urnetwork/server` refuses the whole
-  activation when any offered carrier fails, so in practice a blocked udp
-  port does fail activation. Treat the udp ports as required until that is
-  fixed.
+  udp carriers are optional, probed only when offered. The implementation
+  differs: the activation controller in `urnetwork/server` refuses the
+  activation when an offered tcp or quic probe fails, and refuses the dns
+  carrier only when none of its listed ports answers. So a blocked udp 443
+  fails activation, and a blocked 4053 does too unless 53 answers. Treat
+  udp 443 and udp 4053 as required until that is fixed. Webrtc is not
+  accepted by the server yet either, so a host with no public tcp 443 cannot
+  activate.
+- Bind failures on the host are not the same as blocked ports. A carrier
+  that fails to bind is logged (`[extender] listen error (<carrier>)`) and
+  is not offered, so the activation goes on without it, except tcp 443: with
+  no tcp listener the server refuses the activation.
 - In practice a blocked carrier shows up as `<carrier> carrier did not
-  answer`, which reads like a server fault and is usually your firewall.
+  answer`, which reads like a server fault and is usually your firewall. That
+  text is on the `[extender]activate v<n> refused =` line.
 - Best single diagnostic: if tcp 443 answers from another host but udp 443
   does not, suspect a host or cloud firewall, not the provider.
 - A rejected UDP probe often returns ICMP "admin prohibited". Most QUIC
@@ -105,8 +124,10 @@ above it drops the packet.
   while you send from the other host and see whether packets arrive.
 - ICMP "admin prohibited" is the signature of a reject rule. A silent drop
   looks like a plain timeout. Both mean a firewall, not a server fault.
-- Re-read the failure line: `[extender]activate v<n> err = ` carries the
-  per-attempt causes (G3).
+- Re-read the failure lines. `[extender]activate v<n> err =` carries the
+  per-attempt causes of a request that failed in transit (G3).
+  `[extender]activate v<n> refused =` carries the operator's answer, which
+  is where `<carrier> carrier did not answer` appears.
 
 ## 1. Original proposal
 
