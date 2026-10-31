@@ -885,19 +885,32 @@ func activationLogAddress(apiURL string) string {
 }
 
 var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
-var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]+`)
+// The matcher stops at whitespace only, and the punctuation a sentence puts
+// after a url is trimmed from the tail. Excluding quotes inside the character
+// class would truncate a url whose query value contains one, and whatever came
+// after the quote would escape the strip.
+var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
-// Reduces any url in error text to its host. The url in an `http.Client.Do`
-// error has its password masked and the request path appended, so it does not
-// equal the configured api url, and its query and fragment can still carry
-// credentials.
+// A host carrying a query or fragment and no scheme is the leftover of a url
+// that an earlier literal replacement already stripped the scheme from.
+var activationSchemalessUrl = regexp.MustCompile(`\b[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}\S*[?#]\S*`)
+
+const activationUrlTrailer = "\"'<>),;:."
+
 func activationLogUrls(text string) string {
-	return activationUrl.ReplaceAllStringFunc(text, func(raw string) string {
-		if u, err := url.Parse(raw); err == nil && u.Host != "" {
-			return u.Host
+	strip := func(raw string) string {
+		trimmed := strings.TrimRight(raw, activationUrlTrailer)
+		trailer := raw[len(trimmed):]
+		if trimmed == "" {
+			return raw
 		}
-		return "[url]"
-	})
+		if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+			return u.Host + trailer
+		}
+		return "[url]" + trailer
+	}
+	text = activationUrl.ReplaceAllStringFunc(text, strip)
+	return activationSchemalessUrl.ReplaceAllStringFunc(text, func(string) string { return "[url]" })
 }
 
 func activationLogText(text, jwt, apiURL string) string {
@@ -986,7 +999,7 @@ func (self *ExtenderActivator) activateUrl(
 		ipVersion = extenderActivateResultIpVersion(result)
 	}
 	if !result.Activated {
-		message := result.Error
+		message := activationLogText(result.Error, jwt, apiUrl)
 		if message == "" {
 			message = "the operator refused the activation"
 		}

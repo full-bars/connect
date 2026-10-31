@@ -278,3 +278,42 @@ func TestActivationLogErrorStripsUrlAndJwtShape(t *testing.T) {
 		}
 	}
 }
+
+// A quote inside a query value used to truncate the url match, and the tail
+// after the quote escaped the strip.
+func TestActivationLogTextHandlesQuoteInsideQuery(t *testing.T) {
+	// the quote sits INSIDE the query value, so a matcher that stops at a quote
+	// truncates the url and leaves the rest of the secret in the text
+	text := activationLogText(
+		`http request failed: Post "https://api.example.org/a?code=quo"ted-secret": EOF`,
+		"test-jwt",
+		"https://api.example.org/a",
+	)
+	for _, fragment := range []string{"quo", "ted-secret", "code="} {
+		if strings.Contains(text, fragment) {
+			t.Fatalf("query fragment %q survived: %q", fragment, text)
+		}
+	}
+	if !strings.Contains(text, "api.example.org") {
+		t.Fatalf("host should survive: %q", text)
+	}
+}
+
+// A scheme-less host carrying a query is a leftover; it must not survive.
+func TestActivationLogTextStripsSchemalessQuery(t *testing.T) {
+	text := activationLogText("left api.example.org/a?code=scheme-less-secret behind", "test-jwt", "")
+	if strings.Contains(text, "scheme-less-secret") {
+		t.Fatalf("scheme-less query survived: %q", text)
+	}
+}
+
+// The refusal message is operator-supplied text and is persisted, so it needs
+// the same treatment as a transport error.
+func TestActivationLogTextSanitizesRefusalMessage(t *testing.T) {
+	text := activationLogText("refused: https://api.example.org/activate?token=refusal-secret", "test-jwt", "")
+	for _, secret := range []string{"refusal-secret", "token="} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("%q survived in refusal text: %q", secret, text)
+		}
+	}
+}
