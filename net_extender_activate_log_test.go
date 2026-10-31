@@ -346,3 +346,33 @@ func TestExtenderProbeErrorWithoutCause(t *testing.T) {
 		t.Fatalf("unexpected rendering: %q", got)
 	}
 }
+
+// Diagnostics must survive the sanitizer: a measurement or a version is not a
+// host, and a permissive matcher replaced them with [url].
+func TestActivationLogTextKeepsMeasurements(t *testing.T) {
+	const in = "elapsed 1.5s? then v2.0? and step 1.2? done"
+	if got := activationLogText(in, "", ""); got != in {
+		t.Fatalf("measurements mangled:\n  in:  %q\n  out: %q", in, got)
+	}
+}
+
+// A schemaless host with a path and no query still hides a secret in the path.
+func TestActivationLogTextStripsSchemalessPath(t *testing.T) {
+	got := activationLogText("error at api.example.org/v1/keys/SECRET12345/view failed", "", "")
+	if strings.Contains(got, "SECRET12345") {
+		t.Fatalf("path secret survived: %q", got)
+	}
+	if !strings.Contains(got, "api.example.org") {
+		t.Fatalf("host should survive: %q", got)
+	}
+}
+
+// Userinfo before an IP literal carries a password and is not a query.
+func TestActivationLogTextStripsUserinfoBeforeIpLiteral(t *testing.T) {
+	got := activationLogText("connect to admin:supersecret@1.2.3.4?token=secret failed", "", "")
+	for _, secret := range []string{"supersecret", "token=secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("%q survived: %q", secret, got)
+		}
+	}
+}
