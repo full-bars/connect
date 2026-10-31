@@ -382,6 +382,12 @@ type ExtenderSettings struct {
 	// a socket without binding a privileged port. Nil retains
 	// net.ListenPacket. The extender owns and closes returned endpoints.
 	ListenPacket func(network string, address string) (net.PacketConn, error)
+	// BindOwnerDetail, when set, names what holds a port whose bind failed
+	// with EADDRINUSE; the text is appended to the bind failure log. The
+	// library runs no utility itself, so a caller that wants the owner (the
+	// miner or cli, for example by asking `ss`) supplies the lookup. Nil logs
+	// only that the port is in use.
+	BindOwnerDetail func(transport string, port int, err error) string
 	// DialContext, when set, creates the forwarded inner connection. Userspace
 	// integration tests use it for the extender-to-connect segment. Nil
 	// retains forwardDialer. The extender owns and closes returned connections.
@@ -925,7 +931,7 @@ func (self *ExtenderServer) ListenAndServe() error {
 			continue
 		}
 
-		log.Printf("[extender] listen tcp %d", port)
+		log.Printf("[extender] bind attempt transport=tcp port=%d carrier=%s", port, connect.ExtenderCarrierTcp)
 		listen := net.Listen
 		if self.settings.Listen != nil {
 			listen = self.settings.Listen
@@ -937,16 +943,17 @@ func (self *ExtenderServer) ListenAndServe() error {
 			if listener != nil {
 				listener.Close()
 			}
-			self.reportListenError(connect.ExtenderCarrierTcp, err)
+			self.reportListenError(connect.ExtenderCarrierTcp, "tcp", port, err)
 			bindErrs = append(bindErrs, err)
 			continue
 		}
 		if listener == nil {
 			err := fmt.Errorf("extender listener factory returned nil")
-			self.reportListenError(connect.ExtenderCarrierTcp, err)
+			self.reportListenError(connect.ExtenderCarrierTcp, "tcp", port, err)
 			bindErrs = append(bindErrs, err)
 			continue
 		}
+		log.Printf("[extender] bound transport=tcp port=%d carrier=%s", port, connect.ExtenderCarrierTcp)
 		ownedListener, ok := self.addListener(listener)
 		if !ok {
 			// shutdown started while binding, which is not a bind failure
@@ -972,7 +979,7 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}
 		carrier := connect.ExtenderCarrierForConnectMode(connectMode)
 
-		log.Printf("[extender] listen udp %d (%s)", port, connectMode)
+		log.Printf("[extender] bind attempt transport=udp port=%d carrier=%s", port, carrier)
 		listenPacket := net.ListenPacket
 		if self.settings.ListenPacket != nil {
 			listenPacket = self.settings.ListenPacket
@@ -982,16 +989,17 @@ func (self *ExtenderServer) ListenAndServe() error {
 			if packetConn != nil {
 				packetConn.Close()
 			}
-			self.reportListenError(carrier, err)
+			self.reportListenError(carrier, "udp", port, err)
 			bindErrs = append(bindErrs, err)
 			continue
 		}
 		if packetConn == nil {
 			err := fmt.Errorf("extender packet listener factory returned nil")
-			self.reportListenError(carrier, err)
+			self.reportListenError(carrier, "udp", port, err)
 			bindErrs = append(bindErrs, err)
 			continue
 		}
+		log.Printf("[extender] bound transport=udp port=%d carrier=%s", port, carrier)
 		ownedCloser, ok := self.addCloser(func() { packetConn.Close() })
 		if !ok {
 			// shutdown started while binding, which is not a bind failure
@@ -1179,8 +1187,8 @@ func (self *ExtenderServer) addCarrier(carrier string) {
 // Reports one carrier bind failure (G2). The carrier is disabled; the log line
 // is unconditional because a bind that failed is a configuration fact an
 // operator needs, and the handler is what the sdk provider role reads.
-func (self *ExtenderServer) reportListenError(carrier string, err error) {
-	log.Printf("[extender] listen error (%s): %s", carrier, err)
+func (self *ExtenderServer) reportListenError(carrier, transport string, port int, err error) {
+	log.Printf("[extender] bind failed transport=%s port=%d carrier=%s error=%s%s", transport, port, carrier, strings.Join(strings.Fields(err.Error()), " "), self.bindOwnerDetail(transport, port, err))
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()

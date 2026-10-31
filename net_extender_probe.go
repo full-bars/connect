@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -38,6 +42,60 @@ import (
 // an unknown field is ignored, so this stays valid as hello grows.
 type extenderHelloResult struct {
 	ClientAddress string `json:"client_address"`
+}
+
+// ExtenderProbeError identifies the phase and endpoint of a failed carrier probe.
+// Unwrap preserves the original error for callers that classify failures.
+type ExtenderProbeError struct {
+	Carrier string
+	Address string
+	Port    int
+	Phase   string
+	Err     error
+}
+
+func (e *ExtenderProbeError) Error() string {
+	// Err is set by every constructor, but Error() must not be the place a
+	// missing cause turns into a panic on a logging path.
+	cause := "<nil>"
+	if e.Err != nil {
+		cause = strings.Join(strings.Fields(e.Err.Error()), " ")
+	}
+	return fmt.Sprintf("[extender] probe failed carrier=%s port=%d address=%s phase=%s error=%s", e.Carrier, e.Port, e.Address, e.Phase, cause)
+}
+func (e *ExtenderProbeError) Unwrap() error { return e.Err }
+
+type extenderProbePhaseKey struct{}
+type extenderProbePhase struct{ phase atomic.Value }
+
+func newExtenderProbePhase() *extenderProbePhase {
+	p := &extenderProbePhase{}
+	p.phase.Store("dial")
+	return p
+}
+
+// How far a phase is into the exchange: dial, then handshake, then request.
+func extenderProbePhaseRank(phase string) int {
+	switch phase {
+	case "handshake", "dial/handshake":
+		return 1
+	case "request":
+		return 2
+	}
+	return 0
+}
+
+// Moves the phase forward to `phase` if that is further than where it is.
+func (p *extenderProbePhase) advance(phase string) {
+	if extenderProbePhaseRank(p.phase.Load().(string)) < extenderProbePhaseRank(phase) {
+		p.phase.Store(phase)
+	}
+}
+
+func setExtenderProbePhase(ctx context.Context, phase string) {
+	if p, ok := ctx.Value(extenderProbePhaseKey{}).(*extenderProbePhase); ok {
+		p.phase.Store(phase)
+	}
 }
 
 // ProbeExtenderCarrier dials one carrier of one extender with a fresh
@@ -78,6 +136,16 @@ func ProbeExtenderCarrier(
 
 	probeCtx, probeCancel := probeContext(ctx, connectSettings)
 	defer probeCancel()
+	phase := newExtenderProbePhase()
+	probeCtx = context.WithValue(probeCtx, extenderProbePhaseKey{}, phase)
+	probeError := func(err error) error {
+		address := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+		if connectMode == ExtenderConnectModeWebRtc {
+			// WebRTC resolves signaling by identity, not by this IP and port.
+			address = "signaling-unknown"
+		}
+		return &ExtenderProbeError{Carrier: ExtenderCarrierForConnectMode(connectMode), Address: address, Port: port, Phase: phase.phase.Load().(string), Err: err}
+	}
 
 	challenge, err := NewExtenderChallenge()
 	if err != nil {
@@ -110,21 +178,22 @@ func ProbeExtenderCarrier(
 		if conn != nil {
 			conn.Close()
 		}
-		return nil, err
+		return nil, probeError(err)
 	}
 	// the probe never forwards; release the stream and the destination
 	// connection the extender opened for it
 	conn.Close()
 
+	setExtenderProbePhase(probeCtx, "request")
 	if response == nil {
-		return nil, fmt.Errorf("extender sent no response")
+		return nil, probeError(fmt.Errorf("extender sent no response"))
 	}
 	if 0 < len(expectPublicKey) {
 		if string(response.PublicKey) != string(expectPublicKey) {
-			return nil, fmt.Errorf("extender published another identity key")
+			return nil, probeError(fmt.Errorf("extender published another identity key"))
 		}
 		if !VerifyExtenderChallenge(expectPublicKey, challenge, response.ChallengeSignature) {
-			return nil, fmt.Errorf("extender challenge signature does not verify")
+			return nil, probeError(fmt.Errorf("extender challenge signature does not verify"))
 		}
 	}
 	return response, nil

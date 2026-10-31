@@ -124,6 +124,7 @@ func dialExtenderTcpCamouflageConn(
 		handshakeConn = rconn
 	}
 
+	setExtenderProbePhase(ctx, "handshake")
 	var serverConn net.Conn
 	func() {
 		tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
@@ -139,6 +140,7 @@ func dialExtenderTcpCamouflageConn(
 		}
 	}
 
+	setExtenderProbePhase(ctx, "request")
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
@@ -298,6 +300,19 @@ func raceExtenderTcpCamouflage(
 ) (net.Conn, *protocol.ExtenderResponse, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	var attemptWorkers sync.WaitGroup
+	// both attempts share raceCtx, so each reports its phase to its own holder
+	// and the race hands the furthest one to the probe once both have stopped
+	var attemptPhases []*extenderProbePhase
+	var attemptPhasesLock sync.Mutex
+	if probePhase, ok := ctx.Value(extenderProbePhaseKey{}).(*extenderProbePhase); ok {
+		defer func() {
+			attemptPhasesLock.Lock()
+			defer attemptPhasesLock.Unlock()
+			for _, attemptPhase := range attemptPhases {
+				probePhase.advance(attemptPhase.phase.Load().(string))
+			}
+		}()
+	}
 	defer func() {
 		raceCancel()
 		attemptWorkers.Wait()
@@ -311,11 +326,19 @@ func raceExtenderTcpCamouflage(
 		if roundTrip != nil {
 			attempt.roundTrip = &ExtenderRoundTrip{}
 		}
+		attemptCtx := raceCtx
+		if _, ok := ctx.Value(extenderProbePhaseKey{}).(*extenderProbePhase); ok {
+			attemptPhase := newExtenderProbePhase()
+			attemptCtx = context.WithValue(raceCtx, extenderProbePhaseKey{}, attemptPhase)
+			attemptPhasesLock.Lock()
+			attemptPhases = append(attemptPhases, attemptPhase)
+			attemptPhasesLock.Unlock()
+		}
 		attemptWorkers.Add(1)
 		go func() {
 			defer attemptWorkers.Done()
 			HandleError(func() {
-				attempt.conn, attempt.response, attempt.err = dial(raceCtx, attempt.roundTrip)
+				attempt.conn, attempt.response, attempt.err = dial(attemptCtx, attempt.roundTrip)
 			}, func(err error) {
 				attempt.err = err
 			})

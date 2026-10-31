@@ -7,10 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http/httptrace"
 	"net/netip"
+	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -560,7 +564,7 @@ func (self *ExtenderActivator) run() {
 			if err != nil {
 				// a failed check retries on the backoff floor rather than on
 				// every wake, which a directory change would otherwise be
-				self.log.Infof("[extender]activate hello err = %s\n", httpRequestErrorWithCauses(err))
+				self.log.Infof("[extender]activate hello err = %s\n", activationLogError(httpRequestErrorWithCauses(err)))
 				nextAddressCheckTime = now.Add(self.settings.MinBackoff)
 			} else {
 				nextAddressCheckTime = now.Add(self.settings.AddressCheckTimeout)
@@ -859,6 +863,86 @@ func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time
 	return succeeded, succeeded && measurementCsr != ""
 }
 
+// Activation diagnostics count physical strategy requests, including hello
+// attempts used to find a working route, without changing their outcomes.
+type extenderActivationTraceKey struct{}
+type extenderActivationTrace struct {
+	attempts atomic.Int64
+	remote   atomic.Value
+}
+
+func traceExtenderActivationAttempt(ctx context.Context) {
+	if trace, ok := ctx.Value(extenderActivationTraceKey{}).(*extenderActivationTrace); ok {
+		trace.attempts.Add(1)
+	}
+}
+func activationLogAddress(apiURL string) string {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Hostname() == "" {
+		return "unknown"
+	}
+	return u.Host
+}
+
+var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
+// The matcher stops at whitespace only, and the punctuation a sentence puts
+// after a url is trimmed from the tail. Excluding quotes inside the character
+// class would truncate a url whose query value contains one, and whatever came
+// after the quote would escape the strip.
+var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
+
+const activationUrlTrailer = "\"'<>),;:."
+
+func activationLogUrls(text string) string {
+	strip := func(raw string) string {
+		trimmed := strings.TrimRight(raw, activationUrlTrailer)
+		trailer := raw[len(trimmed):]
+		if trimmed == "" {
+			return raw
+		}
+		if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+			return u.Host + trailer
+		}
+		return "[url]" + trailer
+	}
+	return activationUrl.ReplaceAllStringFunc(text, strip)
+}
+
+func activationLogText(text, jwt, apiURL string) string {
+	if jwt != "" {
+		text = strings.ReplaceAll(text, jwt, "[redacted]")
+	}
+	// Strip every url to its host BEFORE the literal apiURL replacement. The
+	// replacement matches a bare substring, so running it first turns
+	// "<apiURL>?code=secret" into "<host>?code=secret": the scheme is gone and
+	// the url matcher below can no longer see it, which leaks the query.
+	text = activationLogUrls(text)
+	if apiURL != "" {
+		address := activationLogAddress(apiURL)
+		text = strings.ReplaceAll(text, apiURL, address)
+		// The replacement above leaves the scheme-less host behind, and anything
+		// still attached to it (a path, a query, a fragment) can carry a secret.
+		// Strip it by NAME: the api host is the one host known to carry ours, so
+		// no pattern has to guess what a schemaless url looks like. QuoteMeta makes
+		// the port, dots and IPv6 brackets literal.
+		if address != "unknown" {
+			text = regexp.MustCompile(regexp.QuoteMeta(address)+`\S*`).ReplaceAllLiteralString(text, address)
+		}
+	}
+	text = activationJWT.ReplaceAllString(text, "[redacted]")
+	return strings.Join(strings.Fields(text), " ")
+}
+
+// activationLogError sanitizes error text where no jwt is in hand: every url
+// falls back to its host and anything jwt-shaped is redacted. It has no api url
+// in hand, so only scheme'd urls are reduced to their host; a schemaless
+// fragment of an unknown host is not stripped here.
+func activationLogError(text string) string {
+	text = activationLogUrls(text)
+	text = activationJWT.ReplaceAllString(text, "[redacted]")
+	return strings.Join(strings.Fields(text), " ")
+}
+
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
 // fallback mode. `measurementCsr` is the request the post carries, empty for
@@ -888,18 +972,29 @@ func (self *ExtenderActivator) activateUrl(
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
+	trace := &extenderActivationTrace{}
+	trace.remote.Store("unknown")
+	ctx = context.WithValue(ctx, extenderActivationTraceKey{}, trace)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		if info.Conn != nil && info.Conn.RemoteAddr() != nil {
+			trace.remote.Store(info.Conn.RemoteAddr().String())
+		}
+	}})
+	started := time.Now()
+	jwt := self.byJwt()
 	result, err := PostExtenderActivate(
 		ctx,
 		self.settings.ClientStrategy,
 		apiUrl,
-		self.byJwt(),
+		jwt,
 		args,
 	)
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if err != nil {
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
-		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
-		self.recordFailure(ipVersion, now, err.Error(), false)
+		self.log.Infof("[extender] activate v%d failed carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), elapsed, trace.attempts.Load(), activationLogText(httpRequestErrorWithCauses(err), jwt, apiUrl))
+		self.recordFailure(ipVersion, now, activationLogText(err.Error(), jwt, apiUrl), false)
 		return false
 	}
 	if result == nil {
@@ -910,11 +1005,11 @@ func (self *ExtenderActivator) activateUrl(
 		ipVersion = extenderActivateResultIpVersion(result)
 	}
 	if !result.Activated {
-		message := result.Error
+		message := activationLogText(result.Error, jwt, apiUrl)
 		if message == "" {
 			message = "the operator refused the activation"
 		}
-		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		self.log.Infof("[extender] activate v%d refused carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), elapsed, trace.attempts.Load(), activationLogText(message, jwt, apiUrl))
 		self.recordFailure(ipVersion, now, message, true)
 		return false
 	}
