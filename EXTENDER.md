@@ -31,9 +31,9 @@ implementation differs).
   `CAP_NET_BIND_SERVICE`. The role binds it only when `--dns_privileged_port`
   (connectctl) or `ProvideExtenderDnsPrivilegedPort` (sn) is set. If that
   bind fails, the failure is logged, 53 is not offered, and the dns carrier
-  keeps 4053, so the dns carrier is still offered on 4053. A blocked 53 does not refuse an
-  activation while 4053 answers; the record lists only the dns ports that
-  answered.
+  keeps 4053, so the dns carrier is still offered on 4053. Once activation
+  is live, a blocked 53 does not refuse an activation while 4053 answers; the
+  record lists only the dns ports that answered.
 - Host firewall changes do not open AWS security groups, GCP VPC firewall,
   Azure NSGs, router NAT or Docker's published ports. Each is a separate
   layer with its own switch.
@@ -41,25 +41,26 @@ implementation differs).
   udp carriers are optional, probed only when offered. The implementation
   differs: the activation controller in `urnetwork/server` refuses the
   activation when an offered tcp or quic probe fails, and refuses the dns
-  carrier only when none of its listed ports answers. So a blocked udp 443
-  fails activation, and a blocked 4053 does too unless 53 answers. Treat
-  udp 443 and udp 4053 as required until that is fixed. Webrtc is not
-  accepted by the server yet either, so even once activation is live a host
-  with no public tcp 443 cannot activate.
+  carrier only when none of its listed ports answers. So once activation
+  is live, a blocked udp 443 fails activation, and a blocked 4053 does too
+  unless 53 answers. Treat udp 443 and udp 4053 as required until that is
+  fixed. Webrtc is not accepted by the server yet either, so even once
+  activation is live a host with no public tcp 443 cannot activate.
 - Bind failures on the host are not the same as blocked ports. Bind attempts
   run TCP first, then UDP; each carrier binds independently. A carrier that
   fails to bind on the host is logged (`[extender] listen error (<carrier>)`)
   and is not offered in the activation request. A failed UDP bind disables
   just that carrier on the host without refusing the activation, but TCP 443
   is required: with no TCP listener the server refuses the activation.
-  Conversely, if a UDP carrier binds on the host and is offered, but is
-  blocked by a firewall, the server probe fails and refuses the whole
-  activation.
+  Conversely, once activation is live, if a UDP carrier binds on the host and
+  is offered, but is blocked by a firewall, the server probe fails and
+  refuses the whole activation.
 - In practice a blocked carrier shows up as `<carrier> carrier did not
   answer`, which reads like a server fault and is usually a host or cloud
   firewall. That text is on the `[extender]activate v<n> refused =` line.
-- Best single diagnostic: if tcp 443 answers from another host but udp 443
-  does not, suspect a host or cloud firewall, not the provider.
+- Best single diagnostic: once activation is live, if tcp 443 answers from
+  another host but udp 443 does not, suspect a host or cloud firewall, not
+  the provider.
 - A rejected UDP probe often returns ICMP "admin prohibited". Most QUIC
   clients ignore it and report a timeout, so "it times out" does not mean
   "it never arrived".
@@ -745,8 +746,8 @@ name the api host on port 443 as their destination.
 
 C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
 it passes at least one required test. Every other carrier is optional.
-(Operators: the ports must be open on the host and the cloud layer first,
-see "Before you activate: open the ports" at the top.)
+(Operators: once activation is live, the ports must be open on the host and
+the cloud layer first; see "Before you activate: open the ports" at the top.)
 
 - Required, at least one of:
   - Public tcp 443. The activation probe dials the caller's public address
@@ -759,6 +760,8 @@ see "Before you activate: open the ports" at the top.)
     proves the forward with the same verified `GET /hello` through the data
     channel. This is the path for an extender behind NAT, which has no
     public inbound address. It lands with the webrtc carrier.
+    (Implementation divergence: `urnetwork/server` requires tcp and does not
+    accept webrtc yet; see "Before you activate: open the ports".)
 - Optional, probed only when offered, never gating: udp 443 (quic), the dns
   carrier on udp 4053, and udp 53 on the sn miner. An optional carrier that
   fails its probe is left out of the stored `carriers`; it does not fail an
