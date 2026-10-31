@@ -21,19 +21,28 @@ tests them. Open them on the host and on every cloud layer in front of it first
 (C2a states the rule; the note on the udp carriers below is where the
 implementation differs).
 
+Today the provider role is off unless `URNETWORK_EXTENDER=on` is set
+(`provider/extender_role.go` in urnetwork-3.23-fix), and that role runs no
+activation loop. An ordinary production provider therefore binds none of the
+ports below and writes none of the `[extender]activate` lines this section
+mentions. Nothing here needs opening until the role is switched on and
+activation ships.
+
 | Port | Needed | Carrier |
 |---|---|---|
 | tcp 443 | required. The server refuses an activation that does not offer tcp, so webrtc alone is not accepted yet | tcp |
 | udp 443 | offered when bound. If offered and blocked, the activation is refused | quic |
 | udp 4053 | offered when bound. Refused when no dns port answers, so in practice required | dns |
 
-- udp 53 (the sn miner only, A1) is privileged: binding it needs root or
-  `CAP_NET_BIND_SERVICE`. The role binds it only when `--dns_privileged_port`
-  (connectctl) or `ProvideExtenderDnsPrivilegedPort` (sn) is set. If that
-  bind fails, the failure is logged, 53 is not offered, and the dns carrier
-  keeps 4053, so the dns carrier is still offered on 4053. Once activation
-  is live, a blocked 53 does not refuse an activation while 4053 answers; the
-  record lists only the dns ports that answered.
+- udp 53 is privileged: binding it needs root or `CAP_NET_BIND_SERVICE`. The
+  dns carrier, the same carrier as udp 4053, binds it only when the operator
+  opts in. In urnetwork-3.23-fix that is `URNETWORK_EXTENDER_DNS53=on`, and
+  the role itself must also be on (`URNETWORK_EXTENDER=on`); in the
+  standalone `connectctl` extender it is `--dns_privileged_port`. Both are off
+  by default. If the 53 bind fails, the dns carrier logs it and keeps 4053, so
+  the dns carrier is still offered on 4053. Once activation is live, a blocked
+  53 does not refuse an activation while 4053 answers; the record lists only
+  the dns ports that answered.
 - Host firewall changes do not open AWS security groups, GCP VPC firewall,
   Azure NSGs, router NAT or Docker's published ports. Each is a separate
   layer with its own switch.
@@ -48,16 +57,24 @@ implementation differs).
   activation is live a host with no public tcp 443 cannot activate.
 - Bind failures on the host are not the same as blocked ports. Bind attempts
   run TCP first, then UDP; each carrier binds independently. A carrier that
-  fails to bind on the host is logged (`[extender] listen error (<carrier>)`)
-  and is not offered in the activation request. A failed UDP bind disables
-  just that carrier on the host without refusing the activation, but TCP 443
-  is required: with no TCP listener the server refuses the activation.
+  fails to bind on the host is logged while the role is on. The provider
+  prints `[extender] tcp 443 unavailable` for tcp, and
+  `[extender] <carrier> carrier unavailable` for the others. The server
+  package also prints `[extender] listen error (<carrier>)`. Once activation
+  is live, that carrier would not be offered in the activation request. A
+  failed UDP bind disables just that carrier on the host without refusing the
+  activation, but TCP 443 is required: with no TCP listener the server refuses
+  the activation.
   Conversely, once activation is live, if a UDP carrier binds on the host and
   is offered, but is blocked by a firewall, the server probe fails and
   refuses the whole activation.
-- In practice a blocked carrier shows up as `<carrier> carrier did not
-  answer`, which reads like a server fault and is usually a host or cloud
-  firewall. That text is on the `[extender]activate v<n> refused =` line.
+- Once activation is live, a blocked carrier is expected to show as
+  `<carrier> carrier did not answer`, which reads like a server fault and is
+  usually a host or cloud firewall. That text would be on the
+  `[extender]activate v<n> refused =` line. The line comes from the activation
+  loop, which the provider role does not run today, so no production provider
+  log contains it. The exact wording is the operator's, not in this repo, so
+  it is unverified here.
 - Best single diagnostic: once activation is live, if tcp 443 answers from
   another host but udp 443 does not, suspect a host or cloud firewall, not
   the provider.
@@ -76,7 +93,7 @@ Rows are grouped desktop-first: Windows and macOS, then Linux (common firewalls 
 |---|---|---|
 | Windows (elevated PowerShell) | `New-NetFirewallRule -DisplayName "extender tcp 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow; New-NetFirewallRule -DisplayName "extender udp" -Direction Inbound -Protocol UDP -LocalPort 443,4053 -Action Allow` | `Get-NetFirewallRule -DisplayName "extender*"` |
 | macOS | System Settings, Network, Firewall: allow the app. Add any custom pf rules as in the FreeBSD row | `/usr/libexec/ApplicationFirewall/socketfilterfw --listapps` |
-| firewalld (AlmaLinux, Rocky, RHEL, Fedora) | `firewall-cmd --permanent --add-service=https --add-service=http3 --add-port=4053/udp && firewall-cmd --reload` | `firewall-cmd --list-all` |
+| firewalld (AlmaLinux, Rocky, RHEL, Fedora) | `firewall-cmd --permanent --add-service=https --add-port=443/udp --add-port=4053/udp && firewall-cmd --reload` | `firewall-cmd --query-port=443/udp && firewall-cmd --query-port=4053/udp` |
 | ufw (Ubuntu, Debian) | `ufw allow 443/tcp && ufw allow 443/udp && ufw allow 4053/udp` | `ufw status verbose` |
 | nftables (bare) | `nft add rule inet filter input tcp dport 443 accept; nft add rule inet filter input udp dport '{ 443, 4053 }' accept` | `nft list ruleset` |
 | iptables (bare) | `iptables -I INPUT -p tcp --dport 443 -j ACCEPT && iptables -I INPUT -p udp -m multiport --dports 443,4053 -j ACCEPT` | `iptables -S INPUT` |
@@ -88,9 +105,13 @@ Rows are grouped desktop-first: Windows and macOS, then Linux (common firewalls 
 
 Notes that bite:
 
-- firewalld: `firewall-cmd --query-port=443/udp` answers `no` when udp 443
-  is opened by the `http3` service. Verify the service
-  (`firewall-cmd --query-service=http3`), not the port.
+- firewalld: `--add-service=https` opens tcp 443 only. udp 443 and udp 4053
+  are opened with `--add-port`, and `firewall-cmd --query-port=443/udp` and
+  `--query-port=4053/udp` answer `yes` once the reload has applied them. There
+  is no `http3` service to add: a command that names an unknown service fails
+  with INVALID_SERVICE and applies nothing, so read the output of the
+  `--permanent` step before trusting the `--reload`. This row is unverified on
+  a live firewalld host.
 - ufw can be inactive while firewalld, nftables or iptables is the one
   enforcing. `ufw status` saying inactive proves nothing about the host.
 - nftables and iptables: the commands assume a table `inet filter` and an
@@ -122,6 +143,9 @@ can change them, and a host rule that looks right still fails if any layer
 above it drops the packet.
 
 ### If probes fail once activation is live
+
+Activation is not live, so nothing in this section applies to production today.
+Use it once the role is on and activation ships.
 
 - Probe from a **different host**, not from the box itself. Loopback can
   bypass the firewall and report success for a port the internet cannot
