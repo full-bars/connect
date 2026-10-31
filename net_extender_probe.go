@@ -73,7 +73,7 @@ func extenderProbePhaseRank(phase string) int {
 	switch phase {
 	case "handshake", "dial/handshake":
 		return 1
-	case "challenge":
+	case "request":
 		return 2
 	}
 	return 0
@@ -178,7 +178,7 @@ func ProbeExtenderCarrier(
 	// connection the extender opened for it
 	conn.Close()
 
-	setExtenderProbePhase(probeCtx, "challenge")
+	setExtenderProbePhase(probeCtx, "request")
 	if response == nil {
 		return nil, probeError(fmt.Errorf("extender sent no response"))
 	}

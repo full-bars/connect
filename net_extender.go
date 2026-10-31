@@ -698,7 +698,7 @@ func dialExtenderTcpLegacyConn(
 		serverConn = tlsServerConn
 	}
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
@@ -880,7 +880,7 @@ func dialExtenderQuic(
 	flight := quicSendFlightForConn(quicConn)
 	flight.bind(quicConn)
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	h3Transport := &http3.Transport{MaxResponseHeaderBytes: ExtenderMaxHeaderByteCount}
 	clientConn := h3Transport.NewClientConn(quicConn)
 	stream, err := clientConn.OpenRequestStream(ctx)

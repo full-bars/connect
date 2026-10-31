@@ -230,7 +230,7 @@ func TestRaceExtenderTcpCamouflageKeepsFurthestAttemptPhase(t *testing.T) {
 	defer cancel()
 	legacyStarted := make(chan struct{})
 	camoDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
-		setExtenderProbePhase(ctx, "challenge")
+		setExtenderProbePhase(ctx, "request")
 		return nil, nil, errors.New("camouflaged request failed")
 	}
 	legacyDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
@@ -247,8 +247,8 @@ func TestRaceExtenderTcpCamouflageKeepsFurthestAttemptPhase(t *testing.T) {
 	if err == nil {
 		t.Fatal("the race succeeded")
 	}
-	if got := phase.phase.Load().(string); got != "challenge" {
-		t.Fatalf("phase = %q, want the camouflaged attempt's %q", got, "challenge")
+	if got := phase.phase.Load().(string); got != "request" {
+		t.Fatalf("phase = %q, want the camouflaged attempt's %q", got, "request")
 	}
 }
 

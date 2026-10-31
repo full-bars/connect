@@ -337,7 +337,7 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 	conn := newWebRtcDataChannelConn(detached, peerConnection, cancelResolve, int(self.settings.MaxMessageSize))
 	owned = true
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,

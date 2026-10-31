@@ -140,7 +140,7 @@ func dialExtenderTcpCamouflageConn(
 		}
 	}
 
-	setExtenderProbePhase(ctx, "challenge")
+	setExtenderProbePhase(ctx, "request")
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
