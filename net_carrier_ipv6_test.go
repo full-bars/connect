@@ -79,7 +79,11 @@ func (self *fakeSocksExit) serve(conn net.Conn) {
 }
 
 func (self *fakeSocksExit) settings(index int) *ProxySettings {
-	return &ProxySettings{Index: index, Network: "tcp", Address: self.listener.Addr().String()}
+	// this fork's ProxySettings has no Index field and Key() is Address(+Auth.User),
+	// so each fake exit is identified by its own listener address; index is kept in
+	// the signature so the call sites read the same as the provider fork's copy
+	_ = index
+	return &ProxySettings{Network: "tcp", Address: self.listener.Addr().String()}
 }
 
 // withCarrierClock swaps the process-wide table for a fresh one on a manual
