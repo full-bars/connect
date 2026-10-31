@@ -55,12 +55,12 @@ func (self *ExtenderServer) bindTcpCarrier(port int) (net.Listener, *extenderOwn
 		if listener != nil {
 			listener.Close()
 		}
-		logBindFailed(carrier, "tcp", port, err)
+		self.logBindFailed(carrier, "tcp", port, err)
 		return nil, nil, err
 	}
 	if listener == nil {
 		err := fmt.Errorf("extender listener factory returned nil")
-		logBindFailed(carrier, "tcp", port, err)
+		self.logBindFailed(carrier, "tcp", port, err)
 		return nil, nil, err
 	}
 	ownedListener, ok := self.addListener(listener)
@@ -87,12 +87,12 @@ func (self *ExtenderServer) bindUdpCarrier(
 		if packetConn != nil {
 			packetConn.Close()
 		}
-		logBindFailed(carrier, "udp", port, err)
+		self.logBindFailed(carrier, "udp", port, err)
 		return nil, nil, err
 	}
 	if packetConn == nil {
 		err := fmt.Errorf("extender packet listener factory returned nil")
-		logBindFailed(carrier, "udp", port, err)
+		self.logBindFailed(carrier, "udp", port, err)
 		return nil, nil, err
 	}
 	ownedCloser, ok := self.addCloser(func() { packetConn.Close() })
@@ -105,8 +105,8 @@ func (self *ExtenderServer) bindUdpCarrier(
 
 // Logs one failed bind with the carrier it was for and, where the host says, what
 // holds the port.
-func logBindFailed(carrier, transport string, port int, err error) {
-	log.Printf("[extender] bind failed transport=%s port=%d carrier=%s error=%s%s", transport, port, carrier, strings.Join(strings.Fields(err.Error()), " "), bindOwnerDetail(transport, port, err))
+func (self *ExtenderServer) logBindFailed(carrier, transport string, port int, err error) {
+	log.Printf("[extender] bind failed transport=%s port=%d carrier=%s error=%s%s", transport, port, carrier, strings.Join(strings.Fields(err.Error()), " "), self.bindOwnerDetail(transport, port, err))
 }
 
 // Serves one tcp carrier port for the life of the server, from the listener

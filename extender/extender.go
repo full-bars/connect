@@ -434,6 +434,12 @@ type ExtenderSettings struct {
 	// a socket without binding a privileged port. Nil retains
 	// net.ListenPacket. The extender owns and closes returned endpoints.
 	ListenPacket func(network string, address string) (net.PacketConn, error)
+	// BindOwnerDetail, when set, names what holds a port whose bind failed
+	// with EADDRINUSE; the text is appended to the bind failure log. The
+	// library runs no utility itself, so a caller that wants the owner (the
+	// miner or cli, for example by asking `ss`) supplies the lookup. Nil logs
+	// only that the port is in use.
+	BindOwnerDetail func(transport string, port int, err error) string
 	// DialContext, when set, creates the forwarded inner connection. Userspace
 	// integration tests use it for the extender-to-connect segment. Nil
 	// retains forwardDialer. The extender owns and closes returned connections.

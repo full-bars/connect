@@ -60,10 +60,20 @@ func TestExtenderBindFailureLogNamesPortAndTransport(t *testing.T) {
 		t.Fatalf("failed bind logged success: %s", text)
 	}
 	t.Logf("bind logs: %s", text)
-	if detail := bindOwnerDetail("udp", port, fmt.Errorf("wrapped: %w", syscall.EADDRINUSE)); !strings.Contains(detail, "port already in use") {
+	inUse := fmt.Errorf("wrapped: %w", syscall.EADDRINUSE)
+	if detail := server.bindOwnerDetail("udp", port, inUse); !strings.Contains(detail, "port already in use") {
 		t.Fatal(detail)
 	}
-	if detail := bindOwnerDetail("udp", port, errors.New("other")); detail != "" {
+	if detail := server.bindOwnerDetail("udp", port, errors.New("other")); detail != "" {
+		t.Fatal(detail)
+	}
+	server.settings.BindOwnerDetail = func(transport string, p int, err error) string {
+		return fmt.Sprintf("owner=test transport=%s port=%d", transport, p)
+	}
+	if detail := server.bindOwnerDetail("udp", port, inUse); detail != fmt.Sprintf("; owner=test transport=udp port=%d", port) {
+		t.Fatal(detail)
+	}
+	if detail := server.bindOwnerDetail("udp", port, errors.New("other")); detail != "" {
 		t.Fatal(detail)
 	}
 }
