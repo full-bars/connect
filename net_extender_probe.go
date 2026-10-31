@@ -62,6 +62,30 @@ func (e *ExtenderProbeError) Unwrap() error { return e.Err }
 type extenderProbePhaseKey struct{}
 type extenderProbePhase struct{ phase atomic.Value }
 
+func newExtenderProbePhase() *extenderProbePhase {
+	p := &extenderProbePhase{}
+	p.phase.Store("dial")
+	return p
+}
+
+// How far a phase is into the exchange: dial, then handshake, then request.
+func extenderProbePhaseRank(phase string) int {
+	switch phase {
+	case "handshake", "dial/handshake":
+		return 1
+	case "challenge":
+		return 2
+	}
+	return 0
+}
+
+// Moves the phase forward to `phase` if that is further than where it is.
+func (p *extenderProbePhase) advance(phase string) {
+	if extenderProbePhaseRank(p.phase.Load().(string)) < extenderProbePhaseRank(phase) {
+		p.phase.Store(phase)
+	}
+}
+
 func setExtenderProbePhase(ctx context.Context, phase string) {
 	if p, ok := ctx.Value(extenderProbePhaseKey{}).(*extenderProbePhase); ok {
 		p.phase.Store(phase)
@@ -106,8 +130,7 @@ func ProbeExtenderCarrier(
 
 	probeCtx, probeCancel := probeContext(ctx, connectSettings)
 	defer probeCancel()
-	phase := &extenderProbePhase{}
-	phase.phase.Store("dial")
+	phase := newExtenderProbePhase()
 	probeCtx = context.WithValue(probeCtx, extenderProbePhaseKey{}, phase)
 	probeError := func(err error) error {
 		address := net.JoinHostPort(ip.String(), strconv.Itoa(port))

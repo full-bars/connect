@@ -5,9 +5,12 @@ package connect
 // camo-first-then-legacy ordering is forced with barriers rather than timing.
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -216,5 +219,64 @@ func TestExtenderCamouflageFrontName(t *testing.T) {
 	defer restoreEmpty()
 	if got := extenderCamouflageFrontName(&ExtenderConfig{}); got != "" {
 		t.Fatalf("front name = %q, expected empty with no borrow list", got)
+	}
+}
+
+// The probe reports the phase the furthest attempt reached, not whichever
+// attempt wrote last: both attempts share the race context.
+func TestRaceExtenderTcpCamouflageKeepsFurthestAttemptPhase(t *testing.T) {
+	phase := newExtenderProbePhase()
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), extenderProbePhaseKey{}, phase))
+	defer cancel()
+	legacyStarted := make(chan struct{})
+	camoDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+		setExtenderProbePhase(ctx, "challenge")
+		return nil, nil, errors.New("camouflaged request failed")
+	}
+	legacyDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+		setExtenderProbePhase(ctx, "handshake")
+		close(legacyStarted)
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+	go func() {
+		<-legacyStarted
+		cancel()
+	}()
+	_, _, err := raceExtenderTcpCamouflage(ctx, nil, neverStagger, camoDial, legacyDial)
+	if err == nil {
+		t.Fatal("the race succeeded")
+	}
+	if got := phase.phase.Load().(string); got != "challenge" {
+		t.Fatalf("phase = %q, want the camouflaged attempt's %q", got, "challenge")
+	}
+}
+
+// The camouflaged attempt reports its handshake phase itself.
+func TestDialExtenderTcpCamouflageConnReportsHandshakePhase(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	settings := DefaultConnectSettings()
+	settings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) { return client, nil }}
+	phase := newExtenderProbePhase()
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), extenderProbePhaseKey{}, phase))
+	defer cancel()
+	go func() {
+		// the client hello arrives once the handshake is under way
+		buf := make([]byte, 1)
+		server.Read(buf)
+		cancel()
+	}()
+	extenderConfig := &ExtenderConfig{
+		Ip:               netip.MustParseAddr("127.0.0.1"),
+		Profile:          ExtenderProfile{Port: 443},
+		RealityPublicKey: bytes.Repeat([]byte{9}, extenderRealityX25519PublicKeyByteCount),
+		PublicKey:        make([]byte, ed25519.PublicKeySize),
+	}
+	if _, _, err := dialExtenderTcpCamouflageConn(ctx, settings, extenderConfig, "example.org", nil, nil); err == nil {
+		t.Fatal("the handshake succeeded")
+	}
+	if got := phase.phase.Load().(string); got != "handshake" {
+		t.Fatalf("phase = %q, want handshake", got)
 	}
 }
