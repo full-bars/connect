@@ -25,9 +25,14 @@ this follows).
 - Host firewall changes do not open AWS security groups, GCP VPC firewall,
   Azure NSGs, router NAT or Docker's published ports. Each is a separate
   layer with its own switch.
-- Per C2a the udp carriers are optional and never gate acceptance. In
-  practice a blocked one shows up as `<carrier> carrier did not answer`,
-  which reads like a server fault and is usually your firewall.
+- C2a specifies that only a required carrier gates acceptance and that the
+  udp carriers are optional, probed only when offered. Do not rely on that
+  today: the activation controller in `urnetwork/server` refuses the whole
+  activation when any offered carrier fails, so in practice a blocked udp
+  port does fail activation. Treat the udp ports as required until that is
+  fixed.
+- In practice a blocked carrier shows up as `<carrier> carrier did not
+  answer`, which reads like a server fault and is usually your firewall.
 - Best single diagnostic: if tcp 443 answers from another host but udp 443
   does not, suspect a host or cloud firewall, not the provider.
 - A rejected UDP probe often returns ICMP "admin prohibited". Most QUIC
