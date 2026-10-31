@@ -305,9 +305,10 @@ func TestActivationLogTextHandlesQuoteInsideQuery(t *testing.T) {
 	}
 }
 
-// A scheme-less host carrying a query is a leftover; it must not survive.
+// A scheme-less host carrying a query is a leftover of the literal apiURL
+// replacement; it is stripped by name, so the apiURL must be the one in play.
 func TestActivationLogTextStripsSchemalessQuery(t *testing.T) {
-	text := activationLogText("left api.example.org/a?code=scheme-less-secret behind", "test-jwt", "")
+	text := activationLogText("left api.example.org/a?code=scheme-less-secret behind", "test-jwt", "https://api.example.org/a")
 	if strings.Contains(text, "scheme-less-secret") {
 		t.Fatalf("scheme-less query survived: %q", text)
 	}
@@ -324,16 +325,42 @@ func TestActivationLogTextSanitizesRefusalMessage(t *testing.T) {
 	}
 }
 
-// An IP-literal endpoint has no alpha TLD, so a matcher that required one let
-// the query through.
+// IP-literal endpoints are redacted by name too, bracketed IPv6 included.
 func TestActivationLogTextStripsSchemalessIpLiteral(t *testing.T) {
-	for _, text := range []string{
-		"left 1.2.3.4?code=ip-secret behind",
-		"left [::1]?code=ip-secret behind",
+	for _, c := range []struct{ text, apiURL string }{
+		{"left 1.2.3.4?code=ip-secret behind", "http://1.2.3.4"},
+		{"left [::1]?code=ip-secret behind", "http://[::1]"},
+		{"left [2001:db8::1]:8443/x?code=ip-secret behind", "https://[2001:db8::1]:8443/activate"},
 	} {
-		got := activationLogText(text, "", "")
+		got := activationLogText(c.text, "", c.apiURL)
 		if strings.Contains(got, "ip-secret") {
-			t.Fatalf("query survived for %q: %q", text, got)
+			t.Fatalf("query survived for %q: %q", c.text, got)
+		}
+	}
+}
+
+// A port in the host used to break the structural match and leak the tail.
+func TestActivationLogTextStripsHostWithPort(t *testing.T) {
+	got := activationLogText("left api.example.org:8443/x?code=port-secret behind", "", "https://api.example.org:8443/activate")
+	if strings.Contains(got, "port-secret") || strings.Contains(got, "/x") {
+		t.Fatalf("port host tail survived: %q", got)
+	}
+	if got != "left api.example.org:8443 behind" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+}
+
+// Text that is not the api host is left alone: there is no pattern to
+// misfire on addresses, stack traces or measurements.
+func TestActivationLogTextLeavesOtherTextAlone(t *testing.T) {
+	const apiURL = "https://api.example.org/activate"
+	for _, in := range []string{
+		"notify ops@example.org or user@host about it",
+		"goroutine 5 [running]: main.(*Foo).Bar(0xc000012345) /src/app/foo.go:42 +0x1f",
+		"net/http.(*Transport).RoundTrip? failed after 1.5s? retry",
+	} {
+		if got := activationLogText(in, "", apiURL); got != in {
+			t.Fatalf("diagnostic mangled:\n  in:  %q\n  out: %q", in, got)
 		}
 	}
 }
@@ -356,9 +383,9 @@ func TestActivationLogTextKeepsMeasurements(t *testing.T) {
 	}
 }
 
-// A schemaless host with a path and no query still hides a secret in the path.
+// A schemaless api host with a path and no query still hides a secret in the path.
 func TestActivationLogTextStripsSchemalessPath(t *testing.T) {
-	got := activationLogText("error at api.example.org/v1/keys/SECRET12345/view failed", "", "")
+	got := activationLogText("error at api.example.org/v1/keys/SECRET12345/view failed", "", "https://api.example.org/activate")
 	if strings.Contains(got, "SECRET12345") {
 		t.Fatalf("path secret survived: %q", got)
 	}
@@ -367,9 +394,12 @@ func TestActivationLogTextStripsSchemalessPath(t *testing.T) {
 	}
 }
 
-// Userinfo before an IP literal carries a password and is not a query.
+// Userinfo on a scheme'd url is dropped with the rest of the url. The bare
+// "user:pass@ip?query" form has no scheme and no known host to key on; the old
+// test asserted a structural match that no longer exists, so it now asserts the
+// scheme'd form that the url stripper still owns.
 func TestActivationLogTextStripsUserinfoBeforeIpLiteral(t *testing.T) {
-	got := activationLogText("connect to admin:supersecret@1.2.3.4?token=secret failed", "", "")
+	got := activationLogText("connect to http://admin:supersecret@1.2.3.4/x?token=secret failed", "", "")
 	for _, secret := range []string{"supersecret", "token=secret"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("%q survived: %q", secret, got)

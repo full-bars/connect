@@ -891,18 +891,6 @@ var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\
 // after the quote would escape the strip.
 var activationUrl = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
-// A host carrying a path, query or fragment and no scheme is the leftover of a
-// url that an earlier literal replacement already stripped the scheme from.
-//
-// The host is matched structurally — a dotted IPv4 quad, a bracketed IPv6
-// literal, or a name ending in an alphabetic TLD — and any userinfo before it
-// is consumed too. A permissive "dot followed by alphanumerics" instead treated
-// measurements as hosts and replaced them: `1.5s?` and `v2.0?` became `[url]`,
-// which destroyed the very diagnostics this file exists to keep. The suffix is
-// dropped by the replacement, so the host survives and the path, query,
-// fragment and userinfo do not.
-var activationSchemalessUrl = regexp.MustCompile(`(^|[^0-9A-Za-z])(?:[^\s/@]+@)?((?:[0-9]{1,3}\.){3}[0-9]{1,3}|\[[0-9A-Fa-f:]+\]|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})(?:[/?#][^\s]*)?`)
-
 const activationUrlTrailer = "\"'<>),;:."
 
 func activationLogUrls(text string) string {
@@ -917,10 +905,7 @@ func activationLogUrls(text string) string {
 		}
 		return "[url]" + trailer
 	}
-	text = activationUrl.ReplaceAllStringFunc(text, strip)
-	// keep the character before the host and the host itself; drop userinfo,
-	// path, query and fragment
-	return activationSchemalessUrl.ReplaceAllString(text, "$1$2")
+	return activationUrl.ReplaceAllStringFunc(text, strip)
 }
 
 func activationLogText(text, jwt, apiURL string) string {
@@ -933,14 +918,25 @@ func activationLogText(text, jwt, apiURL string) string {
 	// the url matcher below can no longer see it, which leaks the query.
 	text = activationLogUrls(text)
 	if apiURL != "" {
-		text = strings.ReplaceAll(text, apiURL, activationLogAddress(apiURL))
+		address := activationLogAddress(apiURL)
+		text = strings.ReplaceAll(text, apiURL, address)
+		// The replacement above leaves the scheme-less host behind, and anything
+		// still attached to it (a path, a query, a fragment) can carry a secret.
+		// Strip it by NAME: the api host is the one host known to carry ours, so
+		// no pattern has to guess what a schemaless url looks like. QuoteMeta makes
+		// the port, dots and IPv6 brackets literal.
+		if address != "unknown" {
+			text = regexp.MustCompile(regexp.QuoteMeta(address)+`\S*`).ReplaceAllLiteralString(text, address)
+		}
 	}
 	text = activationJWT.ReplaceAllString(text, "[redacted]")
 	return strings.Join(strings.Fields(text), " ")
 }
 
 // activationLogError sanitizes error text where no jwt is in hand: every url
-// falls back to its host and anything jwt-shaped is redacted.
+// falls back to its host and anything jwt-shaped is redacted. It has no api url
+// in hand, so only scheme'd urls are reduced to their host; a schemaless
+// fragment of an unknown host is not stripped here.
 func activationLogError(text string) string {
 	text = activationLogUrls(text)
 	text = activationJWT.ReplaceAllString(text, "[redacted]")
