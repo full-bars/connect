@@ -245,3 +245,36 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 	}
 	t.Logf("refusal log: %s", line)
 }
+
+// The literal apiURL replacement matches a bare substring. If it runs before
+// the url matcher, "<apiURL>?code=secret" becomes "<host>?code=secret": the
+// scheme is gone, the matcher no longer sees a url, and the query survives.
+// This is the ordering the activation path had before the url strip moved
+// ahead of it.
+func TestActivationLogTextStripsUrlBeforeLiteralApiUrl(t *testing.T) {
+	apiURL := "https://api.example.org/v1/extender/activate"
+	text := activationLogText(
+		`http request failed: Post "`+apiURL+`?code=query-secret#frag": EOF`,
+		"test-jwt",
+		apiURL,
+	)
+	for _, secret := range []string{"query-secret", "frag", "?"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("url component %q survived sanitization: %q", secret, text)
+		}
+	}
+	if !strings.Contains(text, "api.example.org") {
+		t.Fatalf("the host should survive: %q", text)
+	}
+}
+
+// activationLogError is the no-jwt sanitizer used on the hello path.
+func TestActivationLogErrorStripsUrlAndJwtShape(t *testing.T) {
+	token := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4eXoifQ.c2lnbmF0dXJlLXZhbHVl"
+	text := activationLogError(`Post "https://user:pass@example.org/hello?token=hidden": ` + token)
+	for _, secret := range []string{"hidden", "pass", token} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("secret %q survived: %q", secret, text)
+		}
+	}
+}

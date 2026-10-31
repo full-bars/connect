@@ -564,7 +564,7 @@ func (self *ExtenderActivator) run() {
 			if err != nil {
 				// a failed check retries on the backoff floor rather than on
 				// every wake, which a directory change would otherwise be
-				self.log.Infof("[extender]activate hello err = %s\n", httpRequestErrorWithCauses(err))
+				self.log.Infof("[extender]activate hello err = %s\n", activationLogError(httpRequestErrorWithCauses(err)))
 				nextAddressCheckTime = now.Add(self.settings.MinBackoff)
 			} else {
 				nextAddressCheckTime = now.Add(self.settings.AddressCheckTimeout)
@@ -904,9 +904,21 @@ func activationLogText(text, jwt, apiURL string) string {
 	if jwt != "" {
 		text = strings.ReplaceAll(text, jwt, "[redacted]")
 	}
+	// Strip every url to its host BEFORE the literal apiURL replacement. The
+	// replacement matches a bare substring, so running it first turns
+	// "<apiURL>?code=secret" into "<host>?code=secret": the scheme is gone and
+	// the url matcher below can no longer see it, which leaks the query.
+	text = activationLogUrls(text)
 	if apiURL != "" {
 		text = strings.ReplaceAll(text, apiURL, activationLogAddress(apiURL))
 	}
+	text = activationJWT.ReplaceAllString(text, "[redacted]")
+	return strings.Join(strings.Fields(text), " ")
+}
+
+// activationLogError sanitizes error text where no jwt is in hand: every url
+// falls back to its host and anything jwt-shaped is redacted.
+func activationLogError(text string) string {
 	text = activationLogUrls(text)
 	text = activationJWT.ReplaceAllString(text, "[redacted]")
 	return strings.Join(strings.Fields(text), " ")
@@ -963,7 +975,7 @@ func (self *ExtenderActivator) activateUrl(
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
 		self.log.Infof("[extender] activate v%d failed carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), elapsed, trace.attempts.Load(), activationLogText(httpRequestErrorWithCauses(err), jwt, apiUrl))
-		self.recordFailure(ipVersion, now, err.Error(), false)
+		self.recordFailure(ipVersion, now, activationLogText(err.Error(), jwt, apiUrl), false)
 		return false
 	}
 	if result == nil {
