@@ -6,6 +6,102 @@ bullet of the original is superseded, the decision that supersedes it says
 so. Implementation runs in the phases of section 5, in order, each with
 tests before the next starts.
 
+**Operators: open the ports first.** Activation tests them but never opens
+them. See "Before you activate: open the ports" below.
+
+## Before you activate: open the ports
+
+**Nothing opens these ports for you.** Activation only tests them. Open them
+on the host and on every cloud layer in front of it first (C2a is the rule
+this follows).
+
+| Port | Needed | Carrier |
+|---|---|---|
+| tcp 443 | required (or webrtc, for a host with no public inbound address) | tcp |
+| udp 443 | optional, needed for full carrier coverage | quic |
+| udp 4053 | optional, needed for full carrier coverage | dns |
+
+- The sn miner also serves udp 53 (A1). Same rule: optional.
+- Host firewall changes do not open AWS security groups, GCP VPC firewall,
+  Azure NSGs, router NAT or Docker's published ports. Each is a separate
+  layer with its own switch.
+- Per C2a the udp carriers are optional and never gate acceptance. In
+  practice a blocked one shows up as `<carrier> carrier did not answer`,
+  which reads like a server fault and is usually your firewall.
+- Best single diagnostic: if tcp 443 answers from another host but udp 443
+  does not, suspect a host or cloud firewall, not the provider.
+- A rejected UDP probe often returns ICMP "admin prohibited". Most QUIC
+  clients ignore it and report a timeout, so "it times out" does not mean
+  "it never arrived".
+
+### Commands per platform
+
+Run as root (or elevated). Each row is the open command, then a check.
+Detect which firewall is actually active first; more than one can be
+installed and only one is enforcing.
+
+| Platform | Open | Verify |
+|---|---|---|
+| firewalld (AlmaLinux, Rocky, RHEL, Fedora) | `firewall-cmd --permanent --add-service=https --add-service=http3 --add-port=4053/udp && firewall-cmd --reload` | `firewall-cmd --list-all` |
+| ufw (Ubuntu, Debian) | `ufw allow 443/tcp && ufw allow 443/udp && ufw allow 4053/udp` | `ufw status verbose` |
+| nftables (bare) | `nft add rule inet filter input tcp dport 443 accept; nft add rule inet filter input udp dport '{ 443, 4053 }' accept` | `nft list ruleset` |
+| iptables (bare) | `iptables -I INPUT -p tcp --dport 443 -j ACCEPT && iptables -I INPUT -p udp -m multiport --dports 443,4053 -j ACCEPT` | `iptables -S INPUT` |
+| openSUSE, SLES (firewalld) | same as the firewalld row | `firewall-cmd --list-all` |
+| openSUSE, SLES (SuSEfirewall2, legacy) | add `443` to `FW_SERVICES_EXT_TCP` and `443 4053` to `FW_SERVICES_EXT_UDP` in `/etc/sysconfig/SuSEfirewall2`, then `SuSEfirewall2 start` | `iptables -S INPUT` |
+| FreeBSD (pf) | add `pass in proto tcp to port 443` and `pass in proto udp to port { 443, 4053 }` to `/etc/pf.conf`, test with `pfctl -nf /etc/pf.conf`, load with `pfctl -f /etc/pf.conf` | `pfctl -sr` |
+| Docker, host networking | uses the host rules above | the host row's verify |
+| Docker, bridge networking | `docker run -p 443:443/tcp -p 443:443/udp -p 4053:4053/udp ...` | `docker port <container>` |
+| Windows (elevated PowerShell) | `New-NetFirewallRule -DisplayName "extender tcp 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow; New-NetFirewallRule -DisplayName "extender udp" -Direction Inbound -Protocol UDP -LocalPort 443,4053 -Action Allow` | `Get-NetFirewallRule -DisplayName "extender*"` |
+| macOS | System Settings, Network, Firewall: allow the app. Add any custom pf rules as in the FreeBSD row | `/usr/libexec/ApplicationFirewall/socketfilterfw --listapps` |
+
+Notes that bite:
+
+- firewalld: `firewall-cmd --query-port=443/udp` answers `no` when udp 443
+  is opened by the `http3` service. Verify the service
+  (`firewall-cmd --query-service=http3`), not the port.
+- ufw can be inactive while firewalld, nftables or iptables is the one
+  enforcing. `ufw status` saying inactive proves nothing about the host.
+- nftables and iptables: the commands assume a table `inet filter` and an
+  `INPUT` chain exist. Check which tool is in use (`nft list ruleset`,
+  `iptables -S`) before adding rules, and make them persistent with your
+  distribution's mechanism or they vanish on reboot.
+- iptables `-I` inserts at the top and nft `add rule` appends at the end, so
+  an earlier reject rule can still win under nft. Inspect the order.
+- FreeBSD may run IPFW or IPFILTER instead of pf. Detect rather than assume:
+  `sysrc pf_enable ipfw_enable ipfilter_enable`. `pfctl -f` replaces the
+  loaded ruleset, so a bad file changes live policy; run `pfctl -nf` first.
+- Docker bridge: published ports are inserted by Docker ahead of ufw's
+  rules and can bypass ufw, so host INPUT rules alone are not container
+  policy. Check what is actually published.
+- The `firewall-cmd --permanent` plus `--reload` pair re-applies the whole
+  permanent configuration; runtime-only changes you made earlier are lost.
+
+### Cloud layer (separate from the host)
+
+| Provider | Where | Change with |
+|---|---|---|
+| AWS | security group inbound rules, and the subnet's network ACL (stateless: allow the return traffic too) | EC2 console, or `aws ec2 authorize-security-group-ingress` |
+| GCP | VPC firewall rule targeting the instance | Cloud console, or `gcloud compute firewall-rules create` |
+| Azure | NSG at the subnet and again on the NIC; both must allow it | Portal, or `az network nsg rule create` |
+| Home or office | router NAT or port forward to the host | the router's admin page |
+
+These are changed in the provider console or CLI. Nothing on the host
+can change them, and a host rule that looks right still fails if any layer
+above it drops the packet.
+
+### If activation fails anyway
+
+- Probe from a **different host**, not from the box itself. Loopback can
+  bypass the firewall and report success for a port the internet cannot
+  reach.
+- tcp: `nc -vz <public-ip> 443`. udp has no handshake, so a quiet result
+  proves little; capture on the extender (`tcpdump -ni any udp port 443`)
+  while you send from the other host and see whether packets arrive.
+- ICMP "admin prohibited" is the signature of a reject rule. A silent drop
+  looks like a plain timeout. Both mean a firewall, not a server fault.
+- Re-read the failure line: `[extender]activate v<n> err = ` carries the
+  per-attempt causes (G3).
+
 ## 1. Original proposal
 
 - Extender speaks tcp 443, udp 443, dns and http3/dtls
@@ -616,6 +712,8 @@ name the api host on port 443 as their destination.
 
 C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
 it passes at least one required test. Every other carrier is optional.
+(Operators: the ports must be open on the host and the cloud layer first,
+see "Before you activate: open the ports" at the top.)
 
 - Required, at least one of:
   - Public tcp 443. The activation probe dials the caller's public address
