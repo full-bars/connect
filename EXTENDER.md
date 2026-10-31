@@ -30,7 +30,7 @@ differs).
   `CAP_NET_BIND_SERVICE`. The role binds it only when `--dns_privileged_port`
   (connectctl) or `ProvideExtenderDnsPrivilegedPort` (sn) is set. If that
   bind fails, the failure is logged, 53 is not offered, and the dns carrier
-  keeps 4053, so activation still runs. A blocked 53 does not refuse an
+  keeps 4053, so the dns carrier is still offered on 4053. A blocked 53 does not refuse an
   activation while 4053 answers; the record lists only the dns ports that
   answered.
 - Host firewall changes do not open AWS security groups, GCP VPC firewall,
@@ -47,11 +47,11 @@ differs).
   activate.
 - Bind failures on the host are not the same as blocked ports. A carrier
   that fails to bind is logged (`[extender] listen error (<carrier>)`) and
-  is not offered, so the activation goes on without it, except tcp 443: with
-  no tcp listener the server refuses the activation.
+  is not offered, so the activation request proceeds without offering that carrier,
+  except tcp 443: with no tcp listener the server refuses the activation.
 - In practice a blocked carrier shows up as `<carrier> carrier did not
-  answer`, which reads like a server fault and is usually your firewall. That
-  text is on the `[extender]activate v<n> refused =` line.
+  answer`, which reads like a server fault and is usually a host or cloud
+  firewall. That text is on the `[extender]activate v<n> refused =` line.
 - Best single diagnostic: if tcp 443 answers from another host but udp 443
   does not, suspect a host or cloud firewall, not the provider.
 - A rejected UDP probe often returns ICMP "admin prohibited". Most QUIC
@@ -99,7 +99,7 @@ Notes that bite:
   rules and can bypass ufw, so host INPUT rules alone are not container
   policy. Check what is actually published.
 - The `firewall-cmd --permanent` plus `--reload` pair re-applies the whole
-  permanent configuration; runtime-only changes you made earlier are lost.
+  permanent configuration; runtime-only changes made earlier are lost.
 
 ### Cloud layer (separate from the host)
 
@@ -114,14 +114,14 @@ These are changed in the provider console or CLI. Nothing on the host
 can change them, and a host rule that looks right still fails if any layer
 above it drops the packet.
 
-### If activation fails anyway
+### If probes fail once activation is live
 
 - Probe from a **different host**, not from the box itself. Loopback can
   bypass the firewall and report success for a port the internet cannot
   reach.
 - tcp: `nc -vz <public-ip> 443`. udp has no handshake, so a quiet result
   proves little; capture on the extender (`tcpdump -ni any udp port 443`)
-  while you send from the other host and see whether packets arrive.
+  while sending from the other host to see whether packets arrive.
 - ICMP "admin prohibited" is the signature of a reject rule. A silent drop
   looks like a plain timeout. Both mean a firewall, not a server fault.
 - Re-read the failure lines. `[extender]activate v<n> err =` carries the
