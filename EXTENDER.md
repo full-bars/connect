@@ -40,19 +40,20 @@ Run as root (or elevated). Each row is the open command, then a check.
 Detect which firewall is actually active first; more than one can be
 installed and only one is enforcing.
 
+Rows are grouped desktop-first: Windows and macOS, then Linux (common firewalls first), then FreeBSD. The cloud layer is separate and comes last.
 | Platform | Open | Verify |
 |---|---|---|
+| Windows (elevated PowerShell) | `New-NetFirewallRule -DisplayName "extender tcp 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow; New-NetFirewallRule -DisplayName "extender udp" -Direction Inbound -Protocol UDP -LocalPort 443,4053 -Action Allow` | `Get-NetFirewallRule -DisplayName "extender*"` |
+| macOS | System Settings, Network, Firewall: allow the app. Add any custom pf rules as in the FreeBSD row | `/usr/libexec/ApplicationFirewall/socketfilterfw --listapps` |
 | firewalld (AlmaLinux, Rocky, RHEL, Fedora) | `firewall-cmd --permanent --add-service=https --add-service=http3 --add-port=4053/udp && firewall-cmd --reload` | `firewall-cmd --list-all` |
 | ufw (Ubuntu, Debian) | `ufw allow 443/tcp && ufw allow 443/udp && ufw allow 4053/udp` | `ufw status verbose` |
 | nftables (bare) | `nft add rule inet filter input tcp dport 443 accept; nft add rule inet filter input udp dport '{ 443, 4053 }' accept` | `nft list ruleset` |
 | iptables (bare) | `iptables -I INPUT -p tcp --dport 443 -j ACCEPT && iptables -I INPUT -p udp -m multiport --dports 443,4053 -j ACCEPT` | `iptables -S INPUT` |
 | openSUSE, SLES (firewalld) | same as the firewalld row | `firewall-cmd --list-all` |
 | openSUSE, SLES (SuSEfirewall2, legacy) | add `443` to `FW_SERVICES_EXT_TCP` and `443 4053` to `FW_SERVICES_EXT_UDP` in `/etc/sysconfig/SuSEfirewall2`, then `SuSEfirewall2 start` | `iptables -S INPUT` |
-| FreeBSD (pf) | add `pass in proto tcp to port 443` and `pass in proto udp to port { 443, 4053 }` to `/etc/pf.conf`, test with `pfctl -nf /etc/pf.conf`, load with `pfctl -f /etc/pf.conf` | `pfctl -sr` |
 | Docker, host networking | uses the host rules above | the host row's verify |
 | Docker, bridge networking | `docker run -p 443:443/tcp -p 443:443/udp -p 4053:4053/udp ...` | `docker port <container>` |
-| Windows (elevated PowerShell) | `New-NetFirewallRule -DisplayName "extender tcp 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow; New-NetFirewallRule -DisplayName "extender udp" -Direction Inbound -Protocol UDP -LocalPort 443,4053 -Action Allow` | `Get-NetFirewallRule -DisplayName "extender*"` |
-| macOS | System Settings, Network, Firewall: allow the app. Add any custom pf rules as in the FreeBSD row | `/usr/libexec/ApplicationFirewall/socketfilterfw --listapps` |
+| FreeBSD (pf) | add `pass in proto tcp to port 443` and `pass in proto udp to port { 443, 4053 }` to `/etc/pf.conf`, test with `pfctl -nf /etc/pf.conf`, load with `pfctl -f /etc/pf.conf` | `pfctl -sr` |
 
 Notes that bite:
 
