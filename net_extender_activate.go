@@ -1616,6 +1616,7 @@ func activationLogAddress(apiURL string) string {
 }
 
 var activationJWT = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
+
 // The matcher stops at whitespace only, and the punctuation a sentence puts
 // after a url is trimmed from the tail. Excluding quotes inside the character
 // class would truncate a url whose query value contains one, and whatever came
