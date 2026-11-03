@@ -132,6 +132,68 @@ type ExtenderActivateResult struct {
 	// the operator has room for this family's next post (C2, connect#230). 0
 	// on every other answer, and from an operator that predates the field.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	// the dns ports that passed their probe, ascending, which is what the
+	// operator stores and signs (L2). Empty when the dns carrier was not
+	// offered, when no port answered, and from an operator that predates the
+	// field.
+	DnsPorts []int `json:"dns_ports,omitempty"`
+	// the optional carriers this extender was offered and did not answer, each
+	// dns port that did not, with the operator's timing (C2a). They are left
+	// out of the stored address and the signed record, so the extender is
+	// published on the carriers that answered and no others. Empty on a
+	// refusal, which probes no optional carrier, and from an operator that
+	// predates the field.
+	RefusedCarriers []*ExtenderCarrierRefusal `json:"refused_carriers,omitempty"`
+	// every step the operator's probe ran, in the order run: the tcp
+	// challenge, the forward through it, each dns port, then quic, with how
+	// long each ran, how much of the probe budget was left when it started,
+	// and how it ended (C2). A refusal's last step is the one that refused it.
+	// Empty when the activation was refused before anything was probed, and
+	// from an operator that predates the field (connect#230).
+	ProbeSteps []*ExtenderProbeStep `json:"probe_steps,omitempty"`
+}
+
+// One optional carrier this extender was offered and did not answer, with the
+// timing that tells a late answer from no answer at all (C2a, connect#230).
+//
+// The wire names are the operator's: this type is decoded from the activation
+// answer, not encoded for it.
+type ExtenderCarrierRefusal struct {
+	// tcp, quic or dns
+	Carrier string `json:"carrier"`
+	// the port the carrier was probed on
+	Port int `json:"port"`
+	// why the probe failed, in the operator's words
+	Error string `json:"error"`
+	// how long the probe ran
+	ElapsedMs int64 `json:"elapsed_ms"`
+	// how much of the activation's probe budget was left when the probe
+	// started. A dns port is also bounded by its own budget.
+	BudgetLeftMs int64 `json:"budget_left_ms"`
+}
+
+// One step of the operator's probe, timed on the operator's clock (C2).
+//
+// The steps share one probe budget, so a step that ran out of it is told apart
+// from one that failed on its own, and from one starved by the steps before it.
+// That is the difference a refusal's bare error text hides: an extender that
+// answered late and an extender that never answered read the same
+// (connect#230).
+type ExtenderProbeStep struct {
+	// tcp, forward, dns or quic
+	Name string `json:"name"`
+	// the family the step dialed, 4 or 6
+	IpVersion int `json:"ip_version"`
+	// the extender port the step dialed. The forward runs over the tcp carrier
+	// and names its port here.
+	Port int `json:"port"`
+	// how long the step ran
+	ElapsedMs int64 `json:"elapsed_ms"`
+	// how much of the activation's probe budget was left when the step started
+	BudgetLeftMs int64 `json:"budget_left_ms"`
+	// ok; error, the step failed before its budget ran out; or timeout, its
+	// budget ran out before it answered
+	Outcome string `json:"outcome"`
 }
 
 // PostExtenderActivate posts one activation to one family api url (C2). The
@@ -1764,6 +1826,11 @@ func (self *ExtenderActivator) activateUrl(
 			retryAfter = time.Duration(result.RetryAfterSeconds) * time.Second
 		}
 		self.log.Infof("[extender] activate v%d refused carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), duration.Round(time.Millisecond), trace.attempts.Load(), activationLogText(message, jwt, apiUrl))
+		// where the operator's probe spent its budget. A refusal reads the
+		// same whether the extender answered late or never, and the step
+		// timings are the only thing that tells them apart (connect#230).
+		// Silent from an operator that predates probe_steps.
+		self.logProbeSteps(ipVersion, result.ProbeSteps)
 		self.recordFailure(ipVersion, now, message, true, duration)
 		return extenderActivateRefused, retryAfter
 	}
@@ -1847,6 +1914,51 @@ func (self *ExtenderActivator) applyRecords(result *ExtenderActivateResult) {
 	}
 	for _, recordBase64 := range result.Bootstrap {
 		apply(recordBase64)
+	}
+}
+
+// logProbeSteps reports where the operator's probe spent its budget on the
+// refusal that ended it (connect#230).
+//
+// The refusing step is the last one the operator ran, so its name, its outcome
+// and the budget left when it started are the answer to "did my extender answer
+// late, or not at all". Nothing is logged when the answer carries no steps,
+// which is every operator that predates the field, so an old answer logs
+// exactly what it logged before.
+func (self *ExtenderActivator) logProbeSteps(ipVersion int, probeSteps []*ExtenderProbeStep) {
+	steps := make([]*ExtenderProbeStep, 0, len(probeSteps))
+	for _, step := range probeSteps {
+		if step != nil {
+			steps = append(steps, step)
+		}
+	}
+	if len(steps) == 0 {
+		return
+	}
+	refusing := steps[len(steps)-1]
+	self.log.Infof(
+		"[extender]activate v%d probe stopped at %s on port %d: %s after %dms with %dms of the budget left when it started\n",
+		ipVersion,
+		refusing.Name,
+		refusing.Port,
+		refusing.Outcome,
+		refusing.ElapsedMs,
+		refusing.BudgetLeftMs,
+	)
+	if !self.log.V(1).Enabled() {
+		return
+	}
+	for _, step := range steps {
+		self.log.Infof(
+			"[extender]activate v%d probe step %s ipv%d port=%d outcome=%s elapsed_ms=%d budget_left_ms=%d\n",
+			ipVersion,
+			step.Name,
+			step.IpVersion,
+			step.Port,
+			step.Outcome,
+			step.ElapsedMs,
+			step.BudgetLeftMs,
+		)
 	}
 }
 
