@@ -667,6 +667,7 @@ func dialExtenderTcpLegacyConn(
 		}
 	}()
 
+	setExtenderProbePhase(ctx, "handshake")
 	var serverConn net.Conn
 	if extenderConfig.Profile.Fragment || extenderConfig.Profile.Reorder {
 		rconn := NewResilientTlsConn(conn, extenderConfig.Profile.Fragment, extenderConfig.Profile.Reorder)
@@ -701,6 +702,7 @@ func dialExtenderTcpLegacyConn(
 		serverConn = tlsServerConn
 	}
 
+	setExtenderProbePhase(ctx, "request")
 	// the extender's Date is an authenticated time source only when the leaf
 	// was checked under the record key (B3)
 	streamConn, response, err := extenderStreamRequest(
@@ -884,6 +886,9 @@ func dialExtenderQuic(
 	quicTlsConfig := extenderTlsConfig.Clone()
 	quicTlsConfig.NextProtos = []string{http3.NextProtoH3}
 	installQuicSendFlight(policy.quicConfig)
+	// QUIC establishes the connection and TLS together; failures cannot be
+	// assigned to one half without guessing.
+	setExtenderProbePhase(ctx, "dial/handshake")
 	quicConn, err := quicTransport.Dial(ctx, udpAddr, quicTlsConfig, policy.quicConfig)
 	if err != nil {
 		return nil, nil, err
@@ -892,6 +897,7 @@ func dialExtenderQuic(
 	flight := quicSendFlightForConn(quicConn)
 	flight.bind(quicConn)
 
+	setExtenderProbePhase(ctx, "request")
 	h3Transport := &http3.Transport{MaxResponseHeaderBytes: ExtenderMaxHeaderByteCount}
 	clientConn := h3Transport.NewClientConn(quicConn)
 	stream, err := clientConn.OpenRequestStream(ctx)

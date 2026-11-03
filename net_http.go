@@ -2150,6 +2150,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
 	if result, ok, err := self.httpPlatformDirect(request); ok {
+		traceExtenderActivationAttempt(request.Context())
 		if err != nil {
 			return nil, fmt.Errorf("http request failed: %w", err)
 		}
@@ -2173,6 +2174,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		dialStart := time.Now()
 		timing := &dialTiming{}
 		sendTime := extenderCamouflageLocalNow()
+		traceExtenderActivationAttempt(request.Context())
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
@@ -2209,6 +2211,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		dialStart := time.Now()
 		timing := &dialTiming{}
 		sendTime := extenderCamouflageLocalNow()
+		traceExtenderActivationAttempt(request.Context())
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
 		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)

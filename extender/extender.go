@@ -434,6 +434,12 @@ type ExtenderSettings struct {
 	// a socket without binding a privileged port. Nil retains
 	// net.ListenPacket. The extender owns and closes returned endpoints.
 	ListenPacket func(network string, address string) (net.PacketConn, error)
+	// BindOwnerDetail, when set, names what holds a port whose bind failed
+	// with EADDRINUSE; the text is appended to the bind failure log. The
+	// library runs no utility itself, so a caller that wants the owner (the
+	// miner or cli, for example by asking `ss`) supplies the lookup. Nil logs
+	// only that the port is in use.
+	BindOwnerDetail func(transport string, port int, err error) string
 	// DialContext, when set, creates the forwarded inner connection. Userspace
 	// integration tests use it for the extender-to-connect segment. Nil
 	// retains forwardDialer. The extender owns and closes returned connections.
@@ -1261,11 +1267,11 @@ func (self *ExtenderServer) addCarrierWithLock(carrier string) {
 	delete(self.carrierListenErrs, carrier)
 }
 
-// Reports one carrier bind failure (G2). The carrier is disabled; the log line
-// is unconditional because a bind that failed is a configuration fact an
-// operator needs, and the handler is what the sdk provider role reads.
+// Records one carrier bind failure (G2). The carrier is disabled; the handler is
+// what the sdk provider role reads. The bind helpers have already logged the
+// failure with its carrier, port and owner, which an operator needs whether or
+// not the bind is the first one.
 func (self *ExtenderServer) reportListenError(carrier string, err error) {
-	log.Printf("[extender] listen error (%s): %s", carrier, err)
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()

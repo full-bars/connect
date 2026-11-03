@@ -773,8 +773,33 @@ func spliceProberReceiveByteCount(t *testing.T, fixture *extenderFixture) int {
 		n, err := conn.Read(buffer)
 		received += n
 		if err != nil {
-			return received
+			break
 		}
+	}
+	// The splice and relayed-byte counters are written by the relay goroutine,
+	// which can land after this prober has read its bytes. Every caller asserts
+	// on that ledger, so settle it once here instead of making each test wait.
+	waitForSpliceLedger(t, fixture)
+	return received
+}
+
+// waitForSpliceLedger blocks until the per-target ledger shows both a splice
+// and relayed bytes for the test target, or fails after a bounded wait. The
+// counters are cumulative stats, so waiting here is safe even for callers that
+// later drain the report ledger.
+func waitForSpliceLedger(t *testing.T, fixture *extenderFixture) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var loads map[string]ExtenderCamouflageTargetLoad
+	for {
+		loads = fixture.server.CamouflageStats().TargetLoads
+		if load, ok := loads[testBorrowName]; ok && 0 < load.SpliceCount && 0 < load.RelayedByteCount {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("splice ledger for %s did not settle: %+v", testBorrowName, loads)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
