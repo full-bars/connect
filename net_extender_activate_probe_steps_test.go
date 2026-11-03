@@ -129,20 +129,25 @@ func TestExtenderActivateResultWithoutProbeSteps(t *testing.T) {
 }
 
 // A logger whose verbose levels are on, so the debug branch of the step log can
-// be exercised without glog.
+// be exercised without glog. The verbose sink writes to the same recorder, which
+// is what proves the step list goes through V(1).Infof rather than Infof.
 type testVerboseActivateLogger struct {
 	testActivateLogger
 }
 
 func (self *testVerboseActivateLogger) V(level int32) Verbose {
-	return testEnabledVerbose{}
+	return testEnabledVerbose{log: &self.testActivateLogger}
 }
 
-type testEnabledVerbose struct{}
+type testEnabledVerbose struct {
+	log *testActivateLogger
+}
 
-func (testEnabledVerbose) Enabled() bool        { return true }
-func (testEnabledVerbose) Info(args ...any)     {}
-func (testEnabledVerbose) Infof(string, ...any) {}
+func (testEnabledVerbose) Enabled() bool { return true }
+
+func (self testEnabledVerbose) Info(args ...any) { self.log.Info(args...) }
+
+func (self testEnabledVerbose) Infof(format string, args ...any) { self.log.Infof(format, args...) }
 
 func newTestActivatorForLog(log Logger) *ExtenderActivator {
 	return &ExtenderActivator{log: log}
@@ -186,6 +191,29 @@ func TestLogProbeStepsAtInfo(t *testing.T) {
 	}
 	if strings.Contains(line, "probe step tcp") {
 		t.Errorf("the probe line %q carries the per-step list at info", line)
+	}
+}
+
+// In the fallback mode the loop tracks no family, so the refusal carries v0. The
+// summary names the family the operator actually probed instead, since that is
+// the fact the line exists to report.
+func TestLogProbeStepsFallbackNamesTheOperatorsFamily(t *testing.T) {
+	log := &testActivateLogger{}
+	steps := []*ExtenderProbeStep{
+		{Name: "tcp", IpVersion: 6, Port: 443, ElapsedMs: 900, BudgetLeftMs: 10000, Outcome: "ok"},
+		{Name: "forward", IpVersion: 6, Port: 443, ElapsedMs: 300, BudgetLeftMs: 900, Outcome: "timeout"},
+	}
+	newTestActivatorForLog(log).logProbeSteps(0, steps)
+
+	if len(log.lines) != 1 {
+		t.Fatalf("logged %d lines, expected 1: %v", len(log.lines), log.lines)
+	}
+	line := log.lines[0]
+	if !strings.Contains(line, "activate v6 probe stopped") {
+		t.Errorf("the fallback refusal line %q does not name the probed family", line)
+	}
+	if strings.Contains(line, "v0") {
+		t.Errorf("the fallback refusal line %q reports v0", line)
 	}
 }
 

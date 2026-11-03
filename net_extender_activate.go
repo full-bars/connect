@@ -1936,9 +1936,15 @@ func (self *ExtenderActivator) logProbeSteps(ipVersion int, probeSteps []*Extend
 		return
 	}
 	refusing := steps[len(steps)-1]
+	// in the fallback mode the answer's own family is the only one known, since
+	// the post went to the plain api url and the loop tracks no family for it
+	refusingIpVersion := ipVersion
+	if refusingIpVersion == 0 {
+		refusingIpVersion = refusing.IpVersion
+	}
 	self.log.Infof(
 		"[extender]activate v%d probe stopped at %s on port %d: %s after %dms with %dms of the budget left when it started\n",
-		ipVersion,
+		refusingIpVersion,
 		refusing.Name,
 		refusing.Port,
 		refusing.Outcome,
@@ -1949,7 +1955,9 @@ func (self *ExtenderActivator) logProbeSteps(ipVersion int, probeSteps []*Extend
 		return
 	}
 	for _, step := range steps {
-		self.log.Infof(
+		// the step list is debug output, so it goes to the verbose sink rather
+		// than the info one: an embedder may route the two apart
+		self.log.V(1).Infof(
 			"[extender]activate v%d probe step %s ipv%d port=%d outcome=%s elapsed_ms=%d budget_left_ms=%d\n",
 			ipVersion,
 			step.Name,
