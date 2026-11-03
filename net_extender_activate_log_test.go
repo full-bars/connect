@@ -69,6 +69,20 @@ func (self *testActivateLogger) linesWithPrefix(prefix string) []string {
 	return lines
 }
 
+// The logged lines that contain `sub`. A line that starts with an emoji cannot
+// be found by prefix without repeating the emoji in every assertion.
+func (self *testActivateLogger) linesContaining(sub string) []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	lines := []string{}
+	for _, line := range self.lines {
+		if strings.Contains(line, sub) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		tcpCause := errors.New("test tcp dial refused")
@@ -132,7 +146,7 @@ func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 			t.Fatalf("v4 status = %+v, expected a failed activation", status)
 		}
 
-		lines := log.linesWithPrefix("[extender]activate v4 err = ")
+		lines := log.linesContaining("[extender]activate v4 err = ")
 		if len(lines) == 0 {
 			t.Fatal("the failed activation logged no error")
 		}
