@@ -360,3 +360,61 @@ func TestCarrierIpv6ConcurrentDialsAreRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A dial that `allow` admitted before the carrier was marked can fail after the
+// mark. It carries no evidence about the carrier, so it must not count another
+// failure, move the cooldown, or claim a probe failed while the verdict stands.
+// The failure that first crosses the threshold and a failing probe still mark
+// the carrier, which is what keeps the verdict re-armable.
+func TestCarrierIpv6LateFailureAfterMarkAddsNoEvidence(t *testing.T) {
+	clock, lines := withCarrierClock(t)
+	const key = "198.51.100.7:1080"
+	dialErr := errors.New("v6 dial timed out")
+
+	for i := 0; i < carrierIpv6FailureThreshold; i++ {
+		carrierIpv6.done(key, false, dialErr, false)
+	}
+	marked := carrierIpv6.Snapshot()
+	if len(marked) != 1 {
+		t.Fatalf("after %d failures the carrier is not marked: %v", carrierIpv6FailureThreshold, marked)
+	}
+	if marked[0].ConsecutiveFailed != carrierIpv6FailureThreshold {
+		t.Fatalf("failures = %d, want %d", marked[0].ConsecutiveFailed, carrierIpv6FailureThreshold)
+	}
+	firstMark := marked[0].SuppressedUntil
+	loggedBefore := len(*lines)
+
+	// the late failure of a dial admitted before the mark
+	clock.Advance(time.Minute)
+	carrierIpv6.done(key, false, dialErr, false)
+
+	late := carrierIpv6.Snapshot()
+	if len(late) != 1 {
+		t.Fatalf("the late failure dropped the verdict: %v", late)
+	}
+	if late[0].ConsecutiveFailed != carrierIpv6FailureThreshold {
+		t.Errorf("a late failure counted: failures = %d, want %d", late[0].ConsecutiveFailed, carrierIpv6FailureThreshold)
+	}
+	if !late[0].SuppressedUntil.Equal(firstMark) {
+		t.Errorf("a late failure moved the cooldown to %s, want %s", late[0].SuppressedUntil, firstMark)
+	}
+	if len(*lines) != loggedBefore {
+		t.Errorf("a late failure logged %v", (*lines)[loggedBefore:])
+	}
+
+	// the one probe the cooldown allows is evidence: failing it re-arms
+	clock.Advance(carrierIpv6Cooldown)
+	ok, probe := carrierIpv6.allow(key)
+	if !ok || !probe {
+		t.Fatalf("allow after the cooldown = %v/%v, want the single probe", ok, probe)
+	}
+	carrierIpv6.done(key, probe, dialErr, false)
+
+	rearmed := carrierIpv6.Snapshot()
+	if len(rearmed) != 1 {
+		t.Fatalf("a failed probe dropped the verdict: %v", rearmed)
+	}
+	if !rearmed[0].SuppressedUntil.After(firstMark) {
+		t.Errorf("a failed probe did not re-arm: %s, was %s", rearmed[0].SuppressedUntil, firstMark)
+	}
+}

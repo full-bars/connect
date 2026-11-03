@@ -128,6 +128,10 @@ func (self *carrierIpv6Table) done(key string, probe bool, err error, neutral bo
 		entry = &carrierIpv6Entry{}
 		self.entries[key] = entry
 	}
+	if !probe && !entry.suppressedUntil.IsZero() {
+		// a dial admitted before the verdict failed late; it adds no evidence
+		return
+	}
 	entry.failures += 1
 	entry.probing = false
 	if entry.failures < carrierIpv6FailureThreshold {
