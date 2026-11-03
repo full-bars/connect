@@ -228,7 +228,7 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 	settings.ApiUrlV4 = operator.URL
 	settings.ByJwt = func() string { return jwt }
 	settings.ClientStrategy = strategy
-	settings.Carriers = func() []string { return []string{ExtenderCarrierQuic} }
+	settings.Carriers = func() []string { return []string{ExtenderCarrierTcp, ExtenderCarrierQuic} }
 	settings.IpVersionSupported = func(int) bool { return true }
 	settings.AddNetworkChangeListener = func(func()) func() { return func() {} }
 	activator := NewExtenderActivator(ctx, settings)
@@ -249,7 +249,7 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 		t.Fatalf("refusal lines: %v", lines)
 	}
 	line := lines[0]
-	for _, want := range []string{"carriers=quic", "api=127.0.0.1:", "last_remote=127.0.0.1:", "elapsed=", "attempts=", "quic carrier did not answer", "[redacted]"} {
+	for _, want := range []string{"carriers=tcp,quic", "api=127.0.0.1:", "last_remote=127.0.0.1:", "elapsed=", "attempts=", "quic carrier did not answer", "[redacted]"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q from %q", want, line)
 		}
