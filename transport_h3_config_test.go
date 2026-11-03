@@ -2,14 +2,17 @@
 // public DNS transport port.
 package connect
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestPlatformQuicConfigEnablesPathMtuDiscovery prevents a regression to a
 // fixed packet-size ceiling after the underlay or selected endpoint changes.
 // It also pins connection-level keepalive: the application writer can block
 // behind the bounded DATAGRAM queue and cannot own hybrid liveness.
 func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	config := newPlatformQuicConfig(settings, 1)
 	if config.DisablePathMTUDiscovery {
 		t.Fatal("H3 path MTU discovery is disabled")
@@ -58,10 +61,38 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 	}
 }
 
+// QUIC sends a keepalive PING once the peer has been quiet for its keepalive
+// period, which quic-go caps at half the idle timeout, and closes the
+// connection one idle timeout after the first ack-eliciting packet the peer
+// leaves unanswered. At PingTimeout a dead peer is found within PingTimeout
+// plus the idle timeout of its last packet, 25s with the defaults; the
+// application ping cannot keep that bound by itself
+// (TestH3DeadPeerFoundWithinPingTimeoutPlusIdleTimeout).
+func TestPlatformQuicConfigKeepAliveIsPingTimeout(t *testing.T) {
+	defaultPingTimeout := DefaultPlatformTransportSettings().PingTimeout
+	for _, pingTimeout := range []time.Duration{defaultPingTimeout, 250 * time.Millisecond, 30 * time.Second} {
+		settings := testingDefaultPlatformTransportSettings()
+		settings.PingTimeout = pingTimeout
+		config := newPlatformQuicConfig(settings, 1)
+		if config.KeepAlivePeriod != pingTimeout || config.MaxIdleTimeout != 4*pingTimeout {
+			t.Fatalf("ping timeout %s: QUIC keepalive=%s idle timeout=%s, want %s and %s",
+				pingTimeout, config.KeepAlivePeriod, config.MaxIdleTimeout, pingTimeout, 4*pingTimeout)
+		}
+		if config.MaxIdleTimeout/2 < config.KeepAlivePeriod {
+			t.Fatalf("ping timeout %s: quic-go caps the %s keepalive at half the %s idle timeout",
+				pingTimeout, config.KeepAlivePeriod, config.MaxIdleTimeout)
+		}
+	}
+	config := newPlatformQuicConfig(testingDefaultPlatformTransportSettings(), 1)
+	if detection := config.KeepAlivePeriod + config.MaxIdleTimeout; 25*time.Second < detection {
+		t.Fatalf("default dead-peer detection can take %s, want at most 25s", detection)
+	}
+}
+
 // TestPlatformQuicConfigDefaultsZeroReceiveWindows preserves compatibility
 // with callers that construct partial PlatformTransportSettings literals.
 func TestPlatformQuicConfigDefaultsZeroReceiveWindows(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.H3InitialStreamReceiveWindowByteCount = 0
 	settings.H3MaxStreamReceiveWindowByteCount = 0
 	settings.H3InitialConnectionReceiveWindowByteCount = 0
@@ -86,7 +117,7 @@ func TestPlatformQuicConfigDefaultsZeroReceiveWindows(t *testing.T) {
 // per-device target reaches quic-go instead of being replaced by process
 // defaults at carrier construction.
 func TestPlatformQuicConfigUsesDeviceMemoryTargetReceiveWindows(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
 	config := newPlatformQuicConfig(settings, 1)
 	if config.InitialStreamReceiveWindow != uint64(settings.H3InitialStreamReceiveWindowByteCount) ||
 		config.MaxStreamReceiveWindow != uint64(settings.H3MaxStreamReceiveWindowByteCount) ||
@@ -106,14 +137,14 @@ func TestPlatformQuicConfigUsesDeviceMemoryTargetReceiveWindows(t *testing.T) {
 // The private edge/server listener is UDP/4053 (with 8053 retained only during
 // migration), but client traffic must still reach public DNS and rely on DNAT.
 func TestPlatformDnsTransportUsesPublicPort(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	if settings.DnsPort != 53 {
 		t.Fatalf("DNS-encoded QUIC destination port=%d want=53", settings.DnsPort)
 	}
 }
 
 func TestPlatformDnsPumpUsesStableWhoDisHost(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	if settings.DnsPumpHost != DefaultDnsPumpHost {
 		t.Fatalf("DNS pump host=%q want %q", settings.DnsPumpHost, DefaultDnsPumpHost)
 	}

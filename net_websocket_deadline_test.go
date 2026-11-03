@@ -37,6 +37,38 @@ type webSocketDeadlineConn struct {
 	closedOnce   sync.Once
 	closedNotify chan struct{}
 	writeStarted chan struct{}
+	// every deadline installation reaching the socket, in order
+	deadlineInstalls []webSocketDeadlineInstall
+	// the write deadline the socket holds after those installations
+	writeDeadline time.Time
+}
+
+// One deadline installation as the socket saw it.
+type webSocketDeadlineInstall struct {
+	// "deadline", "read" or "write", the setter that installed it
+	setter   string
+	deadline time.Time
+}
+
+// Forgets the installations so far, such as the upgrade handshake's.
+func (self *webSocketDeadlineConn) resetDeadlineInstalls() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.deadlineInstalls = nil
+}
+
+// The installations since the last reset.
+func (self *webSocketDeadlineConn) deadlineInstallsSnapshot() []webSocketDeadlineInstall {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([]webSocketDeadlineInstall(nil), self.deadlineInstalls...)
+}
+
+// The write deadline the socket holds now.
+func (self *webSocketDeadlineConn) writeDeadlineSnapshot() time.Time {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.writeDeadline
 }
 
 // The initial request contains only invented host/header data from the dialer.
@@ -104,26 +136,35 @@ func (self *webSocketDeadlineConn) RemoteAddr() net.Addr { return nil }
 func (self *webSocketDeadlineConn) SetDeadline(deadline time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.deadlineInstalls = append(self.deadlineInstalls, webSocketDeadlineInstall{setter: "deadline", deadline: deadline})
 	if deadline.IsZero() && self.clearErr != nil {
 		return self.clearErr
 	}
 	if self.readErr != nil {
 		return self.readErr
 	}
+	if self.writeErr == nil {
+		self.writeDeadline = deadline
+	}
 	return self.writeErr
 }
 
 // Read errors are returned without changing the synthetic byte source.
-func (self *webSocketDeadlineConn) SetReadDeadline(time.Time) error {
+func (self *webSocketDeadlineConn) SetReadDeadline(deadline time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.deadlineInstalls = append(self.deadlineInstalls, webSocketDeadlineInstall{setter: "read", deadline: deadline})
 	return self.readErr
 }
 
 // Write errors do not by themselves prevent a delegated write in the RED case.
-func (self *webSocketDeadlineConn) SetWriteDeadline(time.Time) error {
+func (self *webSocketDeadlineConn) SetWriteDeadline(deadline time.Time) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.deadlineInstalls = append(self.deadlineInstalls, webSocketDeadlineInstall{setter: "write", deadline: deadline})
+	if self.writeErr == nil {
+		self.writeDeadline = deadline
+	}
 	return self.writeErr
 }
 
@@ -165,6 +206,8 @@ func TestWebSocketDeadlineActualControlRejectsInnerError(t *testing.T) {
 }
 
 // Previously retained bytes cannot escape through a later flush after rejection.
+// The second frame installs a new deadline: one the socket already holds, as
+// gorilla's repeated zero, is not installed again and cannot be rejected.
 func TestWebSocketDeadlineBufferedFramesAreRetired(t *testing.T) {
 	ws, adapter, raw := newWebSocketDeadlineFixture(t)
 	adapter.BeginWriteBatch()
@@ -175,6 +218,9 @@ func TestWebSocketDeadlineBufferedFramesAreRetired(t *testing.T) {
 		t.Fatal("fixture did not retain a complete ready frame")
 	}
 	raw.writeErr = errors.New("synthetic second-frame deadline rejected")
+	if err := ws.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	err := ws.WriteMessage(websocket.BinaryMessage, []byte("second complete frame"))
 	flushErr := adapter.FlushWriteBatch()
 	if !errors.Is(err, raw.writeErr) || !errors.Is(flushErr, raw.writeErr) || raw.writeCount != 0 || len(adapter.writeBuffer) != 0 {

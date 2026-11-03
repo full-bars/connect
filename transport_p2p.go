@@ -1419,6 +1419,61 @@ func (self *P2pSendTransport) takePendingProbe(probeBurst int) []byte {
 	}
 }
 
+// The legacy writer's physical write deadline (CPUOPT2 §9.2 finding 1). Each
+// install is a timer change on the SCTP stream, so a busy carrier should not
+// install one per message. A write keeps the installed deadline while it is
+// still ahead: an earlier write armed it WriteTimeout after it started, so it
+// is never later than this write's own. Once it has passed, the next write
+// installs its own, WriteTimeout after it starts. A busy carrier installs
+// about one deadline per WriteTimeout.
+//
+// A kept deadline is earlier than the write's own, so it can fire before the
+// write has had its whole WriteTimeout. That write then installs its own
+// deadline and is written again (extendToOwn): a timed-out SCTP write sent
+// nothing, since the stream rolls the message back. So a blocked physical
+// write still fails exactly WriteTimeout after it starts, as when every write
+// installed its own deadline.
+//
+// One writer at a time owns a value.
+type p2pWriteDeadline struct {
+	timeout time.Duration
+	// zero until the first write, and after a write with its own deadline
+	deadline time.Time
+}
+
+func newP2pWriteDeadline(timeout time.Duration) p2pWriteDeadline {
+	return p2pWriteDeadline{
+		timeout: timeout,
+	}
+}
+
+// The deadline for a write that starts at now, and whether it changed and
+// must be installed before the write.
+func (self *p2pWriteDeadline) next(now time.Time) (time.Time, bool) {
+	if !self.deadline.IsZero() && now.Before(self.deadline) {
+		return self.deadline, false
+	}
+	self.deadline = now.Add(self.timeout)
+	return self.deadline, true
+}
+
+// After a write that started at start timed out under the installed deadline,
+// the write's own deadline, and whether that is later, so the write must
+// install it and be written again.
+func (self *p2pWriteDeadline) extendToOwn(start time.Time) (time.Time, bool) {
+	own := start.Add(self.timeout)
+	if self.deadline.IsZero() || !self.deadline.Before(own) {
+		return self.deadline, false
+	}
+	self.deadline = own
+	return own, true
+}
+
+// Forgets the installed deadline after a write installed its own.
+func (self *p2pWriteDeadline) clear() {
+	self.deadline = time.Time{}
+}
+
 func (self *P2pSendTransport) run() {
 	var legacyQueue *p2pLegacySendQueue
 	defer close(self.done)
@@ -1463,24 +1518,52 @@ func (self *P2pSendTransport) run() {
 	}()
 
 	var pairRecorded atomic.Bool
+	// The physical writes are serialized, by this goroutine before the legacy
+	// queue exists and then by the queue's handoff, so they share one
+	// installed deadline.
+	legacyWriteDeadline := newP2pWriteDeadline(self.settings.WriteTimeout)
 	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
-		if deadline.IsZero() {
-			deadline = time.Now().Add(self.settings.WriteTimeout)
+		writeStart := time.Now()
+		ownDeadline := !deadline.IsZero()
+		installDeadline := true
+		if ownDeadline {
+			// a write with its own deadline replaces the installed one, so the
+			// next write arms afresh
+			legacyWriteDeadline.clear()
+		} else {
+			deadline, installDeadline = legacyWriteDeadline.next(writeStart)
 		}
 		progressObserver := self.settings.ProgressObserver
 		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
 			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
 			TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
 		}, transferFrameBytes)
-		self.conn.SetWriteDeadline(deadline)
+		if installDeadline {
+			self.conn.SetWriteDeadline(deadline)
+		}
 		var nw int
 		var err error
-		if self.delay != nil {
-			// one SCTP message is one physical write, stamped here for the
-			// send worker and the legacy queue worker alike
-			nw, err = self.delay.writeLegacy(self.conn, transferFrameBytes)
-		} else {
-			nw, err = self.conn.Write(transferFrameBytes)
+		for {
+			if self.delay != nil {
+				// one SCTP message is one physical write, stamped here for the
+				// send worker and the legacy queue worker alike
+				nw, err = self.delay.writeLegacy(self.conn, transferFrameBytes)
+			} else {
+				nw, err = self.conn.Write(transferFrameBytes)
+			}
+			var timeoutErr interface{ Timeout() bool }
+			if ownDeadline || nw != 0 || !errors.As(err, &timeoutErr) || !timeoutErr.Timeout() {
+				break
+			}
+			// A deadline kept from an earlier write ran out before this write
+			// had its own WriteTimeout. One SCTP message is all or nothing, so
+			// the timed-out write sent nothing and is written again under its
+			// own deadline.
+			ownWriteDeadline, retry := legacyWriteDeadline.extendToOwn(writeStart)
+			if !retry {
+				break
+			}
+			self.conn.SetWriteDeadline(ownWriteDeadline)
 		}
 		if nw < len(transferFrameBytes) && err == nil {
 			err = io.ErrShortWrite

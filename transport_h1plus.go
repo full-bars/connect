@@ -7,6 +7,7 @@ import (
 
 // The custom carrier drains the same ACK/ordinary lanes and limits as H1 WS,
 // then encodes their ready payloads once through Framer's shared scratch API.
+// One native write deadline bounds the whole batch.
 func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
 	var owned [platformWebSocketWriteBatchMaxMessages][]byte
 	var priorityOwned [platformWebSocketWriteBatchMaxMessages]bool

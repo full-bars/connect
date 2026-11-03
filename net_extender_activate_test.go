@@ -84,10 +84,20 @@ type testActivateOperator struct {
 	stateLock     sync.Mutex
 	clientAddress string
 	// non-empty refuses every activation with this message
-	refusal    string
-	postCounts map[int]int
+	refusal string
+	// non-empty refuses every activation of that family with this message,
+	// ahead of `refusal`
+	familyRefusals map[int]string
+	// the `retry_after_seconds` a refusal carries, 0 for none (connect#230)
+	retryAfterSeconds int
+	// the address an activation of a family is answered with, by family; the
+	// family's fixed address while unset
+	publishedIps map[int]string
+	postCounts   map[int]int
 	// how an activation that is not refused is answered
 	answer testActivateAnswer
+	// while set, an activation is answered only once this closes, or its caller goes
+	answerHold chan struct{}
 	// the addresses this extender has activated, by family. One record names
 	// every one of them, as the operator's does from its address rows (C1, C2).
 	activatedIps map[int]string
@@ -109,6 +119,8 @@ func newTestActivateOperator(
 		posts:          make(chan *testActivatePost, 64),
 		hellos:         make(chan struct{}, 64),
 		clientAddress:  testActivateIpv4 + ":41001",
+		familyRefusals: map[int]string{},
+		publishedIps:   map[int]string{},
 		postCounts:     map[int]int{},
 		activatedIps:   map[int]string{},
 	}
@@ -153,6 +165,10 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		now := self.clock.Now()
 		self.stateLock.Lock()
 		refusal := self.refusal
+		if familyRefusal := self.familyRefusals[ipVersion]; familyRefusal != "" {
+			refusal = familyRefusal
+		}
+		retryAfterSeconds := self.retryAfterSeconds
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
 		self.stateLock.Unlock()
@@ -160,12 +176,23 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		case self.posts <- &testActivatePost{ipVersion: ipVersion, args: args, postTime: now}:
 		default:
 		}
+		self.stateLock.Lock()
+		answerHold := self.answerHold
+		self.stateLock.Unlock()
+		if answerHold != nil {
+			select {
+			case <-answerHold:
+			case <-r.Context().Done():
+				return
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if refusal != "" {
 			json.NewEncoder(w).Encode(&ExtenderActivateResult{
-				Activated: false,
-				Error:     refusal,
+				Activated:         false,
+				Error:             refusal,
+				RetryAfterSeconds: retryAfterSeconds,
 			})
 			return
 		}
@@ -214,6 +241,9 @@ func (self *testActivateOperator) activateResult(
 		ip = testActivateIpv6
 	}
 	self.stateLock.Lock()
+	if publishedIp, ok := self.publishedIps[ipVersion]; ok {
+		ip = publishedIp
+	}
 	self.activatedIps[ipVersion] = ip
 	activatedIps := []string{}
 	for _, activatedIpVersion := range []int{4, 6} {
@@ -305,6 +335,36 @@ func (self *testActivateOperator) setAnswer(answer testActivateAnswer) {
 	self.answer = answer
 }
 
+// Refuses every activation of one family, ahead of the refusal of every
+// family; "" ends it.
+func (self *testActivateOperator) setFamilyRefusal(ipVersion int, refusal string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.familyRefusals[ipVersion] = refusal
+}
+
+// The `retry_after_seconds` every refusal carries from now on, 0 for none
+// (connect#230).
+func (self *testActivateOperator) setAnswerHold(answerHold chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.answerHold = answerHold
+}
+
+func (self *testActivateOperator) setRetryAfterSeconds(retryAfterSeconds int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.retryAfterSeconds = retryAfterSeconds
+}
+
+// Answers the activations of one family with `ip`, as the operator publishes
+// the address it saw.
+func (self *testActivateOperator) setPublishedIp(ipVersion int, ip string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.publishedIps[ipVersion] = ip
+}
+
 func (self *testActivateOperator) postCount(ipVersion int) int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -322,6 +382,9 @@ type testActivatorFixture struct {
 	directory *ExtenderDirectory
 	operator  *testActivateOperator
 	activator *ExtenderActivator
+	// what it was built from, for one that replaces it
+	activatorSettings *ExtenderActivatorSettings
+	activatorCtx      context.Context
 
 	publicKey ed25519.PublicKey
 
@@ -338,6 +401,34 @@ type testActivatorFixture struct {
 
 func newTestActivatorFixture(
 	t *testing.T,
+	configure func(settings *ExtenderActivatorSettings),
+) *testActivatorFixture {
+	t.Helper()
+	return newTestActivatorFixtureWithOperator(t, nil, configure)
+}
+
+// newTestActivatorFixture with `prepare` run on the operator before the
+// activator starts, so its first pass already meets what `prepare` set.
+func newTestActivatorFixtureWithOperator(
+	t *testing.T,
+	prepare func(operator *testActivateOperator),
+	configure func(settings *ExtenderActivatorSettings),
+) *testActivatorFixture {
+	t.Helper()
+	return newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		if prepare != nil {
+			prepare(fixture.operator)
+		}
+	}, configure)
+}
+
+// newTestActivatorFixture with `prepare` run once the operator, the directory
+// and the extender key exist and before the activator starts, so its first
+// pass already meets what `prepare` set: the operator's answers, or the records
+// a restart finds in the directory.
+func newTestActivatorFixtureWithPrepare(
+	t *testing.T,
+	prepare func(fixture *testActivatorFixture),
 	configure func(settings *ExtenderActivatorSettings),
 ) *testActivatorFixture {
 	t.Helper()
@@ -367,6 +458,9 @@ func newTestActivatorFixture(
 			ExtenderCarrierQuic,
 			ExtenderCarrierDns,
 		},
+	}
+	if prepare != nil {
+		prepare(fixture)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -406,6 +500,8 @@ func newTestActivatorFixture(
 	if configure != nil {
 		configure(settings)
 	}
+	fixture.activatorSettings = settings
+	fixture.activatorCtx = ctx
 	fixture.activator = NewExtenderActivator(ctx, settings)
 	t.Cleanup(func() {
 		fixture.activator.Close()
@@ -671,10 +767,16 @@ func TestExtenderActivatorSkipsEmptyAndUnsupportedFamilies(t *testing.T) {
 // advancing between the wake and the post would stamp the next time instead of
 // the one under test.
 func TestExtenderActivatorBacksOffOnRefusal(t *testing.T) {
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
-		settings.ApiUrlV6 = ""
-	})
-	fixture.operator.setRefusal("the tcp carrier did not answer")
+	// refused from before the loop starts, so its first post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+		},
+	)
 	startTime := fixture.clock.Now()
 
 	fixture.waitPass()
@@ -759,6 +861,300 @@ func TestExtenderActivatorBacksOffOnRefusal(t *testing.T) {
 	}
 	if count := fixture.operator.postCount(4); count != beforeCount+1 {
 		t.Fatalf("posts after the reset = %d, expected %d", count, beforeCount+1)
+	}
+}
+
+// A family that passed is not posted again when only the other family failed
+// (connect#230). The refused family retries on its own backoff and the family
+// that passed waits out its own 24 hour tick. Before, a refusal of either
+// family held the whole pass and every retry re-posted both, so a fleet whose
+// ipv6 failed everywhere spent its ipv4 activation budget again on every
+// retry, reissuing records it already held.
+func TestExtenderActivatorRetriesOnlyTheFamilyThatFailed(t *testing.T) {
+	// refused from before the loop starts, so the first ipv6 post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setFamilyRefusal(6, "the tcp carrier did not answer")
+		},
+		nil,
+	)
+	startTime := fixture.clock.Now()
+
+	fixture.waitPass()
+	for range 2 {
+		fixture.waitPost()
+	}
+	if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+		t.Fatalf("activated v%d, expected v4", ipVersion)
+	}
+
+	// expects the next post at `postTime`, from the family named, after a
+	// pass barrier one minute short of it proves the pass before it finished
+	expectPost := func(name string, ipVersion int, postTime time.Time) {
+		t.Helper()
+		fixture.step(postTime.Sub(fixture.clock.Now()) - time.Minute)
+		fixture.clock.advance(time.Minute)
+		fixture.wake()
+		post := fixture.waitPost()
+		if post.ipVersion != ipVersion || post.postTime != postTime {
+			t.Fatalf(
+				"%s: v%d posted at %s, expected v%d at %s",
+				name, post.ipVersion, post.postTime.Sub(startTime),
+				ipVersion, postTime.Sub(startTime))
+		}
+	}
+	// the counts once the pass of the last post has finished
+	expectPostCounts := func(name string, v4Count int, v6Count int) {
+		t.Helper()
+		fixture.step(time.Minute)
+		if count := fixture.operator.postCount(4); count != v4Count {
+			t.Fatalf("%s: v4 posts = %d, expected %d", name, count, v4Count)
+		}
+		if count := fixture.operator.postCount(6); count != v6Count {
+			t.Fatalf("%s: v6 posts = %d, expected %d", name, count, v6Count)
+		}
+	}
+
+	// ipv6 retries on its own backoff, 10 then 20 minutes, alone
+	expectPost("the first v6 retry", 6, startTime.Add(10*time.Minute))
+	expectPost("the second v6 retry", 6, startTime.Add(30*time.Minute))
+	expectPostCounts("the v6 retries", 1, 3)
+	status := fixture.activator.Status()
+	if family := status.Family(4); !family.Activated || family.LastActivationTime != startTime {
+		t.Fatalf("v4 status = %+v, expected activated at the start", family)
+	}
+	if family := status.Family(6); family.Activated || !family.LastRefused {
+		t.Fatalf("v6 status = %+v, expected refused", family)
+	}
+
+	// ipv6 passes on its next retry, 40 minutes on
+	fixture.operator.setFamilyRefusal(6, "")
+	v6ActivateTime := startTime.Add(70 * time.Minute)
+	expectPost("the v6 retry that passes", 6, v6ActivateTime)
+	if ipVersion := fixture.waitActivation(); ipVersion != 6 {
+		t.Fatalf("activated v%d, expected v6", ipVersion)
+	}
+	expectPostCounts("the v6 activation", 1, 4)
+
+	// each family re-activates on its own tick
+	expectPost("the v4 tick", 4, startTime.Add(24*time.Hour))
+	expectPostCounts("the v4 tick", 2, 4)
+	expectPost("the v6 tick", 6, v6ActivateTime.Add(24*time.Hour))
+	expectPostCounts("the v6 tick", 2, 5)
+}
+
+// The holds the activation loop ends its passes with, read through its
+// PassAfter seam. The loop calls the seam once a pass has posted, recorded
+// what came back and set every family's schedule, so a hold read here never
+// races the post that set it. With no address check and no resume watch the
+// hold is exactly the time until the next activation, and the loop moves on
+// only when the test wakes it.
+type testActivatePassHolds struct {
+	holds chan time.Duration
+}
+
+func newTestActivatePassHolds() *testActivatePassHolds {
+	return &testActivatePassHolds{
+		holds: make(chan time.Duration, 64),
+	}
+}
+
+func (self *testActivatePassHolds) configure(settings *ExtenderActivatorSettings) {
+	settings.HelloUrl = ""
+	settings.ResumeCheckTimeout = 0
+	settings.PassAfter = func(wait time.Duration) <-chan time.Time {
+		self.holds <- wait
+		// never fires: the test wakes the loop
+		return nil
+	}
+}
+
+// The hold the next pass ends with.
+func (self *testActivatePassHolds) next(t *testing.T, name string) time.Duration {
+	t.Helper()
+	select {
+	case hold := <-self.holds:
+		return hold
+	case <-time.After(30 * time.Second):
+		t.Fatalf("%s: the activator did not end a pass", name)
+		return 0
+	}
+}
+
+// A refusal that says when the operator has room again (`retry_after_seconds`,
+// connect#230) holds the family exactly that long, within a minute and six
+// hours, and does not double the backoff. Before, the loop read nothing from
+// the refusal: a fleet refused by its account's activation budget, which had
+// room again in 50 minutes, retried at 10, 30 and 70 minutes, and each retry
+// that came too early was refused again.
+func TestExtenderActivatorWaitsTheOperatorsRetryAfter(t *testing.T) {
+	const refusal = "You have reached the maximum number of attempts for activating " +
+		"your account's extenders over IPv4 in the last hour. Please try again in 50 minutes."
+	passHolds := newTestActivatePassHolds()
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal(refusal)
+			operator.setRetryAfterSeconds(50 * 60)
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			passHolds.configure(settings)
+		},
+	)
+	startTime := fixture.clock.Now()
+
+	// each post is refused with the wait of its case, and the loop holds the
+	// family for the case's hold before it posts again
+	cases := []struct {
+		name              string
+		retryAfterSeconds int
+		hold              time.Duration
+	}{
+		// where the backoff would hold 10 and then 20 minutes
+		{name: "a refusal with 50 minutes", retryAfterSeconds: 50 * 60, hold: 50 * time.Minute},
+		{name: "a second refusal with 50 minutes", retryAfterSeconds: 50 * 60, hold: 50 * time.Minute},
+		{name: "a refusal with five seconds", retryAfterSeconds: 5, hold: time.Minute},
+		{name: "a refusal with a week", retryAfterSeconds: 7 * 24 * 60 * 60, hold: 6 * time.Hour},
+		// the waits asked for left the backoff at its floor
+		{name: "a refusal with no wait", retryAfterSeconds: 0, hold: 10 * time.Minute},
+		{name: "a second refusal with no wait", retryAfterSeconds: 0, hold: 20 * time.Minute},
+	}
+	postTime := startTime
+	for i, c := range cases {
+		fixture.operator.setRetryAfterSeconds(c.retryAfterSeconds)
+		if 0 < i {
+			fixture.clock.advance(cases[i-1].hold)
+			fixture.wake()
+		}
+		post := fixture.waitPost()
+		if post.postTime != postTime {
+			t.Fatalf("%s: posted at %s, expected %s", c.name, post.postTime.Sub(startTime), postTime.Sub(startTime))
+		}
+		if hold := passHolds.next(t, c.name); hold != c.hold {
+			t.Fatalf("%s: the loop holds the family %s, expected %s", c.name, hold, c.hold)
+		}
+		status := fixture.activator.Status().Family(4)
+		if status.Activated || status.LastError != refusal || !status.LastRefused {
+			t.Fatalf("%s: status = %+v, expected the operator's refusal", c.name, status)
+		}
+		postTime = postTime.Add(c.hold)
+	}
+}
+
+// The plain api url, whose one post a cycle names no family until the answer
+// does, waits the operator's `retry_after_seconds` the same way
+// (connect#230).
+func TestExtenderActivatorWaitsTheRetryAfterThroughThePlainApiUrl(t *testing.T) {
+	passHolds := newTestActivatePassHolds()
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("The operator is busy probing other extenders. Please try again in 30 minutes.")
+			operator.setRetryAfterSeconds(30 * 60)
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrl = settings.ApiUrlV4
+			settings.ApiUrlV4 = ""
+			settings.ApiUrlV6 = ""
+			passHolds.configure(settings)
+		},
+	)
+
+	fixture.waitPost()
+	if hold := passHolds.next(t, "the refusal"); hold != 30*time.Minute {
+		t.Fatalf("the loop holds the plain api url %s, expected 30m0s", hold)
+	}
+}
+
+// A refusal that names when the operator has room again probed nothing, so it
+// says nothing about whether a private family's NAT forwards (connect#230):
+// such a family waits out the named wait, not the day that a refusal of a
+// private family that has never activated holds it for. A refusal of its
+// probe, which names no wait, then holds it for the day.
+func TestExtenderActivatorWaitsTheRetryAfterOfAPrivateFamily(t *testing.T) {
+	passHolds := newTestActivatePassHolds()
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("You have reached the maximum number of attempts for activating " +
+				"an extender from this address over IPv4 in the last hour. Please try again in 30 minutes.")
+			operator.setRetryAfterSeconds(30 * 60)
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			settings.IpVersionPublic = func(ipVersion int) bool {
+				return false
+			}
+			passHolds.configure(settings)
+		},
+	)
+
+	fixture.waitPost()
+	if hold := passHolds.next(t, "the budget's refusal"); hold != 30*time.Minute {
+		t.Fatalf("the loop holds the private family %s after the budget's refusal, expected 30m0s", hold)
+	}
+
+	fixture.operator.setRefusal("the tcp carrier did not answer")
+	fixture.operator.setRetryAfterSeconds(0)
+	fixture.clock.advance(30 * time.Minute)
+	fixture.wake()
+	fixture.waitPost()
+	if hold := passHolds.next(t, "the probe's refusal"); hold != 24*time.Hour {
+		t.Fatalf("the loop holds the private family %s after its probe's refusal, expected 24h0m0s", hold)
+	}
+}
+
+// A wake that arrives as a pass starts is not lost. The loop read its clock and
+// then subscribed to its wakes, so a wake between the two was missed by the
+// subscribe while its pass ran on the time before it, found nothing due, and
+// went back to wait with nothing to end the wait. The clock read makes the
+// interleaving exact here: the first pass's read returns its time and then
+// advances the clock and wakes the loop, as a test's step does. On a loaded
+// host that window took
+// TestExtenderActivatorPostsAFamilyThatGainsAnAddressLate, whose first step
+// lands as the activation's own directory change starts the next pass.
+func TestExtenderActivatorKeepsAWakeThatArrivesAsAPassStarts(t *testing.T) {
+	var clockReads atomic.Int64
+	var prepared *testActivatorFixture
+	fixture := newTestActivatorFixtureWithPrepare(
+		t,
+		func(fixture *testActivatorFixture) {
+			prepared = fixture
+			// a refusal applies no record, so no directory change of the
+			// pass's own can end the wait in the wake's place
+			fixture.operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			settings.ResumeCheckTimeout = 0
+			// nothing but a wake ends the wait
+			settings.PassAfter = func(wait time.Duration) <-chan time.Time {
+				return nil
+			}
+			settings.Now = func() time.Time {
+				now := prepared.clock.Now()
+				// the resume watch takes the first read, and the first pass
+				// the second
+				if clockReads.Add(1) == 2 {
+					prepared.clock.advance(time.Hour)
+					prepared.wake()
+				}
+				return now
+			}
+		},
+	)
+
+	// the first pass, on the time before the wake
+	fixture.waitPass()
+	fixture.waitPost()
+	// the pass the wake asked for, an hour on, with the hold of the first
+	// pass's refusal run out
+	fixture.waitPass()
+	fixture.waitPost()
+	if count := fixture.operator.postCount(4); count != 2 {
+		t.Fatalf("v4 posts = %d, expected 2", count)
 	}
 }
 
@@ -959,12 +1355,18 @@ func TestExtenderActivatorUsesThePlainApiUrl(t *testing.T) {
 // in the status: it is held under the placeholder family until an answer names
 // one (C2, F3).
 func TestExtenderActivatorRecordsAPlainApiUrlRefusal(t *testing.T) {
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
-		settings.ApiUrl = settings.ApiUrlV4
-		settings.ApiUrlV4 = ""
-		settings.ApiUrlV6 = ""
-	})
-	fixture.operator.setRefusal("the tcp carrier did not answer")
+	// refused from before the loop starts, so its first post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrl = settings.ApiUrlV4
+			settings.ApiUrlV4 = ""
+			settings.ApiUrlV6 = ""
+		},
+	)
 
 	fixture.waitPass()
 	fixture.waitPost()
@@ -1267,6 +1669,19 @@ func TestExtenderActivateResultJsonContract(t *testing.T) {
 	}
 	if refused.ExpireTime != nil {
 		t.Fatalf("refusal expire time = %v, expected none", refused.ExpireTime)
+	}
+	if refused.RetryAfterSeconds != 0 {
+		t.Fatalf("refusal retry after = %d, expected none", refused.RetryAfterSeconds)
+	}
+
+	// a refusal that says when the operator has room again (connect#230)
+	budgetRefusal := `{"activated":false,"error":"Please try again in 2 minutes.","retry_after_seconds":95}`
+	budgetRefused := &ExtenderActivateResult{}
+	if err := json.Unmarshal([]byte(budgetRefusal), budgetRefused); err != nil {
+		t.Fatal(err)
+	}
+	if budgetRefused.Activated || budgetRefused.RetryAfterSeconds != 95 {
+		t.Fatalf("budget refusal = %+v, expected a retry after of 95 seconds", budgetRefused)
 	}
 }
 

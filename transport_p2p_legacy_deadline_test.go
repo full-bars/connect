@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"slices"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -252,6 +254,192 @@ func TestP2pLegacyQueuedWriteCannotExtendTransferAckLifetime(t *testing.T) {
 		if got.err == nil || got.at != started.Add(30*time.Second) || ctx.Err() != nil ||
 			sequence.resendQueue.Len() != 0 || len(sequence.ackLifetimes.items) != 0 {
 			t.Fatalf("ACK lifetime changed: terminal=%+v elapsed=%s carrier=%v resend=%d lifetimes=%d", got, got.at.Sub(started), ctx.Err(), sequence.resendQueue.Len(), len(sequence.ackLifetimes.items))
+		}
+	})
+}
+
+// Counts the write deadlines the legacy writer installs on its connection.
+type p2pWriteDeadlineCountingConn struct {
+	stateLock          sync.Mutex
+	writeCount         int
+	writeDeadlineCount int
+	written            chan struct{}
+}
+
+func (self *p2pWriteDeadlineCountingConn) Write(message []byte) (int, error) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.writeCount += 1
+	}()
+	self.written <- struct{}{}
+	return len(message), nil
+}
+
+func (self *p2pWriteDeadlineCountingConn) SetWriteDeadline(time.Time) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.writeDeadlineCount += 1
+	return nil
+}
+
+func (self *p2pWriteDeadlineCountingConn) counts() (int, int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.writeCount, self.writeDeadlineCount
+}
+
+func (self *p2pWriteDeadlineCountingConn) Read([]byte) (int, error)        { return 0, io.EOF }
+func (self *p2pWriteDeadlineCountingConn) Close() error                    { return nil }
+func (self *p2pWriteDeadlineCountingConn) LocalAddr() net.Addr             { return &net.IPAddr{} }
+func (self *p2pWriteDeadlineCountingConn) RemoteAddr() net.Addr            { return &net.IPAddr{} }
+func (self *p2pWriteDeadlineCountingConn) SetDeadline(time.Time) error     { return nil }
+func (self *p2pWriteDeadlineCountingConn) SetReadDeadline(time.Time) error { return nil }
+
+// 64 messages a millisecond apart install the physical write deadline once:
+// the first write installs WriteTimeout and the rest keep it, since 64 ms of
+// messages never reach it. Before CPUOPT2, every message installed one.
+func TestP2pLegacyWriteDeadlineInstalledPerBurstNotPerMessage(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		conn := &p2pWriteDeadlineCountingConn{written: make(chan struct{})}
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		transport, route := NewP2pSendTransport(ctx, cancel, conn, NewId(), settings)
+		defer func() {
+			cancel()
+			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		const messageCount = 64
+		for index := range messageCount {
+			time.Sleep(time.Millisecond)
+			route <- legacyQueueTestPacket(uint32(index), 1200)
+			<-conn.written
+		}
+		synctest.Wait()
+		writeCount, writeDeadlineCount := conn.counts()
+		if writeCount != messageCount {
+			t.Fatalf("%d messages written, expected %d", writeCount, messageCount)
+		}
+		if writeDeadlineCount != 1 {
+			t.Fatalf("%d write deadlines installed for %d messages, expected 1", writeDeadlineCount, messageCount)
+		}
+	})
+}
+
+// Records the write deadlines the legacy writer installs on a pipe.
+type p2pWriteDeadlineRecordingConn struct {
+	net.Conn
+	stateLock      sync.Mutex
+	writeDeadlines []time.Time
+}
+
+func (self *p2pWriteDeadlineRecordingConn) SetWriteDeadline(t time.Time) error {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.writeDeadlines = append(self.writeDeadlines, t)
+	}()
+	return self.Conn.SetWriteDeadline(t)
+}
+
+func (self *p2pWriteDeadlineRecordingConn) installedWriteDeadlines() []time.Time {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.writeDeadlines)
+}
+
+// A write that starts under a deadline kept from an earlier write, and blocks
+// past it, installs its own deadline when the kept one fires and is written
+// again. A carrier that takes it before its own WriteTimeout ends receives it
+// once and intact, and stays up. Writes start at 0 s (installing 15 s), 12 s
+// (keeping 15 s, then installing its own 27 s when 15 s passes) and 20 s
+// (keeping 27 s); the carrier reads them at 12 s, 20 s and 22 s.
+func TestP2pLegacyWriteOutlastingAKeptDeadlineIsWrittenAgainUnderItsOwn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		left, right := net.Pipe()
+		defer left.Close()
+		defer right.Close()
+		budget := NewTransferMemoryBudget(kib(512))
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		var writes []TransferProgressEvent
+		settings.ProgressObserver = func(event TransferProgressEvent) {
+			if event.Stage == "p2p_write_end" {
+				writes = append(writes, event)
+			}
+		}
+		deadlineConn := &p2pWriteDeadlineRecordingConn{Conn: left}
+		transport, route := NewP2pSendTransport(ctx, cancel, &p2pLegacyQueueBudgetTestConn{Conn: deadlineConn, budget: budget}, NewId(), settings)
+		defer func() {
+			cancel()
+			left.Close()
+			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+			if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
+				t.Errorf("unbalanced physical/queued ownership: %+v", stats)
+			}
+		}()
+		if settings.WriteTimeout != 15*time.Second {
+			t.Fatalf("the test assumes a 15 s write timeout, got %s", settings.WriteTimeout)
+		}
+
+		start := time.Now()
+		for index := range 3 {
+			route <- legacyQueueTestPacket(uint32(index), 1200)
+		}
+		synctest.Wait()
+		for index, readAt := range []time.Duration{12 * time.Second, 20 * time.Second, 22 * time.Second} {
+			time.Sleep(time.Until(start.Add(readAt)))
+			packet := make([]byte, 1200)
+			if _, err := io.ReadFull(right, packet); err != nil {
+				t.Fatalf("packet %d at %s: %v", index, readAt, err)
+			}
+			if binary.BigEndian.Uint32(packet) != uint32(index) ||
+				!bytes.Equal(packet[4:], bytes.Repeat([]byte{byte(index)}, len(packet)-4)) {
+				t.Fatalf("packet %d lost its identity or payload", index)
+			}
+			synctest.Wait()
+		}
+		// nothing was written twice
+		if err := right.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := right.Read(make([]byte, 1200)); n != 0 || err == nil {
+			t.Fatalf("the carrier received %d more bytes after the three packets, err %v", n, err)
+		}
+
+		if ctx.Err() != nil {
+			t.Fatalf("the carrier was torn down: %v", ctx.Err())
+		}
+		expectedElapsed := []time.Duration{12 * time.Second, 8 * time.Second, 2 * time.Second}
+		if len(writes) != len(expectedElapsed) {
+			t.Fatalf("physical writes=%+v, expected %d", writes, len(expectedElapsed))
+		}
+		for index, write := range writes {
+			if !write.Success || write.ElapsedNanos != int64(expectedElapsed[index]) {
+				t.Fatalf("physical write %d=%+v, expected a success after %s", index, write, expectedElapsed[index])
+			}
+		}
+		installedWriteDeadlines := deadlineConn.installedWriteDeadlines()
+		expectedWriteDeadlines := []time.Time{start.Add(15 * time.Second), start.Add(27 * time.Second)}
+		if !slices.EqualFunc(installedWriteDeadlines, expectedWriteDeadlines, time.Time.Equal) {
+			t.Fatalf("installed write deadlines %v after the start, expected 15 s and 27 s", func() []time.Duration {
+				offsets := []time.Duration{}
+				for _, installedWriteDeadline := range installedWriteDeadlines {
+					offsets = append(offsets, installedWriteDeadline.Sub(start))
+				}
+				return offsets
+			}())
 		}
 	})
 }

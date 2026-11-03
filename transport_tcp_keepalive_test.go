@@ -10,9 +10,12 @@ import (
 	"time"
 )
 
-// A platform transport runs its own heartbeat, so the sockets it dials leave TCP
-// keepalive off. Every other platform dial keeps the default keepalive.
-func TestPlatformTransportDialLeavesTcpKeepAliveOff(t *testing.T) {
+// Every platform dial keeps TCP keepalive at the ConnectSettings cadence,
+// including a platform transport's. The transport's own heartbeat notices a
+// dead peer only at its read deadline (30 s after the last frame), while
+// keepalive notices it about 10 s after the last packet, so the heartbeat is
+// not a substitute.
+func TestPlatformTransportDialKeepsTcpKeepAlive(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +37,7 @@ func TestPlatformTransportDialLeavesTcpKeepAliveOff(t *testing.T) {
 	for _, transport := range []bool{false, true} {
 		dialCtx := ctx
 		if transport {
-			dialCtx = withPlatformTransportDial(ctx)
+			dialCtx = (&PlatformTransport{}).dialContext(ctx)
 		}
 		conn, err := settings.DialContext(dialCtx, "tcp", listener.Addr().String())
 		if err != nil {
@@ -42,15 +45,9 @@ func TestPlatformTransportDialLeavesTcpKeepAliveOff(t *testing.T) {
 		}
 		enabled := tcpKeepAliveEnabled(t, conn.(*net.TCPConn))
 		conn.Close()
-		if enabled == transport {
-			t.Fatalf("platform transport dial=%t: TCP keepalive=%t", transport, enabled)
+		if !enabled {
+			t.Fatalf("platform transport dial=%t: TCP keepalive is off", transport)
 		}
-	}
-}
-
-func TestPlatformTransportDialContextIsMarked(t *testing.T) {
-	if !isPlatformTransportDial((&PlatformTransport{}).dialContext(context.Background())) {
-		t.Fatal("platform transport dial context is not marked")
 	}
 }
 

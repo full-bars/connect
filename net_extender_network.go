@@ -9,6 +9,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -234,6 +235,27 @@ func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 	}
 }
 
+// An ip literal, with its port or zone, in the text of an error. What it matches
+// is only an address once it parses (extenderErrorText).
+var extenderErrorAddressToken = regexp.MustCompile(`[0-9A-Fa-f:.]*[:.][0-9A-Fa-f:.]*(?:%[0-9A-Za-z_.-]+)?`)
+
+// The text of an error for a default-level log line or the status, with every
+// address taken out. A failed dial names the address it dialed, and sometimes this
+// host's own, and a client holds gated records whose addresses no public channel
+// carries, while its logs and status leave the device in feedback and support. The
+// lines that name an address sit behind a verbosity someone opted into.
+func extenderErrorText(err error) string {
+	return extenderErrorAddressToken.ReplaceAllStringFunc(err.Error(), func(token string) string {
+		literal := strings.TrimRight(token, ":.")
+		_, addrErr := netip.ParseAddr(literal)
+		_, addrPortErr := netip.ParseAddrPort(literal)
+		if addrErr != nil && addrPortErr != nil {
+			return token
+		}
+		return "<address>" + token[len(literal):]
+	})
+}
+
 // What the sdk status reports (E3, F2). Comparable, so it rides a
 // MonitorValue and a consumer is woken only on an actual change.
 type ExtenderNetworkClientStatus struct {
@@ -244,7 +266,9 @@ type ExtenderNetworkClientStatus struct {
 	FeedIp     netip.Addr
 	// The time of the last completed sample, zero when there has been none.
 	LastSampleTime time.Time
-	LastError      string
+	// What the last failed sample said, with every address taken out
+	// (extenderErrorText): this reaches the apps' status.
+	LastError string
 	// True once the first attempt has finished, whether or not it produced a
 	// sample. The startup gate reads the same fact from the directory.
 	InitialAttemptDone bool
@@ -529,6 +553,25 @@ func (self *ExtenderNetworkClient) networkChanged() {
 	if feedStream != nil {
 		feedStream.Close()
 	}
+	// the hint and the hello loops share the wake
+	self.hintWake.NotifyAll()
+	self.wakeMonitor.NotifyAll()
+}
+
+// Wake runs a pass now and reads a failed hello and hint again at once, as a
+// path change does, without the path change's other effects: the country, the
+// latency samples and the open subscription are kept. The owner calls it once
+// a seed bundle has made verified extenders dialable (EXTENDER-UPDATE2.md
+// §2.3): the reads that failed for want of reach are worth trying again now,
+// not after the backoffs their failures built up, and the pass that follows
+// dials the seed's records like any other verified candidates.
+func (self *ExtenderNetworkClient) Wake() {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.hintRearmed = true
+		self.helloRearmed = true
+	}()
 	// the hint and the hello loops share the wake
 	self.hintWake.NotifyAll()
 	self.wakeMonitor.NotifyAll()
@@ -840,7 +883,7 @@ func (self *ExtenderNetworkClient) refreshRootKeys() bool {
 	helloResult, err := hello(ctx)
 	if err != nil {
 		if allow, suppressed := self.helloLogThrottle.Allow(self.settings.Now()); allow {
-			self.log.Infof("[extender]hello err = %s%s\n", err, suppressedSuffix(suppressed))
+			self.log.Infof("[extender]hello err = %s%s\n", extenderErrorText(err), suppressedSuffix(suppressed))
 		}
 		return false
 	}
@@ -851,7 +894,7 @@ func (self *ExtenderNetworkClient) refreshRootKeys() bool {
 	// a list of blank entries is as empty as no list: installed, it would
 	// refuse every record until the next answer
 	if keySet, err := NewExtenderRootKeySetFromHex(helloResult.RootPublicKeyHexes...); err != nil {
-		self.log.Infof("[extender]hello root keys err = %s\n", err)
+		self.log.Infof("[extender]hello root keys err = %s\n", extenderErrorText(err))
 		answered = false
 	} else if 0 < keySet.Len() && !keySet.Equal(self.directory.RootKeys()) {
 		self.directory.SetRootKeys(keySet)
@@ -983,7 +1026,7 @@ func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 			}
 			// not fatal: the address answers may still bootstrap, unverified
 			if allow, suppressed := self.bootstrapLogThrottle.Allow(self.settings.Now()); allow {
-				self.log.Infof("[extender]bootstrap txt err = %s%s\n", err, suppressedSuffix(suppressed))
+				self.log.Infof("[extender]bootstrap txt err = %s%s\n", extenderErrorText(err), suppressedSuffix(suppressed))
 			}
 		} else if 0 < len(txts) {
 			// the name answered; whatever parked the bootstrap no longer holds
@@ -1000,11 +1043,11 @@ func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 	for _, txt := range txts {
 		message, err := DecodeExtenderDnsRecord(txt)
 		if err != nil {
-			self.log.Infof("[extender]bootstrap txt record ignored: %s\n", err)
+			self.log.Infof("[extender]bootstrap txt record ignored: %s\n", extenderErrorText(err))
 			continue
 		}
 		if _, err := self.directory.ApplySource(message, ExtenderSourceDns); err != nil {
-			self.log.Infof("[extender]bootstrap txt record refused: %s\n", err)
+			self.log.Infof("[extender]bootstrap txt record refused: %s\n", extenderErrorText(err))
 			continue
 		}
 		applied += 1
@@ -1142,11 +1185,11 @@ func (self *ExtenderNetworkClient) sample() (bool, time.Time) {
 			return true, time.Time{}
 		}
 		if err != nil {
-			self.log.Infof("[extender]feed %s err = %s\n", candidate.Ip, err)
+			self.log.Infof("[extender]feed err = %s\n", extenderErrorText(err))
 			self.updateStatus(func(status *ExtenderNetworkClientStatus) {
 				status.FeedConnected = false
 				status.FeedIp = netip.Addr{}
-				status.LastError = err.Error()
+				status.LastError = extenderErrorText(err)
 			})
 		}
 	}
@@ -1199,6 +1242,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		connectSettings = &self.clientStrategy.settings.ConnectSettings
 	}
 	spoofDomains, _ := directorySpoofDomains(self.directory)
+	borrowCountryCode := directoryBorrowCountryCode(self.directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		select {
 		case <-self.ctx.Done():
@@ -1212,7 +1256,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)
 		if extenderConfig == nil {
 			continue
 		}
@@ -1308,11 +1352,11 @@ func (self *ExtenderNetworkClient) runFeed(
 		switch {
 		case frame.GetRecord() != nil:
 			if _, err := self.directory.ApplyRecord(frame.GetRecord(), ExtenderSourceFeed); err != nil {
-				self.log.Infof("[extender]feed record err = %s\n", err)
+				self.log.Infof("[extender]feed record err = %s\n", extenderErrorText(err))
 			}
 		case frame.GetRevocation() != nil:
 			if _, err := self.directory.ApplyRevocation(frame.GetRevocation()); err != nil {
-				self.log.Infof("[extender]feed revocation err = %s\n", err)
+				self.log.Infof("[extender]feed revocation err = %s\n", extenderErrorText(err))
 			}
 		case frame.GetEndOfSample():
 			sampled = true
@@ -1360,10 +1404,16 @@ func orderedExtenderCarriers(carriers []string) []string {
 // carrier is one dial that races its ports (L2, net_extender_dns_ports.go),
 // so the feed, the probe and the peer pinger try both 53 and 4053 as the
 // strategy does.
+//
+// The tcp config also carries the record's camouflage key and the client's
+// borrow country (borrowCountryCode), so a feed, probe or pinger dial of a
+// Phase B extender authenticates as the strategy's does (EXTENDER-UPDATE2
+// §3.2) rather than being spliced away.
 func extenderFeedConfig(
 	candidate *ExtenderCandidate,
 	connectMode ExtenderConnectMode,
 	spoofDomains []string,
+	borrowCountryCode string,
 ) *ExtenderConfig {
 	profile := ExtenderProfile{
 		ConnectMode: connectMode,
@@ -1388,12 +1438,17 @@ func extenderFeedConfig(
 	if profile.Port <= 0 {
 		return nil
 	}
-	return &ExtenderConfig{
+	extenderConfig := &ExtenderConfig{
 		Profile:   profile,
 		Ip:        candidate.Ip,
 		PublicKey: candidate.PublicKey,
 		DnsPorts:  dnsPorts,
 	}
+	if connectMode == ExtenderConnectModeTcpTls {
+		extenderConfig.RealityPublicKey = candidate.RealityPublicKey
+		extenderConfig.CamouflageCountryCode = borrowCountryCode
+	}
+	return extenderConfig
 }
 
 // The hint (DESIGNNOTES4.md §4).
@@ -1542,7 +1597,7 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	result, err := hint(ctx)
 	if err != nil {
 		if allow, suppressed := self.hintLogThrottle.Allow(self.settings.Now()); allow {
-			self.log.Infof("[extender]hint err = %s%s\n", err, suppressedSuffix(suppressed))
+			self.log.Infof("[extender]hint err = %s%s\n", extenderErrorText(err), suppressedSuffix(suppressed))
 		}
 		self.directory.ExpireCountryHint()
 		return false
@@ -1861,7 +1916,7 @@ func (self *ExtenderNetworkClient) probeFamily(
 		probed = true
 		rtt, outcome, err := self.probeCandidate(candidate, attestor, reporter)
 		if err != nil {
-			self.log.Infof("[extender]probe %s err = %s\n", candidate.Ip, err)
+			self.log.Infof("[extender]probe err = %s\n", extenderErrorText(err))
 			continue
 		}
 		self.directory.RecordLatency(candidate.Ip, rtt, outcome == ExtenderPingCosigned)
@@ -1973,12 +2028,13 @@ func probeExtenderCandidate(
 	count = max(1, count)
 	var resultErr error
 	spoofDomains, _ := directorySpoofDomains(directory)
+	borrowCountryCode := directoryBorrowCountryCode(directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)
 		if extenderConfig == nil {
 			continue
 		}

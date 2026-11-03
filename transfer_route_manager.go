@@ -458,6 +458,10 @@ type RouteManager struct {
 	mutex               sync.Mutex
 	writerMatchState    *MatchState
 	readerMatchState    *MatchState
+	// Whether any transport is registered (HasActiveTransport). Set in the
+	// critical section that changes the transport set, so a consumer can wait
+	// for its carrier to change instead of polling it.
+	activeTransport *MonitorValue[bool]
 
 	// Only snapshots with admitted writers enter these indexes. Physical route
 	// teardown joins by transport, while writer close joins by selector; an
@@ -526,6 +530,7 @@ func NewRouteManagerWithLogger(ctx context.Context, clientTag string, log Logger
 		writerMatchState: NewMatchState(ctx, clientTag, log, true, Transport.MatchesSend),
 		// `weightedRoutes=false` because unless there is a cpu limit this is not needed
 		readerMatchState:                      NewMatchState(ctx, clientTag, log, false, Transport.MatchesReceive),
+		activeTransport:                       NewMonitorValue(false),
 		writerStreamAuthenticatedDestinations: map[Id]map[TransferPath]bool{},
 		writerStreamAliasScopes:               map[Id]*writerStreamAliasScope{},
 		writerStreamAliasGenerations:          map[Id]uint64{},
@@ -1194,6 +1199,8 @@ func (self *RouteManager) UpdateTransportWithProperties(
 	)
 	self.registerPendingWriterSnapshotsWithLock(retiredSnapshots)
 	pendingSnapshots := self.pendingWriterSnapshotsForTransportWithLock(transport)
+	// notifies only when the set turns empty or non-empty
+	self.activeTransport.Set(self.hasActiveTransportWithLock())
 	self.mutex.Unlock()
 	self.transportUpdateLock.Unlock()
 
@@ -1217,7 +1224,19 @@ func (self *RouteManager) HasActiveTransport() bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	return self.hasActiveTransportWithLock()
+}
+
+// must be called with `mutex`
+func (self *RouteManager) hasActiveTransportWithLock() bool {
 	return 0 < len(self.writerMatchState.transportRoutes) || 0 < len(self.readerMatchState.transportRoutes)
+}
+
+// HasActiveTransport with a channel that closes at its next change, taken in
+// one step, so a consumer that waits while a carrier is up wakes when the last
+// one leaves, and one that waits while none is up wakes when one registers.
+func (self *RouteManager) ActiveTransportNotify() (bool, <-chan struct{}) {
+	return self.activeTransport.Get()
 }
 
 // HasActiveUnreliableSendTransport reports whether an active writer carrier
@@ -3400,8 +3419,11 @@ func (self *MultiRouteSelector) readWithCarrier(
 ) ([]byte, transferReceiveDisposition, error) {
 	self.readMutex.Lock()
 	defer self.readMutex.Unlock()
+	// A negative timeout waits with no timer. Only a call that armed the
+	// timer stops it, so a read served without blocking touches no timer.
+	readTimerArmed := false
 	defer func() {
-		if self.readTimer != nil {
+		if readTimerArmed {
 			self.readTimer.Stop()
 		}
 	}()
@@ -3463,6 +3485,7 @@ func (self *MultiRouteSelector) readWithCarrier(
 					return nil, transferReceiveDisposition{}, nil
 				}
 				timeoutChan = resetOrCreateTimer(&self.readTimer, remainingTimeout)
+				readTimerArmed = true
 			}
 			select {
 			case <-ctx.Done():
@@ -3544,6 +3567,7 @@ func (self *MultiRouteSelector) readWithCarrier(
 			} else {
 				// add a timeout case
 				timeoutChan := resetOrCreateTimer(&self.readTimer, remainingTimeout)
+				readTimerArmed = true
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
 					Chan: reflect.ValueOf(timeoutChan),

@@ -6391,3 +6391,87 @@ The fresh four-APK build attempt failed before APK compilation or installation: 
 Full unfiltered six-repository correctness, synthetic PERFVAR and server benchmarks, repeated memory comparisons, and all 112 scoped hosted-H1 device sessions remain outstanding. The iOS profile is measured on the two allowlisted Android devices; it cannot qualify physical iOS total footprint.
 
 Evidence: `/private/tmp/urnetwork-c40-root-original8-results.json`, SHA-256 `a3d027502f4e55be6985409dff3fd27edfe85bc6c9732c32d770cfef128dd6d6`; native `physical-build-only-result.json`, SHA-256 `64aad731049b59cedb2d1e48bf53d14fe870fde35e697f7041c351210c099868`, under `physical-c38-build-cache.PREP.nvwey6qp/native4-full112-c40-6taq995o/native-build/perf/scoped-h1`. Both runs completed cleanup with all owners joined, source unchanged, and cache leases released. Browsing outer-final SHA-256: `55fc04f901a63dc4f0c49ccaab80864dcb069b3da75e9067bd0ddabc59b8d81e`; failed native outer-final SHA-256: `45511c537d62ff432b2992fcc7c82239a0ea71285b280bfda1d7a80bcec7f0a3`.
+
+### 2026-10-31 C47 checkpoint: native SYN custody and outstanding memory qualification
+
+A deterministic public native/Transfer test exposed a pending-claim stall: an identical ordinary native retransmit remained raw on a live quality source, and another quality contender's explicit failure could not dispatch the retained original SYN into the available fallback slot. The unchanged primary test failed with the exact typed marker in normal and race runs. This is a reproduced ownership defect; it does not establish the cause of every browsing pause.
+
+The private candidate attests the fresh caller-owned full packet, source, provide mode, pin and current retained-owner serial under the flow lock. Ordinary `request.serial` stays zero; a separate `nativeOwnerSerial` authorizes only that exact pending claim. The guard reads no queued packet bytes and retains the existing race, generation, admission, reliability and control fences. NEW passed nine normal plus nine race roots, including the unchanged primary, repeated native retransmits, foreign-claim fences, unchanged request-allocation count and balanced retained-control credit. Public accounting after join is not a peak-memory measurement.
+
+The untraced OLD and NEW race pilots each passed 100 HTML navigations and 400 terminal asset outcomes, with 99 overlaps, zero slow navigations and zero public tracked bytes after testcase join. The intentional cancellation counts were 78 OLD and 83 NEW; terminal outcomes include validated or canceled assets, not 400 fully downloaded bodies. NEW's testcase strict PASS completed in 274.637 seconds. The whole owner subsequently closed successfully: all owners joined, the cache was released, source matched, and the actual process exited zero and was reaped with no timeout.
+
+The canonical gate clock is `cold_link.tap_to_first_byte_ns`:
+
+| Run | Median seconds | Nearest-rank p95 seconds | Maximum seconds |
+| --- | ---: | ---: | ---: |
+| OLD | 1.642316792 | 3.030813333 | 4.140502542 |
+| NEW | 1.7324239375 | 3.043127209 | 3.667116583 |
+
+The observed navigation-boundary maxima of `prior_pages`/`prior_assets` were 1/4 OLD and 2/5 NEW. The configured four-page concurrency cap is not an observed peak. This is one descriptive pair with mixed results: NEW's median and nearest-rank p95 were higher and its maximum was lower. Neither pilot reproduced the earlier six-second traced failure. Source/instrumentation and scheduling limits prevent a broad pause-attribution or nondeterminism inference. No overall speedup, statistical qualification or baseline promotion is claimed. `browsing.pages[].first_byte_ns` and `browsing.pressure.navigations[].elapsed_ns` are separate raw-HTML and request-diagnostic clocks; neither replaces the gate clock.
+
+Full-six correctness and SN qualification, the original eight-arm matrix, PERF48/Server60, M40 and physical112 under both 32 MiB and 64 MiB profiles remain open. These observations do not measure a process or mobile-memory peak or qualify a release.
+
+Evidence: OLD unit reproduction — [closed unit owner](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-consumer-repair-runtime.RESULT.w20v6wkr/FINAL-CUSTODY.json) (SHA-256 `c7697fb007bf95eff8cfd26c23a6d7c45be7a15255b549fc4bacc9312948d1e4`); NEW unit result — [closed 18-root owner](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-new18-runtime.RESULT.30_hj9b6/FINAL-CUSTODY.json) (SHA-256 `21e9f819e87360c65bd7fbf586927e3a713aca0816771f953c96322c6c6adf78`); untraced OLD pilot — [closed 100-page owner](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-old-race-pilot-runtime.RESULT.g1rn8uxb/FINAL-CUSTODY.json) (SHA-256 `c8306ee92f1d0da64c1a3e2f1eac0cea866ca5719e20d6a8adfd61babe80163b`). Candidate — [sealed private source](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-native-owner-attestation.WIP.gv2uzv4i/PACKET.json) (SHA-256 `321b2d09781fddf820d05d62b11e9436e946709561e7de3ddb5661e5981e815d`). [Descriptive pair](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-new-race-pilot-runtime.RESULT.988yzz89/PAIRED-METRICS.json) (SHA-256 `32630cd9294d24bf4c7ee0170db37bba7c7008b70ecf4ce32fbf1c3cdd5abad1`); [Completed NEW testcase report](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-new-race-pilot-runtime.RESULT.988yzz89/FULL100-REPORT.json) (SHA-256 `676bdf13c9595d259d82f363786a0e77eb8aa509d9907edabf2efe32469ead25`). [Closed NEW untraced owner](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/c47-new-race-pilot-runtime.RESULT.988yzz89/FINAL-CUSTODY.json) (SHA-256 `e8bc17703246ef1a1f9546bfa8bd094bcd272f8c7a4ce6da20017f2bfb2651d1`).
+
+Checkpoint integration copies the tested production change and three regression-test files into Connect. The adjacent test tables additionally use explicit field names with unchanged case values and ordering. The results above were collected before integration; the final canonical source still requires the full correctness and performance runs.
+
+
+### 2026-10-31: Original-queue stall reproduction and queue sensitivity
+
+The original hosted-H1 surrogate with inner HTTP/2 reproduced a 6.303 s page-7 tap-to-first-byte stall. All 100 HTML requests and 400 asset outcomes completed, with five stable client/server sessions. The affected origin socket received no post-tap Write call for 5.901 s; socket writes themselves were fast. Global native SDK send calls peaked at 1.485 ms through that snapshot, and all 87 packets submitted between page-6/page-7 snapshots were accepted by the aggregate API. Emitted contract-wait intervals did not overlap the stalled request. These boundaries exclude a synchronous five-second send wait in this occurrence; they do not identify the exact delayed TCP segment.
+
+The surrounding 7.492 s capture interval had 143 uplink packet-count-only queue refusals, 64 aggregate TCP retransmissions and 11 TCP timeouts. These are shared-path counters, not proof that a particular outer H1 socket caused the page stall. The documented nine-packet queue remains an intentional adversarial profile and the five-second gate remains unchanged.
+
+A separate fresh-process sensitivity replay changed only the uplink packet-count ceiling from 9 to 4096, retaining the 12,500-byte bound and reverse queue of 45 packets. Both race-enabled arms passed:
+
+| Uplink packet ceiling | HTML trace median TTFB (lower middle) | P95 nearest rank | Maximum | Combined tap maximum |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 | 402.435 ms | 1329.738 ms | 2842.326 ms | 2842.376 ms |
+| 9 | 867.722 ms | 2164.858 ms | 3767.769 ms | 3768.123 ms |
+
+This is one ordered diagnostic pair, with independent fresh processes; it is not a statistically qualified performance improvement, a production fix, or a replacement for the original queue gate. No shipping queue, timeout, or memory policy was changed. Normal and race-enabled exact-flow replay remains pending. Private scalar TCP and authenticated outer-socket diagnostics are unfinished and have not been compiled or run.
+
+Evidence: closed reproduction `c48-queue-sensitivity-runtime.RESULT.3n1hu3l7/FINAL-CUSTODY.json` (SHA-256 `5500b9177fbae52ac5499f53a0011f899559366c60e43d6fe9292ea08f4b3ed8`); closed sensitivity `c48-queue-newfirst-runtime.RESULT.p8mxzyg9/FINAL-CUSTODY.json` (SHA-256 `7153ecb1befc2dbbd598f78cf06608f04083388d57f50f92c625a65745f367d4`). Both are under `/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/`. Sensitivity exited 0 with all owners joined, unchanged source fingerprint `f373d82f71c6787473ad4f6779ef414e9031927dbdef05a9018d7f36a0353403`, and released cache ownership. Earlier failing runs remain failures.
+
+The full correctness suite, broader PERFVAR comparisons, and real-device MEMSTEADY/PERFVAR qualification for the 32 MiB iOS surrogate and 64 MiB Android profiles remain outstanding. Android cannot qualify a physical iOS extension's total footprint. No final postmortem or overall qualification is claimed.
+
+
+## 2026-11-02: partial physical components and Fast receive-pressure research
+
+The latest Pixel candidate Wi-Fi/H1 collection retained the following component
+results. These are retained Go-runtime observations, including auxiliary samples,
+not continuous process peaks, Android PSS/RSS or a physical iOS footprint.
+
+| Pixel profile | Runtime peak, MiB | Quiet p50, MiB | Fast trials, Mbit/s | Workload result |
+| --- | ---: | ---: | --- | --- |
+| iOS-profile Android surrogate, 32 MiB | 30.39 | 24.75 | 6.2 / 35 / 15 | Valid median 15; numeric 40 Mbit/s goal miss |
+| Android, 64 MiB | 36.39 | 32.21 | 9.9 / invalid 30 / 23 | No valid three-trial median |
+
+The receipts retain exact runtime peaks of 31,871,008 and 38,162,464 bytes.
+The Android second Fast trial reached the
+unchanged 90-second lifecycle bound during `display-poll`: valid=false and
+completed=false. Its displayed 30 Mbit/s is excluded from a throughput median;
+the failed observation remains retained. Both final cells separately report
+memory_eligible=true and owners_joined=true, while workload_eligible=false.
+The later Galaxy attempt failed before traffic/instrumentation and produced no
+memory or throughput measurement. Full cellular collection remains pending.
+
+These APKs predate the private SYN/cohort/queued-wake fixes. The observations
+cannot measure those fixes, establish a causal 64-versus-32 MiB comparison, or
+qualify the complete device/memory/performance matrix. The two profile cells
+were separate public-provider sessions, not a matched memory intervention.
+
+The [read-only Fast investigation](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/fast-bulk-limit-readonly.baWtD1/REPORT.txt)
+observed receive-admission refusals near retained receive-budget saturation.
+Retained admission charges carrier/frame roots and decoded owners, whereas the
+advertised window counts logical bytes. This accounting boundary is a candidate
+bulk-pressure mechanism, not a proven cause of the Fast slowdown or timeout.
+Route/Pack handoff drop counters were zero in these captures. A controlled
+single-sender experiment is prepared but unrun; no receive-budget or production
+default increase is justified by these observations.
+
+Evidence: [Pixel 32 MiB final cell](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/collection/perf/scoped-h1/memsteady-cell-01.json),
+[Pixel 64 MiB final cell](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/collection/perf/scoped-h1/memsteady-cell-02.json),
+[retained invalid Fast observation](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/SECOND-CELL-FAILURE-PACKET.json),
+[Galaxy pre-traffic failure](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-galaxy-first.a_ft2ikx/FIRST-CELL-FAILURE-PACKET.json),
+and [Fast aggregate receipts](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/fast-bulk-limit-readonly.baWtD1/fast-results.json).

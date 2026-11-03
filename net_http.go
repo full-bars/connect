@@ -290,6 +290,15 @@ type ClientStrategySettings struct {
 	// reconnect path (NextReconnectTime). Non-positive removes the cap.
 	KickReconnectLimit int
 
+	// PlatformApiHosts are the hosts of the platform's own api, normalized
+	// (PlatformApiHostNames). The Date of a response from one of them whose tls
+	// chain verified corrects the clock a camouflaged hello seals with, on every
+	// route to the api, an extender's included, since the chain is the api's
+	// (net_extender_camouflage_clock.go). Empty reads no clock. It is meant only
+	// for hosts this strategy's owner trusts to be the platform: a host named
+	// here can move the seal time, and so at worst fail a camouflaged attempt.
+	PlatformApiHosts []string
+
 	// ExtraHeaders, when set, are applied (Set semantics, overriding same-named
 	// headers) to every request this strategy issues: http serial/parallel,
 	// the hello ping, and websocket dials. Intended for test/simulation
@@ -1066,7 +1075,28 @@ func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 // this only for the FIRST dial after a lost connection -- retries after a
 // failed reconnect go back through NextConnectTime, restoring the old pacing
 // exactly when the platform itself is what is failing.
+//
+// The fast path bounds one device's burst, not the fleet's. A platform restart
+// ends every device's connections in the same instant, so a platform
+// transport whose connection died without a network change kick waits out its
+// own spread before it asks for this time
+// (PlatformTransportSettings.ReconnectJitter).
 func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
+	// The staircase step taken past the cap is kept when the wait is
+	// cancelled: this method's release contract is "dial attempt completed",
+	// and handing back a pacing step after a dial that actually happened would
+	// defeat the pacing. Such a leak is bounded by nextConnectMaxLead. The
+	// platform transport gives the step back through nextReconnectTime.
+	next, release, _ := self.nextReconnectTime()
+	return next, release
+}
+
+// nextReconnectTime is NextReconnectTime with the staircase's cancel. A
+// caller past the fast path's cap takes a staircase step, which cancel gives
+// back when its wait ends before it dials, as NextConnectTime's release does.
+// Within the cap, cancel does nothing and release frees the slot. Both are
+// idempotent and never nil.
+func (self *ClientStrategy) nextReconnectTime() (connectTime time.Time, release func(), cancel func()) {
 	acquired := false
 	func() {
 		self.mutex.Lock()
@@ -1079,25 +1109,20 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 	if !acquired {
 		// over the cap: this burst is not small after all; serialize like any
 		// other connect. NextConnectTime takes the mutex itself, so it must be
-		// called with the lock released (done above). The staircase release is
-		// deliberately dropped: this method's release contract is "dial
-		// attempt completed", and handing back a pacing step after a dial that
-		// actually happened would defeat the pacing. A cancelled wait on this
-		// rare over-cap path therefore leaks its step, bounded by
-		// nextConnectMaxLead.
-		next, _ := self.NextConnectTime()
-		return next, func() {}
+		// called with the lock released (done above).
+		next, cancelStep := self.NextConnectTime()
+		return next, func() {}, cancelStep
 	}
 
 	var releaseOnce sync.Once
-	release := func() {
+	release = func() {
 		releaseOnce.Do(func() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 			self.reconnectFastPathCount -= 1
 		})
 	}
-	return time.Now().Add(self.reconnectFastPathJitter()), release
+	return time.Now().Add(self.reconnectFastPathJitter()), release, func() {}
 }
 
 // reconnectFastPathJitter is one draw of the fast path's independent jitter,
@@ -1126,6 +1151,13 @@ func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]
 // reconnect path (NextReconnectTime). The release contract is
 // NextReconnectTime's: call it once the dial attempt completes.
 func (self *ClientStrategy) NextKickReconnectTime() (time.Time, func()) {
+	next, release, _ := self.nextKickReconnectTime()
+	return next, release
+}
+
+// nextKickReconnectTime is NextKickReconnectTime with the cancel of
+// nextReconnectTime, which a caller past the kick cap falls back to.
+func (self *ClientStrategy) nextKickReconnectTime() (connectTime time.Time, release func(), cancel func()) {
 	acquired := false
 	func() {
 		self.mutex.Lock()
@@ -1136,18 +1168,18 @@ func (self *ClientStrategy) NextKickReconnectTime() (time.Time, func()) {
 		}
 	}()
 	if !acquired {
-		return self.NextReconnectTime()
+		return self.nextReconnectTime()
 	}
 
 	var releaseOnce sync.Once
-	release := func() {
+	release = func() {
 		releaseOnce.Do(func() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 			self.kickReconnectCount -= 1
 		})
 	}
-	return time.Now().Add(self.reconnectFastPathJitter()), release
+	return time.Now().Add(self.reconnectFastPathJitter()), release, func() {}
 }
 
 // The weights of dialerWeights with every limited extender dialer left out
@@ -1513,20 +1545,22 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			HandleError(run, handlers...)
 		}()
 	}
+	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
+	// goroutine parked for the call: the callback starts only if the strategy
+	// is canceled first, and is then joined like a worker.
+	workerWaitGroup.Add(1)
+	stopStrategyCancel := context.AfterFunc(self.ctx, func() {
+		defer workerWaitGroup.Done()
+		handleCancel()
+	})
 	defer func() {
+		// true means the callback never started and now never will
+		if stopStrategyCancel() {
+			workerWaitGroup.Done()
+		}
 		handleCancel()
 		workerWaitGroup.Wait()
 	}()
-	// merge handleCtx with self.ctx
-	startWorker(func() {
-		defer handleCancel()
-		select {
-		case <-handleCtx.Done():
-			return
-		case <-self.ctx.Done():
-			return
-		}
-	}, handleCancel)
 
 	// E4: a cold start gives the network client a bounded moment to land its
 	// first feed sample, so the first dial can use the extenders it is about
@@ -1825,26 +1859,24 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 ) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	// The strategy-context bridge is function-owned; join it so even a fast
-	// successful serial result leaves no callback racing the caller's cleanup.
+	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
+	// goroutine parked for the call: the callback starts only if the strategy
+	// is canceled first. The bridge is function-owned; join a started callback
+	// so even a fast successful serial result leaves none racing the caller's
+	// cleanup.
 	var contextWaitGroup sync.WaitGroup
+	contextWaitGroup.Add(1)
+	stopStrategyCancel := context.AfterFunc(self.ctx, func() {
+		defer contextWaitGroup.Done()
+		handleCancel()
+	})
 	defer func() {
+		// true means the callback never started and now never will
+		if stopStrategyCancel() {
+			contextWaitGroup.Done()
+		}
 		handleCancel()
 		contextWaitGroup.Wait()
-	}()
-	// merge handleCtx with self.ctx
-	contextWaitGroup.Add(1)
-	go func() {
-		defer contextWaitGroup.Done()
-		HandleError(func() {
-			defer handleCancel()
-			select {
-			case <-handleCtx.Done():
-				return
-			case <-self.ctx.Done():
-				return
-			}
-		}, handleCancel)
 	}()
 
 	// A short hello can establish this operation without becoming lasting
@@ -2061,7 +2093,9 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		}
 		dialStart := time.Now()
 		timing := &dialTiming{}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -2138,7 +2172,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		}
 		dialStart := time.Now()
 		timing := &dialTiming{}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
@@ -2172,7 +2208,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		}
 		dialStart := time.Now()
 		timing := &dialTiming{}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(timing.trace(handleCtx, attemptRequest, dialStart))
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -2373,7 +2411,9 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	if directory := self.settings.ExtenderDirectory; directory != nil {
 		for _, dialer := range judgeDialers {
 			// the address was held, revoked, expired or removed (E2)
-			if !directory.AddressUsable(dialer.extenderConfig.Ip) {
+			// or, while gated records are preferred, an open record whose
+			// working connections drain (EXTENDER-UPDATE2 §1.1 rule 5)
+			if !directory.ConnectAddressUsable(dialer.extenderConfig.Ip) {
 				dropDialers = append(dropDialers, dialer)
 			}
 		}
@@ -2430,6 +2470,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 
 	// the directory is an external object; it is read with no lock held
 	spoofDomains, spoofCountryCode := directorySpoofDomains(self.settings.ExtenderDirectory)
+	borrowCountryCode := directoryBorrowCountryCode(self.settings.ExtenderDirectory)
 
 	visitedExtenderIpProfiles := map[extenderIpProfile]bool{}
 	visitedExtenderIps := []netip.Addr{}
@@ -2496,25 +2537,20 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 		for _, ip := range ips {
 			extenderConfigs = append(
 				extenderConfigs,
-				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains)...,
+				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains, borrowCountryCode)...,
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
-		familyCandidates := [][]*ExtenderCandidate{}
-		candidates := directory.Candidates
-		if self.settings.DisableManualExtenders {
-			// never a manual address no signed record verifies
-			candidates = directory.VerifiedCandidates
-		}
-		for _, ipVersion := range []int{4, 6} {
-			if !controlFamilyProbe(ipVersion) {
-				continue
-			}
-			familyCandidates = append(
-				familyCandidates,
-				candidates(ipVersion, maxNewDialerCount, visitedExtenderIps...),
-			)
-		}
+		// the connection draw of each family the host has (E2), under the
+		// directory's gated preference (EXTENDER-UPDATE2 §1.1); with
+		// DisableManualExtenders never a manual address no signed record
+		// verifies
+		familyCandidates := directory.ConnectCandidates(
+			ExtenderDialIpVersions(),
+			maxNewDialerCount,
+			self.settings.DisableManualExtenders,
+			visitedExtenderIps,
+		)
 		// interleave the families, so a dual-stack host does not spend its
 		// whole expand budget on v4 before v6 is ever dialed
 		for i := 0; ; i += 1 {
@@ -2529,7 +2565,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 					}
 					extenderConfigs = append(
 						extenderConfigs,
-						extenderConfigsForCandidate(candidates[i], "", spoofDomains)...,
+						extenderConfigsForCandidate(candidates[i], "", spoofDomains, borrowCountryCode)...,
 					)
 				}
 			}
@@ -2638,7 +2674,12 @@ func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*cl
 	if candidate == nil || !candidate.LimitedUntil.IsZero() {
 		return []*clientDialer{}
 	}
-	extenderConfigs := extenderConfigsForCandidate(candidate, secret, spoofDomains)
+	extenderConfigs := extenderConfigsForCandidate(
+		candidate,
+		secret,
+		spoofDomains,
+		directoryBorrowCountryCode(self.settings.ExtenderDirectory),
+	)
 
 	func() {
 		self.mutex.Lock()
@@ -2725,11 +2766,15 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 // 4053 and 53 it does not. The identity key of a verified record is carried
 // into the config so the outer leaf is checked against it (B3). Each config
 // fronts with one random name of `spoofDomains`, the list in force
-// (directorySpoofDomains).
+// (directorySpoofDomains). The tcp config also carries the record's camouflage
+// key and the client's borrow country (borrowCountryCode, the directory's
+// SpoofCountryCode), so its dial fronts the camouflaged attempt with the name
+// the extender covers (EXTENDER-UPDATE2 §3.1, §3.2).
 func extenderConfigsForCandidate(
 	candidate *ExtenderCandidate,
 	secret string,
 	spoofDomains []string,
+	borrowCountryCode string,
 ) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile, dnsPorts []int) {
@@ -2739,13 +2784,18 @@ func extenderConfigsForCandidate(
 		if profile.Port <= 0 {
 			return
 		}
-		extenderConfigs = append(extenderConfigs, &ExtenderConfig{
+		extenderConfig := &ExtenderConfig{
 			Profile:   profile,
 			Ip:        candidate.Ip,
 			Secret:    secret,
 			PublicKey: slices.Clone(candidate.PublicKey),
 			DnsPorts:  dnsPorts,
-		})
+		}
+		if profile.ConnectMode == ExtenderConnectModeTcpTls {
+			extenderConfig.RealityPublicKey = slices.Clone(candidate.RealityPublicKey)
+			extenderConfig.CamouflageCountryCode = borrowCountryCode
+		}
+		extenderConfigs = append(extenderConfigs, extenderConfig)
 	}
 	for _, carrier := range candidate.Carriers {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
@@ -2783,15 +2833,15 @@ func extenderConfigsForCandidate(
 // completed first attempt, or no network client at all never waits: the gate
 // exists so a cold start does not dial without the extenders it is about to
 // learn, not to delay anything else.
+//
+// The gate starts every dial and GET, and almost every call finds no sample
+// pending. A call that does not wait creates no timer and copies nothing.
 func (self *ClientStrategy) waitForExtenderInitialSample(ctx context.Context) {
 	directory := self.settings.ExtenderDirectory
 	if directory == nil || self.settings.ExtenderInitialSampleTimeout <= 0 {
 		return
 	}
-	if 0 < len(self.CustomExtenders()) {
-		return
-	}
-	timeout := time.After(self.settings.ExtenderInitialSampleTimeout)
+	var timeout <-chan time.Time
 	for {
 		state, update := directory.InitialSampleMonitor().Get()
 		if state != ExtenderInitialSamplePending {
@@ -2799,6 +2849,14 @@ func (self *ClientStrategy) waitForExtenderInitialSample(ctx context.Context) {
 		}
 		if 0 < directory.UsableCount(0) {
 			return
+		}
+		if timeout == nil {
+			// the first wait: custom extenders never wait, and one timer
+			// bounds every pass after this
+			if 0 < len(self.CustomExtenders()) {
+				return
+			}
+			timeout = time.After(self.settings.ExtenderInitialSampleTimeout)
 		}
 		select {
 		case <-ctx.Done():

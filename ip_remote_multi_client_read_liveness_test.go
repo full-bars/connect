@@ -15,14 +15,14 @@ import (
 
 func TestBlackholeReadTimeoutDefaultAlignment(t *testing.T) {
 	multi := DefaultMultiClientSettings()
-	platform := DefaultPlatformTransportSettings()
+	platform := testingDefaultPlatformTransportSettings()
 	if multi.BlackholeTimeout != platform.ReadTimeout {
 		t.Fatalf("no-send-ACK timeout %s differs from transport read timeout %s", multi.BlackholeTimeout, platform.ReadTimeout)
 	}
 }
 
 func TestBlackholeReadTimeoutUsesEffectivePerClientSettings(t *testing.T) {
-	generated := DefaultPlatformTransportSettings()
+	generated := testingDefaultPlatformTransportSettings()
 	generated.ReadTimeout = 45 * time.Second
 	generator := &ApiMultiClientGenerator{settings: &ApiMultiClientGeneratorSettings{
 		PlatformTransportSettingsGenerator: func() *PlatformTransportSettings { return generated },
@@ -142,7 +142,7 @@ func TestBlackholeReadTimeoutOnlyPeerAckRestartsClock(t *testing.T) {
 }
 
 func TestBlackholeReadTimeoutDoesNotLengthenFreshnessOrPoll(t *testing.T) {
-	if blackholePollInterval != 1250*time.Millisecond || blackholeAckFreshnessInterval != 5*time.Second {
+	if DefaultMultiClientSettings().BlackholePollInterval != 1250*time.Millisecond || blackholeAckFreshnessInterval != 5*time.Second {
 		t.Fatal("read alignment changed health evaluation/freshness cadence")
 	}
 	synctest.Test(t, func(t *testing.T) {

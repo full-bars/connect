@@ -167,7 +167,7 @@ func (self *ExtenderNetworkClient) bootstrapDnsAddresses(ctx context.Context) {
 				self.markDnsDead()
 			}
 			if allow, suppressed := self.dnsLogThrottle.Allow(self.settings.Now()); allow {
-				self.log.Infof("[extender]bootstrap err = %s%s\n", err, suppressedSuffix(suppressed))
+				self.log.Infof("[extender]bootstrap err = %s%s\n", extenderErrorText(err), suppressedSuffix(suppressed))
 			}
 		}
 	} else {
@@ -202,7 +202,7 @@ func (self *ExtenderNetworkClient) applyManualHostsProgressive() uint64 {
 				ready(changed)
 			})
 			if err != nil && ctx.Err() == nil {
-				self.log.Infof("[extender]manual host %s err = %s\n", host, err)
+				self.log.Infof("[extender]manual host %s err = %s\n", host, extenderErrorText(err))
 			}
 		}
 		return ctx.Err()

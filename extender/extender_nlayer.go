@@ -117,6 +117,7 @@ func newExtenderNLayerHops(extenderConfigs []*connect.ExtenderConfig) []*extende
 		if extenderConfig != nil {
 			hopConfig := *extenderConfig
 			hopConfig.PublicKey = slices.Clone(extenderConfig.PublicKey)
+			hopConfig.RealityPublicKey = slices.Clone(extenderConfig.RealityPublicKey)
 			hop.extenderConfig = &hopConfig
 			hop.ipVersion = 6
 			if hopConfig.Ip.Unmap().Is4() {
@@ -233,8 +234,8 @@ func (self *ExtenderServer) peekNLayerClientRandom(clientConn net.Conn) ([]byte,
 		m, err := clientConn.Read(prefixBytes[n:])
 		n += m
 		if err != nil {
-			// a timeout leaves the stream usable, since the relay sets its own
-			// deadlines; any other error the relay meets on its first read
+			// a timeout leaves the stream usable once the deadline is cleared
+			// below; any other error the relay meets on its first read
 			break
 		}
 	}
