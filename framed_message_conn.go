@@ -361,18 +361,31 @@ func (s *H1PlusStats) Snapshot() H1PlusStatsSnapshot {
 	if s == nil {
 		return H1PlusStatsSnapshot{}
 	}
+	// The failure total is derived from the classes, never loaded beside them.
+	// Recording increments the total and its class as two separate atomics, so
+	// reading both could report failures=1 with an empty breakdown; summing the
+	// classes the snapshot itself reports keeps the advertised invariant true
+	// for every reader, including one that samples mid-record.
+	failureTimeout := s.handshakeFailuresTimeout.Load()
+	failureTls := s.handshakeFailuresTls.Load()
+	failureProxyConnect := s.handshakeFailuresProxyConnect.Load()
+	failureAuth := s.handshakeFailuresAuth.Load()
+	failureUpgradeRejected := s.handshakeFailuresUpgradeRejected.Load()
+	failureIO := s.handshakeFailuresIO.Load()
+	failureOther := s.handshakeFailuresOther.Load()
 	return H1PlusStatsSnapshot{
 		Attempts: s.attempts.Load(), Accepted: s.accepted.Load(), Fallbacks: s.fallbacks.Load(), AuthFailures: s.authFailures.Load(), HandshakeNanos: s.handshakeNanos.Load(),
 		Flushes: s.flushes.Load(), Writes: s.writes.Load(), Messages: s.messages.Load(), Bytes: s.bytes.Load(), ReadErrors: s.readErrors.Load(), WriteErrors: s.writeErrors.Load(),
 		FallbackRejected: s.fallbackRejected.Load(), FallbackInvalid: s.fallbackInvalid.Load(), FallbackIO: s.fallbackIO.Load(), FallbackProxy: s.fallbackProxy.Load(),
-		WebSocketSelected: s.webSocketSelected.Load(), HandshakeFailures: s.handshakeFailures.Load(),
-		HandshakeFailuresTimeout:         s.handshakeFailuresTimeout.Load(),
-		HandshakeFailuresTls:             s.handshakeFailuresTls.Load(),
-		HandshakeFailuresProxyConnect:    s.handshakeFailuresProxyConnect.Load(),
-		HandshakeFailuresAuth:            s.handshakeFailuresAuth.Load(),
-		HandshakeFailuresUpgradeRejected: s.handshakeFailuresUpgradeRejected.Load(),
-		HandshakeFailuresIO:              s.handshakeFailuresIO.Load(),
-		HandshakeFailuresOther:           s.handshakeFailuresOther.Load(),
+		WebSocketSelected:                s.webSocketSelected.Load(),
+		HandshakeFailures:                failureTimeout + failureTls + failureProxyConnect + failureAuth + failureUpgradeRejected + failureIO + failureOther,
+		HandshakeFailuresTimeout:         failureTimeout,
+		HandshakeFailuresTls:             failureTls,
+		HandshakeFailuresProxyConnect:    failureProxyConnect,
+		HandshakeFailuresAuth:            failureAuth,
+		HandshakeFailuresUpgradeRejected: failureUpgradeRejected,
+		HandshakeFailuresIO:              failureIO,
+		HandshakeFailuresOther:           failureOther,
 		HandshakeFailureNanos:            s.handshakeFailureNanos.Load(),
 	}
 }
@@ -440,6 +453,17 @@ const (
 )
 
 func classifyH1PlusFailure(err error) h1PlusFailureClass {
+	// A status the server actually sent is stronger evidence than a transport
+	// error joined onto it: the upgrade path joins its cleanup and context
+	// errors with the failure it was already returning, so a 401 followed by a
+	// deadline is an auth rejection, not a timeout. Classification therefore
+	// reads the HTTP evidence first and the transport causes after it.
+	if isAuthFailure(err) {
+		return h1PlusFailureAuth
+	}
+	if isUpgradeRejectedFailure(err) {
+		return h1PlusFailureUpgradeRejected
+	}
 	if isTimeoutFailure(err) {
 		return h1PlusFailureTimeout
 	}
@@ -448,12 +472,6 @@ func classifyH1PlusFailure(err error) h1PlusFailureClass {
 	}
 	if isProxyConnectFailure(err) {
 		return h1PlusFailureProxyConnect
-	}
-	if isAuthFailure(err) {
-		return h1PlusFailureAuth
-	}
-	if isUpgradeRejectedFailure(err) {
-		return h1PlusFailureUpgradeRejected
 	}
 	if isIOFailure(err) {
 		return h1PlusFailureIO

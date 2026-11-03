@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -101,17 +102,8 @@ func TestH1PlusFailureClassesTableDriven(t *testing.T) {
 			},
 		},
 		{
-			name: "upgrade_rejected_502",
-			err:  &HTTPUpgradeError{StatusCode: 502, Reason: "rejected", Terminal: true},
-			wantAssert: func(t *testing.T, snap H1PlusStatsSnapshot) {
-				if snap.HandshakeFailuresUpgradeRejected != 1 {
-					t.Fatalf("expected HandshakeFailuresUpgradeRejected=1, got %d", snap.HandshakeFailuresUpgradeRejected)
-				}
-			},
-		},
-		{
-			name: "upgrade_rejected_500",
-			err:  &HTTPUpgradeError{StatusCode: 500, Reason: "rejected", Terminal: true},
+			name: "upgrade_rejected_302",
+			err:  &HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true},
 			wantAssert: func(t *testing.T, snap H1PlusStatsSnapshot) {
 				if snap.HandshakeFailuresUpgradeRejected != 1 {
 					t.Fatalf("expected HandshakeFailuresUpgradeRejected=1, got %d", snap.HandshakeFailuresUpgradeRejected)
@@ -308,10 +300,10 @@ func TestH1PlusAuthVsUpgradeRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("502 increments upgrade_rejected and not auth", func(t *testing.T) {
+	t.Run("302 increments upgrade_rejected and not auth", func(t *testing.T) {
 		stats := &H1PlusStats{}
-		err502 := &HTTPUpgradeError{StatusCode: 502, Reason: "rejected", Terminal: true}
-		RecordH1PlusSelection(stats, 100*time.Millisecond, err502)
+		err302 := &HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true}
+		RecordH1PlusSelection(stats, 100*time.Millisecond, err302)
 
 		snap := stats.Snapshot()
 		if snap.HandshakeFailuresUpgradeRejected != 1 {
@@ -346,10 +338,10 @@ func TestH1PlusFailureClassesMixedSequence(t *testing.T) {
 		{elapsed: 60 * time.Millisecond, err: &net.OpError{Op: "proxyconnect", Err: errors.New("proxy error")}},
 		{elapsed: 70 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 401, Reason: "rejected", Terminal: true}},
 		{elapsed: 80 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 403, Reason: "rejected", Terminal: true}},
-		{elapsed: 90 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 502, Reason: "rejected", Terminal: true}},
+		{elapsed: 90 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true}},
 		{elapsed: 100 * time.Millisecond, err: io.ErrUnexpectedEOF},
 		{elapsed: 110 * time.Millisecond, err: errors.New("unclassified dial failure")},
-		{elapsed: 120 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 500, Reason: "rejected", Terminal: true}},
+		{elapsed: 120 * time.Millisecond, err: &HTTPUpgradeError{StatusCode: 307, Reason: "rejected", Terminal: true}},
 		{elapsed: 130 * time.Millisecond, err: io.EOF},
 		{elapsed: 140 * time.Millisecond, err: nil},
 	}
@@ -411,7 +403,7 @@ func TestH1PlusStatsSnapshotCopiesNewCounters(t *testing.T) {
 	RecordH1PlusSelection(stats, 20*time.Millisecond, &tls.RecordHeaderError{Msg: "tls fail"})
 	RecordH1PlusSelection(stats, 30*time.Millisecond, &net.OpError{Op: "proxyconnect", Err: errors.New("proxy")})
 	RecordH1PlusSelection(stats, 40*time.Millisecond, &HTTPUpgradeError{StatusCode: 401, Reason: "rejected", Terminal: true})
-	RecordH1PlusSelection(stats, 50*time.Millisecond, &HTTPUpgradeError{StatusCode: 502, Reason: "rejected", Terminal: true})
+	RecordH1PlusSelection(stats, 50*time.Millisecond, &HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true})
 	RecordH1PlusSelection(stats, 60*time.Millisecond, io.ErrUnexpectedEOF)
 	RecordH1PlusSelection(stats, 70*time.Millisecond, errors.New("other"))
 
@@ -450,5 +442,111 @@ func TestH1PlusStatsSnapshotCopiesNewCounters(t *testing.T) {
 	nilSnap := nilStats.Snapshot()
 	if nilSnap != (H1PlusStatsSnapshot{}) {
 		t.Fatalf("expected zero snapshot for nil stats, got %+v", nilSnap)
+	}
+}
+
+func TestH1PlusRealUpgradeOutcomes(t *testing.T) {
+	classCounters := func(snap H1PlusStatsSnapshot) [7]uint64 {
+		return [7]uint64{
+			snap.HandshakeFailuresTimeout, snap.HandshakeFailuresTls, snap.HandshakeFailuresProxyConnect,
+			snap.HandshakeFailuresAuth, snap.HandshakeFailuresUpgradeRejected, snap.HandshakeFailuresIO,
+			snap.HandshakeFailuresOther,
+		}
+	}
+
+	t.Run("500 non-terminal is a fallback and moves no class", func(t *testing.T) {
+		stats := &H1PlusStats{}
+		RecordH1PlusSelection(stats, 10*time.Millisecond, &HTTPUpgradeError{StatusCode: 500, Reason: "rejected", Terminal: false})
+		snap := stats.Snapshot()
+		if snap.Fallbacks != 1 || snap.FallbackRejected != 1 {
+			t.Fatalf("expected Fallbacks=1 FallbackRejected=1, got %d %d", snap.Fallbacks, snap.FallbackRejected)
+		}
+		if snap.HandshakeFailures != 0 {
+			t.Fatalf("expected HandshakeFailures=0, got %d", snap.HandshakeFailures)
+		}
+		if classCounters(snap) != [7]uint64{} {
+			t.Fatalf("expected every class counter 0, got %v", classCounters(snap))
+		}
+	})
+
+	t.Run("401 joined with a deadline is auth, not timeout", func(t *testing.T) {
+		stats := &H1PlusStats{}
+		err := errors.Join(&HTTPUpgradeError{StatusCode: 401, Reason: "rejected", Terminal: true}, context.DeadlineExceeded)
+		RecordH1PlusSelection(stats, 10*time.Millisecond, err)
+		snap := stats.Snapshot()
+		if snap.HandshakeFailuresAuth != 1 {
+			t.Fatalf("expected HandshakeFailuresAuth=1, got %d", snap.HandshakeFailuresAuth)
+		}
+		if snap.HandshakeFailuresTimeout != 0 {
+			t.Fatalf("expected HandshakeFailuresTimeout=0, got %d", snap.HandshakeFailuresTimeout)
+		}
+		if snap.HandshakeFailures != 1 {
+			t.Fatalf("expected HandshakeFailures=1, got %d", snap.HandshakeFailures)
+		}
+	})
+
+	t.Run("302 joined with a deadline is upgrade_rejected, not timeout", func(t *testing.T) {
+		stats := &H1PlusStats{}
+		err := errors.Join(&HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true}, context.DeadlineExceeded)
+		RecordH1PlusSelection(stats, 10*time.Millisecond, err)
+		snap := stats.Snapshot()
+		if snap.HandshakeFailuresUpgradeRejected != 1 || snap.HandshakeFailuresTimeout != 0 {
+			t.Fatalf("expected upgrade_rejected=1 timeout=0, got %d %d", snap.HandshakeFailuresUpgradeRejected, snap.HandshakeFailuresTimeout)
+		}
+	})
+}
+
+// The snapshot invariant is sampled, not proven: a loop of concurrent
+// recordings makes a torn total/class read overwhelmingly likely to show up
+// against a snapshot that loads the total separately from the classes.
+func TestH1PlusSnapshotFailureSumMatchesClasses(t *testing.T) {
+	stats := &H1PlusStats{}
+	errs := []error{
+		context.DeadlineExceeded,
+		&tls.RecordHeaderError{Msg: "bad record"},
+		&net.OpError{Op: "proxyconnect", Err: errors.New("proxy")},
+		&HTTPUpgradeError{StatusCode: 401, Reason: "rejected", Terminal: true},
+		&HTTPUpgradeError{StatusCode: 302, Reason: "rejected", Terminal: true},
+		io.ErrUnexpectedEOF,
+		errors.New("other"),
+	}
+
+	const recorders, perRecorder = 8, 20000
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	for i := 0; i < recorders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for n := 0; n < perRecorder; n++ {
+				RecordH1PlusSelection(stats, time.Millisecond, errs[(i+n)%len(errs)])
+			}
+		}(i)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	check := func(snap H1PlusStatsSnapshot) {
+		sum := snap.HandshakeFailuresTimeout + snap.HandshakeFailuresTls + snap.HandshakeFailuresProxyConnect +
+			snap.HandshakeFailuresAuth + snap.HandshakeFailuresUpgradeRejected + snap.HandshakeFailuresIO +
+			snap.HandshakeFailuresOther
+		if sum != snap.HandshakeFailures {
+			t.Fatalf("class sum %d != HandshakeFailures %d in one snapshot", sum, snap.HandshakeFailures)
+		}
+	}
+	for sampling := true; sampling; {
+		select {
+		case <-done:
+			sampling = false
+		default:
+			check(stats.Snapshot())
+		}
+	}
+	final := stats.Snapshot()
+	check(final)
+	if final.HandshakeFailures != recorders*perRecorder {
+		t.Fatalf("expected %d failures, got %d", recorders*perRecorder, final.HandshakeFailures)
 	}
 }
