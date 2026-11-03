@@ -5134,6 +5134,9 @@ func (self *Client) Close() {
 	self.streamManagerUnsub()
 	self.peerManagerUnsub()
 	self.sequenceCloserUnsub()
+	// the buckets still open belong to sequences this close is tearing down, and
+	// the process may not live another window to print them
+	flushSequenceExitAggregator()
 }
 
 // CloseAndWait closes the client and joins its reader, close worker,
@@ -5217,6 +5220,9 @@ func (self *Client) CloseAndWait(ctx context.Context) error {
 			result = errors.Join(result, err)
 		}
 	}
+	// Close flushed before the joins; the sequences that recorded their exit
+	// while it ran are in buckets this second flush is the last chance for
+	flushSequenceExitAggregator()
 	return result
 }
 
@@ -9389,7 +9395,14 @@ func (self *SendSequence) Run() {
 		if self.ackWorkerExited.Load() {
 			reason = "ack_worker_exit"
 		}
-		self.recordSendSequenceExit(reason, nil, time.Time{}, nil)
+		var cause error
+		if reason == "context" {
+			// the cancellation this sequence unwinds from, which the record
+			// would otherwise carry as an empty cause: the aggregated line
+			// then tells a client shutdown from a sequence timeout
+			cause = self.ctx.Err()
+		}
+		self.recordSendSequenceExit(reason, nil, time.Time{}, cause)
 	}()
 	drainPacks := func() {
 		for !packsClosed {

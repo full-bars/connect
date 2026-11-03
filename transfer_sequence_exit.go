@@ -27,33 +27,30 @@ func isSequenceExitDetail(log Logger) bool {
 }
 
 type sequenceExitGroupKey struct {
-	reason       string
-	destination  Id
-	routeWritten bool
-	cause        string
+	reason      string
+	destination Id
+	cause       string
 }
 
 type sequenceExitGroup struct {
-	key               sequenceExitGroupKey
-	count             int
-	routeWrittenCount int
-	sends             int
-	lifetime          time.Duration
-	sampleClientTag   string
-	log               Logger
-	window            time.Duration
+	key             sequenceExitGroupKey
+	count           int
+	sends           int
+	lifetime        time.Duration
+	sampleClientTag string
+	log             Logger
+	window          time.Duration
 }
 
 func (grp *sequenceExitGroup) emit() {
 	if grp.log == nil {
 		grp.log = DefaultLogger()
 	}
-	grp.log.Infof("[s]event=sequence_exit count=%d reason=%s destination=%s cause=%s route_written=%d sends=%d lifetime=%s client=%s window=%s\n",
+	grp.log.Infof("[s]event=sequence_exit count=%d reason=%s destination=%s cause=%s sends=%d lifetime=%s client=%s window=%s\n",
 		grp.count,
 		grp.key.reason,
 		grp.key.destination,
 		grp.key.cause,
-		grp.routeWrittenCount,
 		grp.sends,
 		grp.lifetime,
 		grp.sampleClientTag,
@@ -62,11 +59,10 @@ func (grp *sequenceExitGroup) emit() {
 }
 
 type sequenceExitAggregator struct {
-	mutex       sync.Mutex
-	window      time.Duration
-	groups      map[sequenceExitGroupKey]*sequenceExitGroup
-	timer       *time.Timer
-	windowStart time.Time
+	mutex  sync.Mutex
+	window time.Duration
+	groups map[sequenceExitGroupKey]*sequenceExitGroup
+	timer  *time.Timer
 }
 
 func newSequenceExitAggregator(window time.Duration) *sequenceExitAggregator {
@@ -79,14 +75,13 @@ func newSequenceExitAggregator(window time.Duration) *sequenceExitAggregator {
 var globalSequenceExitAggregator = newSequenceExitAggregator(60 * time.Second)
 
 type sequenceExitRecord struct {
-	reason       string
-	destination  Id
-	routeWritten bool
-	cause        error
-	sends        int
-	lifetime     time.Duration
-	clientTag    string
-	log          Logger
+	reason      string
+	destination Id
+	cause       error
+	sends       int
+	lifetime    time.Duration
+	clientTag   string
+	log         Logger
 }
 
 func (a *sequenceExitAggregator) record(rec sequenceExitRecord) {
@@ -99,10 +94,9 @@ func (a *sequenceExitAggregator) record(rec sequenceExitRecord) {
 	}
 
 	key := sequenceExitGroupKey{
-		reason:       rec.reason,
-		destination:  rec.destination,
-		routeWritten: rec.routeWritten,
-		cause:        causeStr,
+		reason:      rec.reason,
+		destination: rec.destination,
+		cause:       causeStr,
 	}
 
 	grp, exists := a.groups[key]
@@ -118,9 +112,6 @@ func (a *sequenceExitAggregator) record(rec sequenceExitRecord) {
 		a.groups[key] = grp
 	}
 	grp.count++
-	if rec.routeWritten {
-		grp.routeWrittenCount++
-	}
 	if grp.sampleClientTag == "" {
 		grp.sampleClientTag = rec.clientTag
 	}
@@ -135,7 +126,6 @@ func (a *sequenceExitAggregator) record(rec sequenceExitRecord) {
 	}
 
 	if a.timer == nil {
-		a.windowStart = time.Now()
 		a.timer = time.AfterFunc(a.window, a.flush)
 	}
 }
@@ -185,6 +175,13 @@ func isRoutineSequenceExit(reason string, destination Id, routeWritten bool, pen
 	return true
 }
 
+// flushSequenceExitAggregator emits every bucket still open in the process wide
+// aggregator. The window timer would emit them a minute later, but a process
+// that exits first takes them with it, and a closed client is the point where a
+// short lived process (a probe, a test, a supervisor restart) ends. Called at
+// client close, so the buckets of that client's sequences are logged rather
+// than dropped; a flush emits the whole process's pending buckets, which costs
+// nothing more than writing the lines early.
 func flushSequenceExitAggregator() {
 	globalSequenceExitAggregator.flush()
 }
@@ -247,14 +244,13 @@ func (self *SendSequence) recordSendSequenceExit(reason string, item *sendItem, 
 
 	if !isSequenceExitDetail(self.log) && isRoutineSequenceExit(reason, self.destination, written, pendingContracts, sends) {
 		globalSequenceExitAggregator.record(sequenceExitRecord{
-			reason:       reason,
-			destination:  self.destination,
-			routeWritten: written,
-			cause:        cause,
-			sends:        sends,
-			lifetime:     lifetime,
-			clientTag:    self.client.ClientTag(),
-			log:          self.log,
+			reason:      reason,
+			destination: self.destination,
+			cause:       cause,
+			sends:       sends,
+			lifetime:    lifetime,
+			clientTag:   self.client.ClientTag(),
+			log:         self.log,
 		})
 		return
 	}

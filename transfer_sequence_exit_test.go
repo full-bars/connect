@@ -275,7 +275,6 @@ func TestSendSequenceExitRoutineAggregatedOneWindow(t *testing.T) {
 			"reason=ack_lifetime",
 			"destination=00000000-0000-0000-0000-000000000000",
 			"cause=context deadline exceeded",
-			"route_written=0",
 			"sends=3",
 			"lifetime=1m0s",
 			"window=1m0s",
@@ -470,5 +469,95 @@ func TestSendSequenceExitDebugSwitchRestoresPerRecord(t *testing.T) {
 				t.Fatalf("not a full record: %s", lines[0])
 			}
 		})
+	})
+}
+
+// A bucket still open when the client closes is logged rather than dropped. The
+// window timer would print it a minute later, and a process that exits first
+// takes it with it (review finding on the aggregation PR).
+func TestSequenceExitFlushOnClientClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		settings := DefaultClientSettings()
+		settings.Log = log
+		settings.EncryptionSettings.Mode = EncryptionModeOff
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+
+		globalSequenceExitAggregator.record(sequenceExitRecord{
+			reason:      "ack_lifetime",
+			destination: Id{},
+			cause:       context.DeadlineExceeded,
+			sends:       2,
+			lifetime:    time.Minute,
+			clientTag:   client.ClientTag(),
+			log:         log,
+		})
+		// no time passes, so only the close can emit this
+		if lines := log.linesWith("event=sequence_exit"); len(lines) != 0 {
+			t.Fatalf("emitted before the window or the close: %v", lines)
+		}
+		client.Close()
+
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("close left %d aggregated lines, expected the pending bucket: %v", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "count=1") || !strings.Contains(lines[0], "reason=ack_lifetime") {
+			t.Fatalf("the flushed line is %s", lines[0])
+		}
+	})
+}
+
+// A single send to a destination that is not the platform is not routine: it is
+// one client's one message, and folding it into a count loses it. Several sends
+// to the same destination do aggregate.
+func TestSequenceExitNonPlatformDestinationException(t *testing.T) {
+	destination := NewId()
+	if isRoutineSequenceExit("ack_lifetime", destination, false, 0, 1) {
+		t.Error("a single send to a non-platform destination was aggregated")
+	}
+	if !isRoutineSequenceExit("ack_lifetime", destination, false, 0, 3) {
+		t.Error("several sends to a non-platform destination were not aggregated")
+	}
+	if !isRoutineSequenceExit("ack_lifetime", Id{}, false, 0, 1) {
+		t.Error("a single send to the platform was not aggregated")
+	}
+}
+
+// A context exit carries the cancellation that ended it, so the aggregated line
+// tells a client shutdown from a sequence timeout instead of printing an empty
+// cause for both.
+func TestSequenceExitContextCauseAggregated(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		for i := 0; i < 3; i++ {
+			globalSequenceExitAggregator.record(sequenceExitRecord{
+				reason:      "context",
+				destination: Id{},
+				cause:       context.Canceled,
+				sends:       4,
+				lifetime:    time.Minute,
+				log:         log,
+			})
+		}
+		flushSequenceExitAggregator()
+
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("expected one aggregated context line, got %d: %v", len(lines), lines)
+		}
+		for _, field := range []string{"count=3", "reason=context", "cause=context canceled"} {
+			if !strings.Contains(lines[0], field) {
+				t.Fatalf("the context line %s does not carry %q", lines[0], field)
+			}
+		}
 	})
 }
