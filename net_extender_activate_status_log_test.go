@@ -8,17 +8,17 @@ import (
 
 // Tests for human-readable extender activation logging and attempt counters.
 
-func waitForLogLines(t *testing.T, log *testActivateLogger, prefix string, minCount int) []string {
+func waitForLogLines(t *testing.T, log *testActivateLogger, sub string, minCount int) []string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		lines := log.linesWithPrefix(prefix)
+		lines := log.linesContaining(sub)
 		if len(lines) >= minCount {
 			return lines
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	return log.linesWithPrefix(prefix)
+	return log.linesContaining(sub)
 }
 
 func TestExtenderActivatorCountersAdvance(t *testing.T) {
@@ -118,12 +118,12 @@ func TestExtenderActivatorPeriodicLineCarriesDetails(t *testing.T) {
 
 	// In pass 1 (at t0), attempt 1 failed. Next try is held 10m to t0 + 10m.
 	expectedNextTime := formatNextTryTime(t0.Add(10*time.Minute), t0)
-	periodicLines := waitForLogLines(t, log, "[extender] IPv4 is not activated yet:", 1)
+	periodicLines := waitForLogLines(t, log, "IPv4 not activated:", 1)
 	if len(periodicLines) != 1 {
 		t.Fatalf("periodicLines = %v, expected 1 line", periodicLines)
 	}
-	expectedFirst := "[extender] IPv4 is not activated yet: 1 tries, 0 worked, 1 failed; next try in 10m at " + expectedNextTime + "; last failure 0s ago: the platform did not answer in time\n"
-	if periodicLines[0] != expectedFirst {
+	expectedFirst := "IPv4 not activated: 1 tries, 0 worked, 1 failed; next try in 10m at " + expectedNextTime + "; last failure 0s ago: the platform did not answer in time\n"
+	if !strings.Contains(periodicLines[0], expectedFirst) {
 		t.Fatalf("periodic line 1 = %q, expected %q", periodicLines[0], expectedFirst)
 	}
 
@@ -134,12 +134,12 @@ func TestExtenderActivatorPeriodicLineCarriesDetails(t *testing.T) {
 	expectedNextTime1 := formatNextTryTime(t0.Add(10*time.Minute), t1)
 	fixture.step(6 * time.Minute)
 
-	periodicLines = waitForLogLines(t, log, "[extender] IPv4 is not activated yet:", 2)
+	periodicLines = waitForLogLines(t, log, "IPv4 not activated:", 2)
 	if len(periodicLines) != 2 {
 		t.Fatalf("periodicLines = %v, expected 2 lines", periodicLines)
 	}
-	expectedSecond := "[extender] IPv4 is not activated yet: 1 tries, 0 worked, 1 failed; next try in 4m at " + expectedNextTime1 + "; last failure 6m ago: the platform did not answer in time\n"
-	if periodicLines[1] != expectedSecond {
+	expectedSecond := "IPv4 not activated: 1 tries, 0 worked, 1 failed; next try in 4m at " + expectedNextTime1 + "; last failure 6m ago: the platform did not answer in time\n"
+	if !strings.Contains(periodicLines[1], expectedSecond) {
 		t.Fatalf("periodic line 2 = %q, expected %q", periodicLines[1], expectedSecond)
 	}
 }
@@ -162,7 +162,7 @@ func TestExtenderActivatorPeriodicLineFiveMinuteWindow(t *testing.T) {
 	fixture.waitPost()
 	fixture.waitOutcome(version)
 
-	periodicLines := waitForLogLines(t, log, "[extender] IPv4 is not activated yet:", 1)
+	periodicLines := waitForLogLines(t, log, "IPv4 not activated:", 1)
 	if len(periodicLines) != 1 {
 		t.Fatalf("initial periodicLines count = %d, expected 1", len(periodicLines))
 	}
@@ -171,7 +171,7 @@ func TestExtenderActivatorPeriodicLineFiveMinuteWindow(t *testing.T) {
 	fixture.step(2 * time.Minute)
 	// Give loop a moment to finish pass.
 	time.Sleep(50 * time.Millisecond)
-	periodicLines = log.linesWithPrefix("[extender] IPv4 is not activated yet:")
+	periodicLines = log.linesContaining("IPv4 not activated:")
 	if len(periodicLines) != 1 {
 		t.Fatalf("periodicLines count after 2m = %d, expected 1 (no new periodic line inside 5m window)", len(periodicLines))
 	}
@@ -179,14 +179,14 @@ func TestExtenderActivatorPeriodicLineFiveMinuteWindow(t *testing.T) {
 	// Another pass at 3 minutes (total 3m from start): still inside 5 minute window.
 	fixture.step(1 * time.Minute)
 	time.Sleep(50 * time.Millisecond)
-	periodicLines = log.linesWithPrefix("[extender] IPv4 is not activated yet:")
+	periodicLines = log.linesContaining("IPv4 not activated:")
 	if len(periodicLines) != 1 {
 		t.Fatalf("periodicLines count after 3m = %d, expected 1", len(periodicLines))
 	}
 
 	// Now step by 3 more minutes (total 6m from start >= 5m): prints periodic line.
 	fixture.step(3 * time.Minute)
-	periodicLines = waitForLogLines(t, log, "[extender] IPv4 is not activated yet:", 2)
+	periodicLines = waitForLogLines(t, log, "IPv4 not activated:", 2)
 	if len(periodicLines) != 2 {
 		t.Fatalf("periodicLines count after 6m = %d, expected 2", len(periodicLines))
 	}
@@ -212,7 +212,7 @@ func TestExtenderActivatorActivationLineOncePerTransition(t *testing.T) {
 		t.Fatalf("activatedLines = %v, expected 1 line", activatedLines)
 	}
 	expected := "[extender] IPv4 is now activated on try 1. The platform can reach this host over IPv4.\n"
-	if activatedLines[0] != expected {
+	if !strings.Contains(activatedLines[0], expected) {
 		t.Fatalf("activatedLine = %q, expected %q", activatedLines[0], expected)
 	}
 
@@ -222,7 +222,7 @@ func TestExtenderActivatorActivationLineOncePerTransition(t *testing.T) {
 	fixture.step(5 * time.Minute)
 	time.Sleep(50 * time.Millisecond)
 
-	activatedLines = log.linesWithPrefix("[extender] IPv4 is now activated on try ")
+	activatedLines = log.linesContaining("[extender] IPv4 is now activated on try ")
 	if len(activatedLines) != 1 {
 		t.Fatalf("activatedLines count after subsequent passes = %d, expected 1", len(activatedLines))
 	}
@@ -247,7 +247,7 @@ func TestExtenderActivatorActivationLineOncePerTransition(t *testing.T) {
 		t.Fatalf("activatedLines count after re-activation = %d, expected 2", len(activatedLines))
 	}
 	expectedSecond := "[extender] IPv4 is now activated on try 3. The platform can reach this host over IPv4.\n"
-	if activatedLines[1] != expectedSecond {
+	if !strings.Contains(activatedLines[1], expectedSecond) {
 		t.Fatalf("activatedLine 2 = %q, expected %q", activatedLines[1], expectedSecond)
 	}
 }
@@ -275,7 +275,7 @@ func TestExtenderActivatorFirstFailureHintPrintsOnce(t *testing.T) {
 		t.Fatalf("hintLinesV4 = %v, expected 1 line", hintLinesV4)
 	}
 	expectedHintV4 := "[extender] IPv4 failed for the first time. Check that inbound TCP 443 reaches this host and that it has a public IPv4 address.\n"
-	if hintLinesV4[0] != expectedHintV4 {
+	if !strings.Contains(hintLinesV4[0], expectedHintV4) {
 		t.Fatalf("hint line v4 = %q, expected %q", hintLinesV4[0], expectedHintV4)
 	}
 
@@ -284,7 +284,7 @@ func TestExtenderActivatorFirstFailureHintPrintsOnce(t *testing.T) {
 		t.Fatalf("hintLinesV6 = %v, expected 1 line", hintLinesV6)
 	}
 	expectedHintV6 := "[extender] IPv6 failed for the first time. Check that inbound TCP 443 reaches this host and that it has a public IPv6 address.\n"
-	if hintLinesV6[0] != expectedHintV6 {
+	if !strings.Contains(hintLinesV6[0], expectedHintV6) {
 		t.Fatalf("hint line v6 = %q, expected %q", hintLinesV6[0], expectedHintV6)
 	}
 
@@ -300,11 +300,11 @@ func TestExtenderActivatorFirstFailureHintPrintsOnce(t *testing.T) {
 	}
 
 	// Hint line must NOT be printed again!
-	hintLinesV4 = log.linesWithPrefix("[extender] IPv4 failed for the first time.")
+	hintLinesV4 = log.linesContaining("[extender] IPv4 failed for the first time.")
 	if len(hintLinesV4) != 1 {
 		t.Fatalf("hintLinesV4 count after second failure = %d, expected 1", len(hintLinesV4))
 	}
-	hintLinesV6 = log.linesWithPrefix("[extender] IPv6 failed for the first time.")
+	hintLinesV6 = log.linesContaining("[extender] IPv6 failed for the first time.")
 	if len(hintLinesV6) != 1 {
 		t.Fatalf("hintLinesV6 count after second failure = %d, expected 1", len(hintLinesV6))
 	}
@@ -321,11 +321,11 @@ func TestExtenderActivatorFirstFailureHintPrintsOnce(t *testing.T) {
 	}
 
 	// Still only 1 hint line each!
-	hintLinesV4 = log.linesWithPrefix("[extender] IPv4 failed for the first time.")
+	hintLinesV4 = log.linesContaining("[extender] IPv4 failed for the first time.")
 	if len(hintLinesV4) != 1 {
 		t.Fatalf("hintLinesV4 count after third failure = %d, expected 1", len(hintLinesV4))
 	}
-	hintLinesV6 = log.linesWithPrefix("[extender] IPv6 failed for the first time.")
+	hintLinesV6 = log.linesContaining("[extender] IPv6 failed for the first time.")
 	if len(hintLinesV6) != 1 {
 		t.Fatalf("hintLinesV6 count after third failure = %d, expected 1", len(hintLinesV6))
 	}

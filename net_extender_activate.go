@@ -715,11 +715,11 @@ func NewExtenderActivator(
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 	self := &ExtenderActivator{
-		ctx:            cancelCtx,
-		cancel:         cancel,
-		done:           make(chan struct{}),
-		log:            loggerOrDefault(settings.Log),
-		settings:       settings,
+		ctx:                    cancelCtx,
+		cancel:                 cancel,
+		done:                   make(chan struct{}),
+		log:                    loggerOrDefault(settings.Log),
+		settings:               settings,
 		changeMonitor:          NewMonitorValue[uint64](0),
 		wakeMonitor:            NewMonitor(),
 		families:               map[int]*ExtenderFamilyActivationStatus{},
@@ -1822,11 +1822,11 @@ func (self *ExtenderActivator) recordSuccess(
 	tryNum := counters.Attempts
 
 	familyName := extenderFamilyName(ipVersion)
-	self.log.Infof("[extender] %s activation try %d worked in %.1fs\n",
+	self.log.Infof("🌉✅ [extender] %s activation try %d worked in %.1fs\n",
 		familyName, tryNum, duration.Seconds())
 
 	if !wasActivated {
-		self.log.Infof("[extender] %s is now activated on try %d. The platform can reach this host over %s.\n",
+		self.log.Infof("🌉✅ [extender] %s is now activated on try %d. The platform can reach this host over %s.\n",
 			familyName, tryNum, familyName)
 	}
 
@@ -1884,13 +1884,22 @@ func (self *ExtenderActivator) recordFailure(
 		tryNum := counters.Attempts
 		familyName := extenderFamilyName(v)
 
-		self.log.Infof("[extender] %s activation try %d failed after %.1fs: %s\n",
-			familyName, tryNum, duration.Seconds(), reason)
+		// The bridge marks the component, the second mark the outcome, so a
+		// grep for 🌉 finds every extender line and one for 🌉❌ finds every
+		// failure. ⛔ is the platform saying no; it is free in this build
+		// because it marks contract denials in the 3.23-fix line only, which
+		// is not in sn's dependency set.
+		mark := "🌉❌"
+		if refused {
+			mark = "🌉⛔"
+		}
+		self.log.Infof("%s [extender] %s activation try %d failed after %.1fs: %s\n",
+			mark, familyName, tryNum, duration.Seconds(), reason)
 
 		if !self.firstFailureHintLogged[v] {
 			self.firstFailureHintLogged[v] = true
-			self.log.Infof("[extender] %s failed for the first time. Check that inbound TCP 443 reaches this host and that it has a public %s address.\n",
-				familyName, familyName)
+			self.log.Infof("%s [extender] %s failed for the first time. Check that inbound TCP 443 reaches this host and that it has a public %s address.\n",
+				mark, familyName, familyName)
 		}
 	}
 }
@@ -1907,66 +1916,95 @@ func (self *ExtenderActivator) logPeriodicNotActivated(now time.Time) {
 		slices.Sort(families)
 	}
 
+	// One line for the whole extender rather than one per family: an operator
+	// watching a busy log wants a single glance at both families, and the
+	// detail belongs to whichever family is not up. The keycap digit names the
+	// family and the mark after it says what happened: ✅ activated, ⛔ the
+	// platform said no, ❌ the last attempt failed, ⏳ nothing tried yet.
+	due := false
 	for _, ipVersion := range families {
 		family := self.families[ipVersion]
 		if family == nil || family.Activated {
 			continue
 		}
-		lastTime := self.lastPeriodicLogTimes[ipVersion]
-		if !lastTime.IsZero() && now.Sub(lastTime) < 5*time.Minute {
+		if lastTime := self.lastPeriodicLogTimes[ipVersion]; lastTime.IsZero() || 5*time.Minute <= now.Sub(lastTime) {
+			due = true
+		}
+	}
+	if !due {
+		return
+	}
+
+	var marks []string
+	var details []string
+	for _, ipVersion := range families {
+		family := self.families[ipVersion]
+		if family == nil {
+			continue
+		}
+		counters := self.familyCountersWithLock(ipVersion)
+		mark := "⏳"
+		switch {
+		case family.Activated:
+			mark = "✅"
+		case family.LastRefused:
+			mark = "⛔"
+		case 0 < counters.Failed:
+			mark = "❌"
+		}
+		marks = append(marks, extenderFamilyName(ipVersion)+" "+mark)
+		if family.Activated {
 			continue
 		}
 		self.lastPeriodicLogTimes[ipVersion] = now
-
-		counters := self.familyCountersWithLock(ipVersion)
-		familyName := extenderFamilyName(ipVersion)
-
-		var schedule *extenderActivateSchedule
-		if s, ok := self.schedules[ipVersion]; ok {
-			schedule = s
-		} else if self.fallback {
-			schedule = self.schedules[0]
-		}
-
-		nextTryClause := "next try at once"
-		if schedule != nil && !schedule.nextActivateTime.IsZero() {
-			if schedule.nextActivateTime.After(now) {
-				wait := schedule.nextActivateTime.Sub(now)
-				nextTryClause = fmt.Sprintf("next try in %s at %s",
-					formatDuration(wait),
-					formatNextTryTime(schedule.nextActivateTime, now),
-				)
-			} else {
-				nextTryClause = fmt.Sprintf("next try in 0s at %s",
-					formatNextTryTime(schedule.nextActivateTime, now),
-				)
-			}
-		}
-
-		if counters.Failed > 0 && !counters.LastFailure.IsZero() {
-			failAge := now.Sub(counters.LastFailure)
-			if failAge < 0 {
-				failAge = 0
-			}
-			self.log.Infof("[extender] %s is not activated yet: %d tries, %d worked, %d failed; %s; last failure %s ago: %s\n",
-				familyName,
-				counters.Attempts,
-				counters.Worked,
-				counters.Failed,
-				nextTryClause,
-				formatDuration(failAge),
-				counters.LastFailureReason,
-			)
-		} else {
-			self.log.Infof("[extender] %s is not activated yet: %d tries, %d worked, %d failed; %s\n",
-				familyName,
-				counters.Attempts,
-				counters.Worked,
-				counters.Failed,
-				nextTryClause,
-			)
-		}
+		details = append(details, self.periodicNotActivatedDetail(ipVersion, counters, now))
 	}
+	if len(details) == 0 {
+		return
+	}
+	self.log.Infof("🌉 [extender] %s  %s\n", strings.Join(marks, " "), strings.Join(details, " | "))
+}
+
+// periodicNotActivatedDetail is the part of the periodic line that says why a
+// family is not up and when the next try is. Caller holds stateLock.
+func (self *ExtenderActivator) periodicNotActivatedDetail(ipVersion int, counters *ExtenderFamilyCounters, now time.Time) string {
+	var schedule *extenderActivateSchedule
+	if s, ok := self.schedules[ipVersion]; ok {
+		schedule = s
+	} else if self.fallback {
+		schedule = self.schedules[0]
+	}
+
+	nextTryClause := "next try at once"
+	if schedule != nil && !schedule.nextActivateTime.IsZero() {
+		wait := schedule.nextActivateTime.Sub(now)
+		if wait < 0 {
+			wait = 0
+		}
+		nextTryClause = fmt.Sprintf("next try in %s at %s",
+			formatDuration(wait),
+			formatNextTryTime(schedule.nextActivateTime, now),
+		)
+	}
+
+	detail := fmt.Sprintf("%s not activated: %d tries, %d worked, %d failed; %s",
+		extenderFamilyName(ipVersion),
+		counters.Attempts,
+		counters.Worked,
+		counters.Failed,
+		nextTryClause,
+	)
+	if counters.Failed > 0 && !counters.LastFailure.IsZero() {
+		failAge := now.Sub(counters.LastFailure)
+		if failAge < 0 {
+			failAge = 0
+		}
+		detail += fmt.Sprintf("; last failure %s ago: %s",
+			formatDuration(failAge),
+			counters.LastFailureReason,
+		)
+	}
+	return detail
 }
 
 func extenderFamilyName(ipVersion int) string {
