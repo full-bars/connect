@@ -2,6 +2,7 @@ package extender
 
 import (
 	"errors"
+	"strings"
 	"syscall"
 )
 
@@ -14,8 +15,8 @@ func (self *ExtenderServer) bindOwnerDetail(transport string, port int, err erro
 	}
 	if self.settings.BindOwnerDetail != nil {
 		if detail := self.settings.BindOwnerDetail(transport, port, err); detail != "" {
-			return "; " + detail
+			return "; " + strings.Join(strings.Fields(detail), " ")
 		}
 	}
-	return "; port already in use by another process"
+	return "; port already in use"
 }
