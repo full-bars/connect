@@ -107,9 +107,10 @@ Notes that bite:
 
 - firewalld: `--add-service=https` opens tcp 443 only. udp 443 and udp 4053
   are opened with `--add-port`, and `firewall-cmd --query-port=443/udp` and
-  `--query-port=4053/udp` answer `yes` once the reload has applied them. There
-  is no `http3` service to add: a command that names an unknown service fails
-  with INVALID_SERVICE and applies nothing, so read the output of the
+  `--query-port=4053/udp` answer `yes` once the reload has applied them. Some
+  firewalld installations or versions do not provide an `http3` service; a
+  command that names an unknown service fails with INVALID_SERVICE and applies
+  nothing, so keep the direct `--add-port=443/udp` and read the output of the
   `--permanent` step before trusting the `--reload`. This row is unverified on
   a live firewalld host.
 - ufw can be inactive while firewalld, nftables or iptables is the one
