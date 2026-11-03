@@ -76,4 +76,10 @@ func TestExtenderBindFailureLogNamesPortAndTransport(t *testing.T) {
 	if detail := server.bindOwnerDetail("udp", port, errors.New("other")); detail != "" {
 		t.Fatal(detail)
 	}
+	// A hook that returns only whitespace is not a detail: the line must still
+	// carry the cause instead of ending in a bare "; ".
+	server.settings.BindOwnerDetail = func(transport string, p int, err error) string { return "   " }
+	if detail := server.bindOwnerDetail("udp", port, inUse); detail != "; port already in use" {
+		t.Fatalf("whitespace hook detail = %q, want the fallback %q", detail, "; port already in use")
+	}
 }

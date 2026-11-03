@@ -74,13 +74,17 @@ func newExtenderProbePhase() *extenderProbePhase {
 	return p
 }
 
-// How far a phase is into the exchange: dial, then handshake, then request.
+// How far a phase is into the exchange: dial, then handshake, then request,
+// then challenge. The challenge signature is checked after the response has
+// arrived, so a failure there must not report the request phase.
 func extenderProbePhaseRank(phase string) int {
 	switch phase {
 	case "handshake", "dial/handshake":
 		return 1
 	case "request":
 		return 2
+	case "challenge":
+		return 3
 	}
 	return 0
 }
@@ -223,6 +227,7 @@ func probeExtenderCarrier(
 		if string(response.PublicKey) != string(expectPublicKey) {
 			return nil, probeError(fmt.Errorf("extender published another identity key"))
 		}
+		setExtenderProbePhase(probeCtx, "challenge")
 		if !VerifyExtenderChallenge(expectPublicKey, challenge, response.ChallengeSignature) {
 			return nil, probeError(fmt.Errorf("extender challenge signature does not verify"))
 		}

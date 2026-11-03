@@ -14,8 +14,11 @@ func (self *ExtenderServer) bindOwnerDetail(transport string, port int, err erro
 		return ""
 	}
 	if self.settings.BindOwnerDetail != nil {
-		if detail := self.settings.BindOwnerDetail(transport, port, err); detail != "" {
-			return "; " + strings.Join(strings.Fields(detail), " ")
+		// Normalize first, then decide: a hook that returns only whitespace is
+		// not a usable detail, and returning "; " from it would suppress the
+		// one line that names the cause.
+		if detail := strings.Join(strings.Fields(self.settings.BindOwnerDetail(transport, port, err)), " "); detail != "" {
+			return "; " + detail
 		}
 	}
 	return "; port already in use"

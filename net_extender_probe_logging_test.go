@@ -73,3 +73,22 @@ func TestProbeExtenderQuicHandshakeTimeoutPhase(t *testing.T) {
 	}
 	t.Logf("probe log: %s", err)
 }
+
+// TestExtenderProbePhaseReportsChallenge pins the phase ordering the probe
+// reports: the challenge signature is verified after the response arrives, so a
+// failure there is a challenge failure and must rank past the request.
+func TestExtenderProbePhaseReportsChallenge(t *testing.T) {
+	p := newExtenderProbePhase()
+	if got := p.phase.Load().(string); got != "dial" {
+		t.Fatalf("initial phase = %q, want dial", got)
+	}
+	p.advance("request")
+	p.advance("challenge")
+	if got := p.phase.Load().(string); got != "challenge" {
+		t.Fatalf("phase after advancing to challenge = %q, want challenge (challenge must rank past request)", got)
+	}
+	p.advance("request")
+	if got := p.phase.Load().(string); got != "challenge" {
+		t.Fatalf("phase went backwards to %q", got)
+	}
+}
