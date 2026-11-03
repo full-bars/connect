@@ -375,6 +375,17 @@ type ExtenderActivatorStatus struct {
 	Families []*ExtenderFamilyActivationStatus
 }
 
+// Counters of activation attempts for one family since the process started.
+type ExtenderFamilyCounters struct {
+	Attempts            int
+	Worked              int
+	Failed              int
+	ConsecutiveFailures int
+	LastSuccess         time.Time
+	LastFailure         time.Time
+	LastFailureReason   string
+}
+
 // The entry of one family, nil when the activator does not run that family.
 func (self *ExtenderActivatorStatus) Family(ipVersion int) *ExtenderFamilyActivationStatus {
 	for _, family := range self.Families {
@@ -438,6 +449,11 @@ type ExtenderActivator struct {
 	// when the caller address is next checked. The loop's, and handed over
 	// (State).
 	nextAddressCheckTime time.Time
+
+	// Counters and periodic logging state per family.
+	counters               map[int]*ExtenderFamilyCounters
+	lastPeriodicLogTimes   map[int]time.Time
+	firstFailureHintLogged map[int]bool
 }
 
 // What an activator hands to the one that replaces it in the same process (G2):
@@ -456,6 +472,7 @@ type ExtenderActivatorState struct {
 	nextAddressCheckTime time.Time
 	forcedActivate       bool
 	carriersChanged      bool
+	counters             map[int]ExtenderFamilyCounters
 }
 
 // What the activator that replaces this one continues from
@@ -474,12 +491,16 @@ func (self *ExtenderActivator) State() *ExtenderActivatorState {
 		nextAddressCheckTime: self.nextAddressCheckTime,
 		forcedActivate:       self.forcedActivate,
 		carriersChanged:      self.carriersChanged,
+		counters:             map[int]ExtenderFamilyCounters{},
 	}
 	for key, schedule := range self.schedules {
 		state.schedules[key] = *schedule
 	}
 	for ipVersion, family := range self.families {
 		state.families[ipVersion] = *family
+	}
+	for ipVersion, c := range self.counters {
+		state.counters[ipVersion] = *c
 	}
 	return state
 }
@@ -508,6 +529,10 @@ func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 			self.families[ipVersion] = &copied
 		}
 	}
+	for ipVersion, c := range previous.counters {
+		copied := c
+		self.counters[ipVersion] = &copied
+	}
 	now := self.settings.Now()
 	for key, schedule := range self.schedules {
 		previousSchedule, ok := previous.schedules[key]
@@ -535,6 +560,25 @@ func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 	// a trigger that landed just ahead of the close, which no pass has acted on
 	self.forcedActivate = previous.forcedActivate
 	self.carriersChanged = previous.carriersChanged
+}
+
+// FamilyCounters reports the counters of activation attempts for one family.
+func (self *ExtenderActivator) FamilyCounters(ipVersion int) ExtenderFamilyCounters {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if c, ok := self.counters[ipVersion]; ok {
+		return *c
+	}
+	return ExtenderFamilyCounters{}
+}
+
+func (self *ExtenderActivator) familyCountersWithLock(ipVersion int) *ExtenderFamilyCounters {
+	if c, ok := self.counters[ipVersion]; ok {
+		return c
+	}
+	c := &ExtenderFamilyCounters{}
+	self.counters[ipVersion] = c
+	return c
 }
 
 // Whether the family of a schedule stands activated. The one schedule of the plain
@@ -676,11 +720,14 @@ func NewExtenderActivator(
 		done:           make(chan struct{}),
 		log:            loggerOrDefault(settings.Log),
 		settings:       settings,
-		changeMonitor:  NewMonitorValue[uint64](0),
-		wakeMonitor:    NewMonitor(),
-		families:       map[int]*ExtenderFamilyActivationStatus{},
-		schedules:      map[int]*extenderActivateSchedule{},
-		helloAddresses: map[int]netip.Addr{},
+		changeMonitor:          NewMonitorValue[uint64](0),
+		wakeMonitor:            NewMonitor(),
+		families:               map[int]*ExtenderFamilyActivationStatus{},
+		schedules:              map[int]*extenderActivateSchedule{},
+		helloAddresses:         map[int]netip.Addr{},
+		counters:               map[int]*ExtenderFamilyCounters{},
+		lastPeriodicLogTimes:   map[int]time.Time{},
+		firstFailureHintLogged: map[int]bool{},
 	}
 	// the run every post reports, so a host log names the run the operator's
 	// activation rows carry (G3)
@@ -693,6 +740,10 @@ func NewExtenderActivator(
 	self.fallback = len(self.ipVersions()) == 0 && self.fallbackApiUrl() != ""
 	for _, ipVersion := range self.ipVersions() {
 		self.families[ipVersion] = &ExtenderFamilyActivationStatus{IpVersion: ipVersion}
+		self.counters[ipVersion] = &ExtenderFamilyCounters{}
+	}
+	if self.fallback {
+		self.counters[0] = &ExtenderFamilyCounters{}
 	}
 	// every family is due at start
 	for _, key := range self.scheduleKeys() {
@@ -919,6 +970,7 @@ func (self *ExtenderActivator) run() {
 		if due := self.dueScheduleKeys(now); 0 < len(due) {
 			self.activate(now, due)
 		}
+		self.logPeriodicNotActivated(self.settings.Now())
 
 		wait := self.nextActivateWait(now)
 		if self.settings.HelloUrl != "" {
@@ -1579,6 +1631,7 @@ func (self *ExtenderActivator) activateUrl(
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
+	start := self.settings.Now()
 	result, err := PostExtenderActivate(
 		ctx,
 		self.settings.ClientStrategy,
@@ -1586,6 +1639,10 @@ func (self *ExtenderActivator) activateUrl(
 		self.byJwt(),
 		args,
 	)
+	duration := self.settings.Now().Sub(start)
+	if duration < 0 {
+		duration = 0
+	}
 	if err != nil {
 		if self.ctx.Err() != nil {
 			return extenderActivateInterrupted, 0
@@ -1593,11 +1650,11 @@ func (self *ExtenderActivator) activateUrl(
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
 		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
-		self.recordFailure(ipVersion, now, err.Error(), false)
+		self.recordFailure(ipVersion, now, err.Error(), false, duration)
 		return extenderActivateFailed, 0
 	}
 	if result == nil {
-		self.recordFailure(ipVersion, now, "the operator sent no activation result", false)
+		self.recordFailure(ipVersion, now, "the operator sent no activation result", false, duration)
 		return extenderActivateFailed, 0
 	}
 	if ipVersion == 0 {
@@ -1615,7 +1672,7 @@ func (self *ExtenderActivator) activateUrl(
 		} else {
 			self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
 		}
-		self.recordFailure(ipVersion, now, message, true)
+		self.recordFailure(ipVersion, now, message, true, duration)
 		return extenderActivateRefused, retryAfter
 	}
 
@@ -1633,10 +1690,10 @@ func (self *ExtenderActivator) activateUrl(
 	if ipVersion == 0 {
 		// an activation with no family cannot be attributed to one, and the
 		// mesh address of D2 has no family to be published under
-		self.recordFailure(ipVersion, now, "the operator named no address family", false)
+		self.recordFailure(ipVersion, now, "the operator named no address family", false, duration)
 		return extenderActivateFailed, 0
 	}
-	if moved := self.recordSuccess(ipVersion, now, result); moved {
+	if moved := self.recordSuccess(ipVersion, now, result, duration); moved {
 		// the address the last check saw on this family was read against
 		// the address the operator published before, so it says nothing of
 		// the one published now: a check that sees it again must compare it
@@ -1727,7 +1784,12 @@ func (self *ExtenderActivator) recordSuccess(
 	ipVersion int,
 	now time.Time,
 	result *ExtenderActivateResult,
+	attemptDuration ...time.Duration,
 ) (moved bool) {
+	duration := time.Duration(0)
+	if 0 < len(attemptDuration) {
+		duration = attemptDuration[0]
+	}
 	ip, _ := netip.ParseAddr(result.Ip)
 	ip = ip.Unmap()
 
@@ -1738,6 +1800,7 @@ func (self *ExtenderActivator) recordSuccess(
 		return false
 	}
 	moved = family.Ip.IsValid() && family.Ip != ip
+	wasActivated := family.Activated
 	family.Activated = true
 	family.Ip = ip
 	family.LastActivationTime = now
@@ -1750,6 +1813,23 @@ func (self *ExtenderActivator) recordSuccess(
 		family.ExpireTime = *result.ExpireTime
 	}
 	self.changedWithLock()
+
+	counters := self.familyCountersWithLock(ipVersion)
+	counters.Attempts += 1
+	counters.Worked += 1
+	counters.ConsecutiveFailures = 0
+	counters.LastSuccess = now
+	tryNum := counters.Attempts
+
+	familyName := extenderFamilyName(ipVersion)
+	self.log.Infof("[extender] %s activation try %d worked in %.1fs\n",
+		familyName, tryNum, duration.Seconds())
+
+	if !wasActivated {
+		self.log.Infof("[extender] %s is now activated on try %d. The platform can reach this host over %s.\n",
+			familyName, tryNum, familyName)
+	}
+
 	return moved
 }
 
@@ -1761,7 +1841,13 @@ func (self *ExtenderActivator) recordFailure(
 	now time.Time,
 	message string,
 	refused bool,
+	attemptDuration ...time.Duration,
 ) {
+	duration := time.Duration(0)
+	if 0 < len(attemptDuration) {
+		duration = attemptDuration[0]
+	}
+
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -1776,6 +1862,196 @@ func (self *ExtenderActivator) recordFailure(
 		family.LastRefused = refused
 	}
 	self.changedWithLock()
+
+	reason := cleanFailureReason(message)
+
+	targetVersions := []int{ipVersion}
+	if ipVersion == 0 && 0 < len(self.families) {
+		targetVersions = nil
+		for v := range self.families {
+			targetVersions = append(targetVersions, v)
+		}
+		slices.Sort(targetVersions)
+	}
+
+	for _, v := range targetVersions {
+		counters := self.familyCountersWithLock(v)
+		counters.Attempts += 1
+		counters.Failed += 1
+		counters.ConsecutiveFailures += 1
+		counters.LastFailure = now
+		counters.LastFailureReason = reason
+		tryNum := counters.Attempts
+		familyName := extenderFamilyName(v)
+
+		self.log.Infof("[extender] %s activation try %d failed after %.1fs: %s\n",
+			familyName, tryNum, duration.Seconds(), reason)
+
+		if !self.firstFailureHintLogged[v] {
+			self.firstFailureHintLogged[v] = true
+			self.log.Infof("[extender] %s failed for the first time. Check that inbound TCP 443 reaches this host and that it has a public %s address.\n",
+				familyName, familyName)
+		}
+	}
+}
+
+func (self *ExtenderActivator) logPeriodicNotActivated(now time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	families := self.ipVersions()
+	if len(families) == 0 && self.fallback {
+		for v := range self.families {
+			families = append(families, v)
+		}
+		slices.Sort(families)
+	}
+
+	for _, ipVersion := range families {
+		family := self.families[ipVersion]
+		if family == nil || family.Activated {
+			continue
+		}
+		lastTime := self.lastPeriodicLogTimes[ipVersion]
+		if !lastTime.IsZero() && now.Sub(lastTime) < 5*time.Minute {
+			continue
+		}
+		self.lastPeriodicLogTimes[ipVersion] = now
+
+		counters := self.familyCountersWithLock(ipVersion)
+		familyName := extenderFamilyName(ipVersion)
+
+		var schedule *extenderActivateSchedule
+		if s, ok := self.schedules[ipVersion]; ok {
+			schedule = s
+		} else if self.fallback {
+			schedule = self.schedules[0]
+		}
+
+		nextTryClause := "next try at once"
+		if schedule != nil && !schedule.nextActivateTime.IsZero() {
+			if schedule.nextActivateTime.After(now) {
+				wait := schedule.nextActivateTime.Sub(now)
+				nextTryClause = fmt.Sprintf("next try in %s at %s",
+					formatDuration(wait),
+					formatNextTryTime(schedule.nextActivateTime, now),
+				)
+			} else {
+				nextTryClause = fmt.Sprintf("next try in 0s at %s",
+					formatNextTryTime(schedule.nextActivateTime, now),
+				)
+			}
+		}
+
+		if counters.Failed > 0 && !counters.LastFailure.IsZero() {
+			failAge := now.Sub(counters.LastFailure)
+			if failAge < 0 {
+				failAge = 0
+			}
+			self.log.Infof("[extender] %s is not activated yet: %d tries, %d worked, %d failed; %s; last failure %s ago: %s\n",
+				familyName,
+				counters.Attempts,
+				counters.Worked,
+				counters.Failed,
+				nextTryClause,
+				formatDuration(failAge),
+				counters.LastFailureReason,
+			)
+		} else {
+			self.log.Infof("[extender] %s is not activated yet: %d tries, %d worked, %d failed; %s\n",
+				familyName,
+				counters.Attempts,
+				counters.Worked,
+				counters.Failed,
+				nextTryClause,
+			)
+		}
+	}
+}
+
+func extenderFamilyName(ipVersion int) string {
+	switch ipVersion {
+	case 4:
+		return "IPv4"
+	case 6:
+		return "IPv6"
+	default:
+		return fmt.Sprintf("IPv%d", ipVersion)
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		sec := int(d.Round(time.Second).Seconds())
+		return fmt.Sprintf("%ds", sec)
+	}
+	if d < time.Hour {
+		min := int(d.Round(time.Minute).Minutes())
+		if min == 0 {
+			sec := int(d.Round(time.Second).Seconds())
+			return fmt.Sprintf("%ds", sec)
+		}
+		if min == 60 {
+			return "1h"
+		}
+		return fmt.Sprintf("%dm", min)
+	}
+	if d < 24*time.Hour {
+		h := int(d / time.Hour)
+		m := int((d % time.Hour).Round(time.Minute) / time.Minute)
+		if m == 60 {
+			h++
+			m = 0
+		}
+		if h == 24 {
+			return "1d"
+		}
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	days := int(d / (24 * time.Hour))
+	h := int((d % (24 * time.Hour)).Round(time.Hour) / time.Hour)
+	if h == 24 {
+		days++
+		h = 0
+	}
+	if h == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd%dh", days, h)
+}
+
+func formatNextTryTime(target, now time.Time) string {
+	targetUtc := target.UTC()
+	nowUtc := now.UTC()
+	if targetUtc.Year() == nowUtc.Year() && targetUtc.YearDay() == nowUtc.YearDay() {
+		return targetUtc.Format("15:04 UTC")
+	}
+	return targetUtc.Format("2006-01-02 15:04 UTC")
+}
+
+func cleanFailureReason(errStr string) string {
+	errStr = strings.TrimSpace(errStr)
+	lower := strings.ToLower(errStr)
+	if strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") {
+		return "the platform did not answer in time"
+	}
+	if strings.Contains(lower, "connection refused") {
+		return "could not connect to the platform"
+	}
+	if strings.Contains(lower, "the operator ") {
+		errStr = strings.ReplaceAll(errStr, "the operator ", "the platform ")
+		errStr = strings.ReplaceAll(errStr, "The operator ", "the platform ")
+	}
+	errStr = strings.TrimRight(errStr, ".\n\r")
+	errStr = strings.ReplaceAll(errStr, "—", "-")
+	errStr = strings.ReplaceAll(errStr, "--", "-")
+	return errStr
 }
 
 // Records a post held back for its carriers. That asked nothing of the operator, so
