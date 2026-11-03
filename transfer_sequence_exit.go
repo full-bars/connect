@@ -1,6 +1,197 @@
 package connect
 
-import "time"
+import (
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var sequenceExitDetailEnv = sync.OnceValue(func() bool {
+	return os.Getenv("URNETWORK_SEQUENCE_EXIT_DETAIL") == "1"
+})
+
+var sequenceExitDetailForTest atomic.Int32
+
+func isSequenceExitDetail(log Logger) bool {
+	if v := sequenceExitDetailForTest.Load(); v != 0 {
+		return v > 0
+	}
+	if sequenceExitDetailEnv() {
+		return true
+	}
+	if log != nil && log.V(1).Enabled() {
+		return true
+	}
+	return false
+}
+
+type sequenceExitGroupKey struct {
+	reason       string
+	destination  Id
+	routeWritten bool
+	cause        string
+}
+
+type sequenceExitGroup struct {
+	key               sequenceExitGroupKey
+	count             int
+	routeWrittenCount int
+	sends             int
+	lifetime          time.Duration
+	sampleClientTag   string
+	log               Logger
+	window            time.Duration
+}
+
+func (grp *sequenceExitGroup) emit() {
+	if grp.log == nil {
+		grp.log = DefaultLogger()
+	}
+	grp.log.Infof("[s]event=sequence_exit count=%d reason=%s destination=%s cause=%s route_written=%d sends=%d lifetime=%s client=%s window=%s\n",
+		grp.count,
+		grp.key.reason,
+		grp.key.destination,
+		grp.key.cause,
+		grp.routeWrittenCount,
+		grp.sends,
+		grp.lifetime,
+		grp.sampleClientTag,
+		grp.window,
+	)
+}
+
+type sequenceExitAggregator struct {
+	mutex       sync.Mutex
+	window      time.Duration
+	groups      map[sequenceExitGroupKey]*sequenceExitGroup
+	timer       *time.Timer
+	windowStart time.Time
+}
+
+func newSequenceExitAggregator(window time.Duration) *sequenceExitAggregator {
+	return &sequenceExitAggregator{
+		window: window,
+		groups: make(map[sequenceExitGroupKey]*sequenceExitGroup),
+	}
+}
+
+var globalSequenceExitAggregator = newSequenceExitAggregator(60 * time.Second)
+
+type sequenceExitRecord struct {
+	reason       string
+	destination  Id
+	routeWritten bool
+	cause        error
+	sends        int
+	lifetime     time.Duration
+	clientTag    string
+	log          Logger
+}
+
+func (a *sequenceExitAggregator) record(rec sequenceExitRecord) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	causeStr := "<nil>"
+	if rec.cause != nil {
+		causeStr = rec.cause.Error()
+	}
+
+	key := sequenceExitGroupKey{
+		reason:       rec.reason,
+		destination:  rec.destination,
+		routeWritten: rec.routeWritten,
+		cause:        causeStr,
+	}
+
+	grp, exists := a.groups[key]
+	if !exists {
+		grp = &sequenceExitGroup{
+			key:             key,
+			sends:           rec.sends,
+			lifetime:        rec.lifetime,
+			sampleClientTag: rec.clientTag,
+			log:             rec.log,
+			window:          a.window,
+		}
+		a.groups[key] = grp
+	}
+	grp.count++
+	if rec.routeWritten {
+		grp.routeWrittenCount++
+	}
+	if grp.sampleClientTag == "" {
+		grp.sampleClientTag = rec.clientTag
+	}
+	if grp.log == nil {
+		grp.log = rec.log
+	}
+	if rec.sends > grp.sends {
+		grp.sends = rec.sends
+	}
+	if grp.lifetime == 0 {
+		grp.lifetime = rec.lifetime
+	}
+
+	if a.timer == nil {
+		a.windowStart = time.Now()
+		a.timer = time.AfterFunc(a.window, a.flush)
+	}
+}
+
+func (a *sequenceExitAggregator) flush() {
+	a.mutex.Lock()
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
+	if len(a.groups) == 0 {
+		a.mutex.Unlock()
+		return
+	}
+	toEmit := a.groups
+	a.groups = make(map[sequenceExitGroupKey]*sequenceExitGroup)
+	a.mutex.Unlock()
+
+	for _, grp := range toEmit {
+		grp.emit()
+	}
+}
+
+func (a *sequenceExitAggregator) reset() {
+	a.mutex.Lock()
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
+	a.groups = make(map[sequenceExitGroupKey]*sequenceExitGroup)
+	a.mutex.Unlock()
+}
+
+func isRoutineSequenceExit(reason string, destination Id, routeWritten bool, pendingContracts int, sends int) bool {
+	if routeWritten {
+		return false
+	}
+	if reason != "ack_lifetime" && reason != "context" {
+		return false
+	}
+	if pendingContracts > 0 {
+		return false
+	}
+	if destination != (Id{}) && sends <= 1 {
+		return false
+	}
+	return true
+}
+
+func flushSequenceExitAggregator() {
+	globalSequenceExitAggregator.flush()
+}
+
+func resetSequenceExitAggregatorForTest() {
+	globalSequenceExitAggregator.reset()
+}
 
 // One bounded metadata-only diagnostic identifies the first terminal owner
 // decision. Generic callback errors intentionally retain their old contract.
@@ -53,6 +244,21 @@ func (self *SendSequence) recordSendSequenceExit(reason string, item *sendItem, 
 		pendingSacks, pendingContracts = len(self.ackWindow.selectiveAcks), len(self.ackWindow.contractMissingAcks)
 		self.ackWindow.ackLock.Unlock()
 	}
+
+	if !isSequenceExitDetail(self.log) && isRoutineSequenceExit(reason, self.destination, written, pendingContracts, sends) {
+		globalSequenceExitAggregator.record(sequenceExitRecord{
+			reason:       reason,
+			destination:  self.destination,
+			routeWritten: written,
+			cause:        cause,
+			sends:        sends,
+			lifetime:     lifetime,
+			clientTag:    self.client.ClientTag(),
+			log:          self.log,
+		})
+		return
+	}
+
 	deadlineNanos := int64(0)
 	if !deadline.IsZero() {
 		deadlineNanos = deadline.UnixNano()

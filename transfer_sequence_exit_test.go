@@ -201,3 +201,274 @@ func TestSendSequenceExitDiscriminatorDueIdentity(t *testing.T) {
 		t.Log(lines[0])
 	})
 }
+
+type sequenceExitVerboseLogger struct {
+	*recordingLogger
+}
+
+func (l *sequenceExitVerboseLogger) V(level int32) Verbose {
+	return sequenceExitVerboseRecorder{l.recordingLogger}
+}
+
+type sequenceExitVerboseRecorder struct {
+	*recordingLogger
+}
+
+func (sequenceExitVerboseRecorder) Enabled() bool      { return true }
+func (r sequenceExitVerboseRecorder) Info(args ...any) { r.recordingLogger.Info(args...) }
+func (r sequenceExitVerboseRecorder) Infof(format string, args ...any) {
+	r.recordingLogger.Infof(format, args...)
+}
+
+func setSequenceExitDetailForTest(t testing.TB, enabled bool) {
+	old := sequenceExitDetailForTest.Swap(1)
+	if !enabled {
+		sequenceExitDetailForTest.Store(-1)
+	}
+	t.Cleanup(func() {
+		sequenceExitDetailForTest.Store(old)
+	})
+}
+
+func TestSendSequenceExitRoutineAggregatedOneWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		for i := 0; i < 5; i++ {
+			seq := &SendSequence{
+				log:         log,
+				client:      &Client{},
+				sequenceId:  NewId(),
+				destination: Id{},
+			}
+			item := &sendItem{
+				messageId:              NewId(),
+				sequenceNumber:         uint64(i),
+				sendCount:              3,
+				sendTime:               time.Now(),
+				pacingSentAtNanos:      time.Now().UnixNano(),
+				ackTimeout:             time.Minute,
+				transportWriteObserved: false,
+			}
+			seq.recordSendSequenceExit("ack_lifetime", item, time.Now().Add(time.Minute), context.DeadlineExceeded)
+		}
+
+		// Halfway through window: nothing emitted yet
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		if len(log.linesWith("event=sequence_exit")) != 0 {
+			t.Fatalf("emitted before window flush: %v", log.linesWith("event=sequence_exit"))
+		}
+
+		// Advance past 60s window
+		time.Sleep(31 * time.Second)
+		synctest.Wait()
+
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("expected exactly 1 aggregated line, got %d: %v", len(lines), lines)
+		}
+		expectedFields := []string{
+			"count=5",
+			"reason=ack_lifetime",
+			"destination=00000000-0000-0000-0000-000000000000",
+			"cause=context deadline exceeded",
+			"route_written=0",
+			"sends=3",
+			"lifetime=1m0s",
+			"window=1m0s",
+			"client=",
+		}
+		for _, field := range expectedFields {
+			if !strings.Contains(lines[0], field) {
+				t.Fatalf("aggregated line missing %q: %s", field, lines[0])
+			}
+		}
+	})
+}
+
+func TestSendSequenceExitRouteWrittenImmediate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		seq := &SendSequence{
+			log:         log,
+			client:      &Client{},
+			sequenceId:  NewId(),
+			destination: Id{},
+		}
+		item := &sendItem{
+			messageId:              NewId(),
+			sequenceNumber:         0,
+			sendCount:              1,
+			sendTime:               time.Now(),
+			pacingSentAtNanos:      time.Now().UnixNano(),
+			ackTimeout:             time.Minute,
+			transportWriteObserved: true,
+		}
+		seq.recordSendSequenceExit("ack_lifetime", item, time.Now().Add(time.Minute), context.DeadlineExceeded)
+
+		synctest.Wait()
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("expected 1 immediate line, got %d: %v", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "route_written=true") || !strings.Contains(lines[0], "reason=ack_lifetime") {
+			t.Fatalf("unexpected immediate line content: %s", lines[0])
+		}
+	})
+}
+
+func TestSendSequenceExitRareReasonImmediate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		seq := &SendSequence{
+			log:         log,
+			client:      &Client{},
+			sequenceId:  NewId(),
+			destination: Id{},
+		}
+		item := &sendItem{
+			messageId:              NewId(),
+			sequenceNumber:         0,
+			sendCount:              1,
+			sendTime:               time.Now(),
+			pacingSentAtNanos:      time.Now().UnixNano(),
+			ackTimeout:             time.Minute,
+			transportWriteObserved: false,
+		}
+		seq.recordSendSequenceExit("contract_canceled", item, time.Now().Add(time.Minute), errors.New("canceled"))
+
+		synctest.Wait()
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("expected 1 immediate line, got %d: %v", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "reason=contract_canceled") {
+			t.Fatalf("unexpected line: %s", lines[0])
+		}
+	})
+}
+
+func TestSendSequenceExitPendingContractsImmediate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		resetSequenceExitAggregatorForTest()
+		defer resetSequenceExitAggregatorForTest()
+
+		log := newRecordingLogger()
+		ackWindow := newSequenceAckWindow()
+		ackWindow.UpdateContractMissing(sequenceAck{messageId: NewId(), missingContractId: NewId()})
+
+		seq := &SendSequence{
+			log:         log,
+			client:      &Client{},
+			sequenceId:  NewId(),
+			destination: Id{},
+			ackWindow:   ackWindow,
+		}
+		item := &sendItem{
+			messageId:              NewId(),
+			sequenceNumber:         0,
+			sendCount:              1,
+			sendTime:               time.Now(),
+			pacingSentAtNanos:      time.Now().UnixNano(),
+			ackTimeout:             time.Minute,
+			transportWriteObserved: false,
+		}
+		seq.recordSendSequenceExit("ack_lifetime", item, time.Now().Add(time.Minute), context.DeadlineExceeded)
+
+		synctest.Wait()
+		lines := log.linesWith("event=sequence_exit")
+		if len(lines) != 1 {
+			t.Fatalf("expected 1 immediate line, got %d: %v", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "pending_contracts=1") || !strings.Contains(lines[0], "reason=ack_lifetime") {
+			t.Fatalf("unexpected line: %s", lines[0])
+		}
+	})
+}
+
+func TestSendSequenceExitDebugSwitchRestoresPerRecord(t *testing.T) {
+	t.Run("atomic_switch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			resetSequenceExitAggregatorForTest()
+			defer resetSequenceExitAggregatorForTest()
+
+			setSequenceExitDetailForTest(t, true)
+
+			log := newRecordingLogger()
+			for i := 0; i < 3; i++ {
+				seq := &SendSequence{
+					log:         log,
+					client:      &Client{},
+					sequenceId:  NewId(),
+					destination: Id{},
+				}
+				item := &sendItem{
+					messageId:              NewId(),
+					sequenceNumber:         uint64(i),
+					sendCount:              3,
+					sendTime:               time.Now(),
+					pacingSentAtNanos:      time.Now().UnixNano(),
+					ackTimeout:             time.Minute,
+					transportWriteObserved: false,
+				}
+				seq.recordSendSequenceExit("ack_lifetime", item, time.Now().Add(time.Minute), context.DeadlineExceeded)
+			}
+
+			synctest.Wait()
+			lines := log.linesWith("event=sequence_exit")
+			if len(lines) != 3 {
+				t.Fatalf("expected 3 full lines immediately, got %d: %v", len(lines), lines)
+			}
+			for _, line := range lines {
+				if !strings.Contains(line, "reason=ack_lifetime") || !strings.Contains(line, "ctx=<nil>") {
+					t.Fatalf("not a full record: %s", line)
+				}
+			}
+		})
+	})
+
+	t.Run("logger_verbose_switch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			resetSequenceExitAggregatorForTest()
+			defer resetSequenceExitAggregatorForTest()
+
+			rec := newRecordingLogger()
+			vlog := &sequenceExitVerboseLogger{recordingLogger: rec}
+
+			seq := &SendSequence{
+				log:         vlog,
+				client:      &Client{},
+				sequenceId:  NewId(),
+				destination: Id{},
+			}
+			item := &sendItem{
+				messageId:              NewId(),
+				sequenceNumber:         0,
+				sendCount:              3,
+				sendTime:               time.Now(),
+				pacingSentAtNanos:      time.Now().UnixNano(),
+				ackTimeout:             time.Minute,
+				transportWriteObserved: false,
+			}
+			seq.recordSendSequenceExit("ack_lifetime", item, time.Now().Add(time.Minute), context.DeadlineExceeded)
+
+			synctest.Wait()
+			lines := rec.linesWith("event=sequence_exit")
+			if len(lines) != 1 {
+				t.Fatalf("expected 1 full line immediately via logger V(1), got %d: %v", len(lines), lines)
+			}
+			if !strings.Contains(lines[0], "reason=ack_lifetime") || !strings.Contains(lines[0], "ctx=<nil>") {
+				t.Fatalf("not a full record: %s", lines[0])
+			}
+		})
+	})
+}
