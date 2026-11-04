@@ -203,7 +203,7 @@ func TestActivationLogTextSanitizesRedactedPathAppendedUrl(t *testing.T) {
 	}
 }
 
-func TestExtenderActivationRefusalLog(t *testing.T) {
+func TestExtenderActivatorRefusalLog(t *testing.T) {
 	const jwt = "sensitive-test-jwt"
 	operator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -211,7 +211,7 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 			fmt.Fprint(w, `{"client_address":"127.0.0.1"}`)
 			return
 		}
-		fmt.Fprint(w, `{"activated":false,"ip_version":4,"error":"quic carrier did not answer: sensitive-test-jwt"}`)
+		fmt.Fprint(w, `{"activated":false,"ip_version":4,"retry_after_seconds":95,"error":"quic carrier did not answer: sensitive-test-jwt"}`)
 	}))
 	defer operator.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -244,12 +244,12 @@ func TestExtenderActivationRefusalLog(t *testing.T) {
 			t.Fatal(ctx.Err())
 		}
 	}
-	lines := logger.linesWithPrefix("[extender] activate v4 refused ")
-	if len(lines) != 1 {
+	lines := logger.linesContaining("refused")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "[extender] activate v4 refused ") {
 		t.Fatalf("refusal lines: %v", lines)
 	}
 	line := lines[0]
-	for _, want := range []string{"carriers=tcp,quic", "api=127.0.0.1:", "last_remote=127.0.0.1:", "elapsed=", "attempts=", "quic carrier did not answer", "[redacted]"} {
+	for _, want := range []string{"carriers=tcp,quic", "api=127.0.0.1:", "last_remote=127.0.0.1:", "elapsed=", "attempts=", "retry_after=1m35s", "quic carrier did not answer", "[redacted]"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q from %q", want, line)
 		}

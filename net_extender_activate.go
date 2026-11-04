@@ -152,11 +152,13 @@ type ExtenderActivateResult struct {
 	// every step the operator's probe ran, in the order run: the tcp
 	// challenge, the forward through it, each dns port, then quic, with how
 	// long each ran, how much of the probe budget was left when it started,
-	// and how it ended (C2). A refusal's last step is the one that refused it.
-	// Empty when the activation was refused before anything was probed, and
-	// from an operator that predates the field (connect#230).
+	// and how it ended (C2). A refusal's last step is the one that refused it,
+	// unless the store refused after the probe passed. Empty when the activation
+	// was refused before anything was probed, and from an operator that predates
+	// the field (connect#230).
 	ProbeSteps []*ExtenderProbeStep `json:"probe_steps,omitempty"`
 	// The refusal kind an extender can act on, when supplied by the operator.
+	// An operator that predates the field says it in Error alone.
 	Refusal string `json:"refusal,omitempty"`
 }
 
@@ -1288,17 +1290,16 @@ const extenderActivateCarrierReturnFlapGuard = 10 * time.Minute
 // after its own draw (TcpCarrierReturned). What the status gave as the reason is over
 // now, whatever the posts come to.
 func (self *ExtenderActivator) scheduleCarrierHeldFamilies(now time.Time) {
-	if !slices.Contains(self.carriers(), ExtenderCarrierTcp) {
-		return
-	}
-	for _, schedule := range self.schedules {
-		if schedule.carrierHeld || schedule.unreachableHeld {
-			if !schedule.lastCarrierReturnRelease.IsZero() && now.Sub(schedule.lastCarrierReturnRelease) < extenderActivateCarrierReturnFlapGuard {
-				continue
+	if slices.Contains(self.carriers(), ExtenderCarrierTcp) {
+		for _, schedule := range self.schedules {
+			if schedule.carrierHeld || schedule.unreachableHeld {
+				if !schedule.lastCarrierReturnRelease.IsZero() && now.Sub(schedule.lastCarrierReturnRelease) < extenderActivateCarrierReturnFlapGuard {
+					continue
+				}
+				schedule.lastCarrierReturnRelease = now
+				schedule.unreachableHeld = false
+				schedule.nextActivateTime = now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
 			}
-			schedule.lastCarrierReturnRelease = now
-			schedule.unreachableHeld = false
-			schedule.nextActivateTime = now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
 		}
 	}
 	self.stateLock.Lock()
@@ -1957,9 +1958,8 @@ func (self *ExtenderActivator) activateUrl(
 		retryAfter := time.Duration(0)
 		if 0 < result.RetryAfterSeconds {
 			retryAfter = time.Duration(result.RetryAfterSeconds) * time.Second
-			self.log.Infof("[extender]activate v%d refused = %s (retry after %s)\n", ipVersion, message, retryAfter)
 		}
-		self.log.Infof("[extender] activate v%d refused carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), duration.Round(time.Millisecond), trace.attempts.Load(), activationLogText(message, jwt, apiUrl))
+		self.log.Infof("[extender] activate v%d refused carriers=%s api=%s last_remote=%s elapsed=%s attempts=%d retry_after=%s error=%s\n", ipVersion, strings.Join(carriers, ","), activationLogAddress(apiUrl), trace.remote.Load(), duration.Round(time.Millisecond), trace.attempts.Load(), retryAfter, activationLogText(message, jwt, apiUrl))
 		// where the operator's probe spent its budget. A refusal reads the
 		// same whether the extender answered late or never, and the step
 		// timings are the only thing that tells them apart (connect#230).

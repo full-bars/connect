@@ -115,6 +115,28 @@ func TestExtenderActivatorHoldsWithoutTheTcpCarrier(t *testing.T) {
 	}
 }
 
+func TestExtenderActivatorReturnWithoutTcpClearsCarrierError(t *testing.T) {
+	passHolds := newTestActivatePassHolds()
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierQuic}
+	}, passHolds.configure)
+	passHolds.next(t, "held without tcp")
+	for _, ipVersion := range []int{4, 6} {
+		if status := fixture.activator.Status().Family(ipVersion); status == nil || !extenderActivateCarrierFailureMessage(status.LastError) {
+			t.Fatalf("v%d status before return = %+v", ipVersion, status)
+		}
+	}
+
+	fixture.activator.TcpCarrierReturned()
+	passHolds.next(t, "return without tcp")
+	for _, ipVersion := range []int{4, 6} {
+		if status := fixture.activator.Status().Family(ipVersion); status == nil || status.LastError != "" {
+			t.Fatalf("v%d status after return = %+v", ipVersion, status)
+		}
+	}
+	fixture.expectFamilyPostCounts("after return without tcp", 0, 0)
+}
+
 // The webrtc carrier is the other path the operator can accept an activation on
 // (C2a), so a list with it and no tcp is posted, as the operator decides.
 func TestExtenderActivatorPostsTheWebRtcCarrierWithoutTcp(t *testing.T) {
