@@ -336,3 +336,108 @@ func TestStrategyRankingBiasedByDeliveryPerNetwork(t *testing.T) {
 		t.Fatalf("the delivery bias leaked to another network: fragment %f, normal %f", onOther[fragmentDialer], onOther[normalDialer])
 	}
 }
+
+// TestDialerDelivered pins the serial set inclusion rule:
+// with smart on, a neutral (weight 1) dialer with measured latency can join the
+// serial set. A measured dialer with negative delivery (weight < 1) stays OUT,
+// and an unmeasured weight-1 dialer stays OUT.
+func TestDialerDelivered(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name          string
+		smart         bool
+		measured      bool
+		hasVerdict    bool
+		verdict       strategyVerdict
+		wantDelivered bool
+	}{
+		{
+			name:          "smart on: neutral weight with measured latency joins serial set",
+			smart:         true,
+			measured:      true,
+			hasVerdict:    false,
+			wantDelivered: true,
+		},
+		{
+			name:          "smart on: measured dialer with weight < 1 (negative delivery) stays out",
+			smart:         true,
+			measured:      true,
+			hasVerdict:    true,
+			verdict:       verdictStalled,
+			wantDelivered: false,
+		},
+		{
+			name:          "smart on: unmeasured weight-1 dialer stays out",
+			smart:         true,
+			measured:      false,
+			hasVerdict:    false,
+			wantDelivered: false,
+		},
+		{
+			name:          "smart on: dialer with weight > 1 joins serial set",
+			smart:         true,
+			measured:      false,
+			hasVerdict:    true,
+			verdict:       verdictDelivered,
+			wantDelivered: true,
+		},
+		{
+			name:          "smart off: neutral weight with measured latency stays out",
+			smart:         false,
+			measured:      true,
+			hasVerdict:    false,
+			wantDelivered: false,
+		},
+		{
+			name:          "smart off: dialer with weight > 1 joins serial set",
+			smart:         false,
+			measured:      false,
+			hasVerdict:    true,
+			verdict:       verdictDelivered,
+			wantDelivered: true,
+		},
+		{
+			name:          "smart off: dialer with weight < 1 stays out",
+			smart:         false,
+			measured:      true,
+			hasVerdict:    true,
+			verdict:       verdictStalled,
+			wantDelivered: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withSmartDialer(t, c.smart)
+			scores := newTestScores(&now)
+			var dialer *clientDialer
+			if c.measured {
+				dialer = testDialer("dialer-"+c.name, 0, 0.25, 2, 50*time.Millisecond, 0)
+			} else {
+				dialer = testDialer("dialer-"+c.name, 0, 0.25, 0, 0, 0)
+			}
+			strategy := &ClientStrategy{
+				scores:  scores,
+				dialers: map[*clientDialer]bool{dialer: true},
+			}
+			info := strategy.dialerInfo(dialer)
+			if c.hasVerdict {
+				scores.recordVerdict(info.delivery.networkId, info.delivery.dialerKey, c.verdict)
+			}
+			weight := scores.weight(info.delivery.networkId, info.delivery.dialerKey)
+			if c.hasVerdict && c.verdict == verdictStalled && !(weight < 1) {
+				t.Fatalf("weight %f not < 1", weight)
+			}
+			if !c.hasVerdict && weight != 1 {
+				t.Fatalf("weight %f != 1", weight)
+			}
+			if c.hasVerdict && c.verdict == verdictDelivered && !(weight > 1) {
+				t.Fatalf("weight %f not > 1", weight)
+			}
+			if got := strategy.dialerDelivered(dialer); got != c.wantDelivered {
+				t.Fatalf("dialerDelivered() = %v, want %v (weight=%f, measured=%v, smart=%v)",
+					got, c.wantDelivered, weight, dialer.hasMeasuredLatency(), SmartDialerEnabled())
+			}
+		})
+	}
+}

@@ -752,6 +752,10 @@ type extenderActivateSchedule struct {
 	carrierHeld bool
 	// The daily hold was caused by an unreachable required TCP test.
 	unreachableHeld bool
+	// when the last carrier-return release occurred for this family. A release is
+	// allowed at most once every 10 minutes so a flapping carrier spends nothing of
+	// the operator's.
+	lastCarrierReturnRelease time.Time
 	// what the post that activated the family offered, nil unless its last post
 	// did. A carrier serving that is not in these is off its record
 	// (CarriersChanged).
@@ -983,8 +987,9 @@ func (self *ExtenderActivator) Reactivate() {
 // Says the tcp carrier is serving again after it was lost (G2): every family with a
 // post that came due while it was gone is posted within CarrierReturnJitter. Any other
 // family is left to its schedule, a refusal's retry_after and a private family's day
-// included, so a carrier that came back before anything was owed posts nothing and a
-// flapping listener spends nothing of the operator's. Safe to call from any goroutine.
+// included; a carrier-return release is allowed at most once every 10 minutes per family,
+// so a carrier that came back before anything was owed posts nothing and a flapping
+// listener spends nothing of the operator's. Safe to call from any goroutine.
 func (self *ExtenderActivator) TcpCarrierReturned() {
 	self.stateLock.Lock()
 	self.tcpCarrierReturned = true
@@ -1275,6 +1280,10 @@ func extenderActivateOffersMore[T comparable](serving []T, posted []T) bool {
 	})
 }
 
+// The shortest interval between carrier-return releases for one family, so a
+// flapping carrier spends nothing of the operator's.
+const extenderActivateCarrierReturnFlapGuard = 10 * time.Minute
+
 // Makes the families whose post came due with no required carrier serving due, each
 // after its own draw (TcpCarrierReturned). What the status gave as the reason is over
 // now, whatever the posts come to.
@@ -1284,6 +1293,10 @@ func (self *ExtenderActivator) scheduleCarrierHeldFamilies(now time.Time) {
 	}
 	for _, schedule := range self.schedules {
 		if schedule.carrierHeld || schedule.unreachableHeld {
+			if !schedule.lastCarrierReturnRelease.IsZero() && now.Sub(schedule.lastCarrierReturnRelease) < extenderActivateCarrierReturnFlapGuard {
+				continue
+			}
+			schedule.lastCarrierReturnRelease = now
 			schedule.unreachableHeld = false
 			schedule.nextActivateTime = now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
 		}

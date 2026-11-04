@@ -178,6 +178,59 @@ func TestExtenderActivatorRetriesUnreachableWhenTcpReturns(t *testing.T) {
 	fixture.waitActivation()
 }
 
+// A flapping tcp carrier does not release an unreachable hold repeatedly: a carrier-return
+// release is allowed at most once every 10 minutes per family, so a flapping listener
+// spends at most one probe of the operator's and the hold stays in place.
+func TestExtenderActivatorCarrierFlapGuardKeepsUnreachableHold(t *testing.T) {
+	passHolds := newTestActivatePassHolds()
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setRefusal(testActivateUnreachableRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(int) bool { return true }
+		settings.CarrierReturnJitter = -1
+		passHolds.configure(settings)
+	})
+	fixture.waitPost()
+	if hold := passHolds.next(t, "unreachable"); hold != 24*time.Hour {
+		t.Fatalf("hold = %s, want one day", hold)
+	}
+
+	postsBefore := fixture.operator.postCount(4)
+	for i := 0; i < 5; i++ {
+		fixture.activator.TcpCarrierReturned()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// At most one post is allowed across the 5 returns.
+	post := fixture.waitPost()
+	if post.ipVersion != 4 {
+		t.Fatalf("post = v%d, want v4", post.ipVersion)
+	}
+	if hold := passHolds.next(t, "refusal after carrier return"); hold != 24*time.Hour {
+		t.Fatalf("hold = %s, want one day", hold)
+	}
+
+	select {
+	case extra := <-fixture.operator.posts:
+		t.Fatalf("unexpected extra post from flapping carrier: %+v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if posts := fixture.operator.postCount(4) - postsBefore; posts > 1 {
+		t.Fatalf("posts = %d from 5 carrier returns, want at most 1", posts)
+	}
+
+	// The hold is still in place after the skipped returns.
+	if !fixture.activator.State().schedules[4].unreachableHeld {
+		t.Fatal("the unreachable hold is not in place after the skipped returns")
+	}
+	status := fixture.activator.Status().Family(4)
+	if status.Activated || !status.LastRefused || status.LastError != testActivateUnreachableRefusal {
+		t.Fatalf("v4 status = %+v, want unreachable refusal", status)
+	}
+}
+
 // The steps decide it when the operator sends them: a tcp step that ran out of
 // time holds the family for the day whatever the words, and a forward that
 // failed holds it on the backoff whatever the words.
