@@ -519,7 +519,10 @@ func (self *ClientStrategy) dialerDelivered(dialer *clientDialer) bool {
 	if info == nil || info.delivery == nil {
 		return false
 	}
-	return 1 < self.scores.weight(info.delivery.networkId, info.delivery.dialerKey)
+	weight := self.scores.weight(info.delivery.networkId, info.delivery.dialerKey)
+	// A measured, healthy route may lead while delivery evidence is neutral.
+	// A route with negative delivery evidence must still lose to a working one.
+	return weight > 1 || (weight == 1 && SmartDialerEnabled() && dialer.hasMeasuredLatency())
 }
 
 // Finalizes at most once, with the score store called outside the attempt lock.

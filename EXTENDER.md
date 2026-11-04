@@ -338,7 +338,9 @@ from the extender's configuration; the sdk provider derives them from the
 network space hosts as `<host>` and `*.<host>` for the host and the
 migration host; connectctl takes them by flag. An extender request's
 destination must match an operator pattern; spoof domains are never valid
-destinations. Any other request on a terminated connection, HTTP/1.1, h2
+destinations, and one that only a `*.` pattern admits must be a syntactic host
+name, since the client chooses everything in front of the suffix. Any other
+request on a terminated connection, HTTP/1.1, h2
 or H3, is answered by a reverse proxy to `https://<sni>` when the SNI is
 on the whitelist, using the extender's egress on the client's family with
 normal CA verification upstream, so a prober gets the real site behind a
@@ -634,9 +636,12 @@ evidence in connect/GEOMAP.md §5.5).
 B1. Keys. Ed25519 everywhere. An extender generates its identity key once;
 the sdk persists it in local state as `.extender_key` (JSON with the hex
 seed), connectctl reads it from `--extender_key_file` and creates it when
-absent. The operator root key lives in the vault resource `extender.yml`
-as `root_private_key_hex` with `root_public_keys_hex` listing every key
-whose signatures are accepted, for rotation.
+absent. The key stays on the host when the account changes (E7), and the
+operator registers it to the network that first activated it (C2c), so a host
+that moves to another network needs a new key. The operator root key lives in
+the vault resource `extender.yml` as `root_private_key_hex` with
+`root_public_keys_hex` listing every key whose signatures are accepted, for
+rotation.
 
 B2. Records. In `protocol/extender.proto`:
 
@@ -743,6 +748,12 @@ network_extender_publish (
 `network_extender_address (active, last_publish_time)` and
 `network_extender_publish (published_time, create_time)`.
 
+`public_key` is unique, so a key has one row. `network_id` is the network
+whose activation first stored the key, and no activation changes it;
+`client_id` is the client of that network that activated it last (C2c). The
+contract parties of J2 name these two. Nothing deletes a row, so a key stays
+registered through a revocation, a removed client and a removed network.
+
 C2. Activation. `POST /network/extender-activate`, client jwt, on `api-v4`
 or `api-v6` so the caller address has one family. An operator without
 family hosts, such as a development operator on an ip literal, is
@@ -776,7 +787,8 @@ spend records for its budgets are each recorded up to a second before it,
 so no create_time joins the address's hashed row to its client's and
 account's. An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
-is refused before it is probed. The handler probes the caller ip synchronously
+is refused before it is probed, and so is a key another network holds (C2c).
+The handler probes the caller ip synchronously
 within one 10 s probe budget, in this order: the required test (C2a) --
 `connect.ProbeExtenderCarrier` dials the tcp carrier with a random spoof
 name, sends a header with a challenge and verifies the response signature
@@ -787,8 +799,9 @@ then quic with what is left. Result `{activated, ip, ip_version,
 carriers, refused_carriers, probe_steps, error, retry_after_seconds,
 expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
-random, `allowed_hosts` the operator patterns of A5. On success the row
-and the family's address row are upserted active, `record_issue_time` is
+random, `allowed_hosts` the operator patterns of A5. On success the row,
+which the upsert updates only for the network that holds the key (C2c), and
+the family's address row are upserted active, `record_issue_time` is
 set, and a record publish row is inserted. The country comes from the ip
 geolocation of the caller. A failed required test (C2a) returns `activated: false`
 with the failing test in `error` and stores nothing. An optional carrier
@@ -798,10 +811,15 @@ public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each
 (C2a). Zero ports and an empty tld
 take the C1 defaults. The budgets are spent at the probe: every check that
 refuses without dialing the caller (the arguments, the caller and its
-family, the configuration) precedes them, so a malformed request or an
-unconfigured operator never spends a caller's budget, and the client's, the
-address's and the account's budgets are spent together or not at all, one
-spend of a budget at a time. Every activation
+family, the configuration, the key's network) precedes them, so a malformed
+request, an unconfigured operator or a key another network holds never spends
+a caller's budget, and the client's, the address's and the account's budgets
+are spent together or not at all, one spend of a budget at a time. A budget
+that is already spent refuses first, on a read that takes no lock
+(connect#230): a fleet's posts that one budget refuses would otherwise each
+queue on its lock, holding a database connection, to be told what the read
+says. That read only ever refuses, and what it finds room for is decided again
+under the lock. Every activation
 that dials the caller is counted, whatever its probe finds. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
@@ -859,7 +877,8 @@ refusals included: `name` (`tcp`, `forward`, `dns`, `quic`), `ip_version`,
 `budget_left_ms` (what was left of the 10 s budget when the step started)
 and `outcome` (`ok`; `error`, it failed on its own; `timeout`, its budget
 ran out before it answered). A refusal's last step is the one that refused
-it; a request refused before the probe has no list. Each
+it, unless the refusal came at the store, after the probe had passed (C2c); a
+request refused before the probe has no list. Each
 `refused_carriers` entry carries the same two times. A refusal says how
 long its step ran: "the forward failed after 0.1 s: ..." makes no claim
 about the budget, while a step whose budget ran out says how much it had,
@@ -871,7 +890,8 @@ left of the 10 s probe budget: ..." for quic; one that failed on its own
 keeps its probe's error. Old providers decode the answer into
 `connect.ExtenderActivateResult`, which skips the new fields. The api
 counts every activation in `urnetwork_extender_activations_total{stage,
-outcome, family}` -- stage `request`, `config`, `busy`, `budget`, `tcp`,
+outcome, family}` -- stage `request`, `config`, `owner` (the key is registered
+to another network, C2c), `busy`, `budget`, `tcp`,
 `forward` or `store`; outcome `refused`, `error`, `timeout`,
 `other_family` or `activated`, and for `busy` why (`probes`,
 `budget_lock`) and for `budget` which budget refused (`client`,
@@ -879,6 +899,106 @@ outcome, family}` -- stage `request`, `config`, `busy`, `budget`, `tcp`,
 `ipv6` or `unknown` -- and times every step in
 `urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
 whose buckets end at 10 s. The extenders dashboard shows both.
+
+C2c. Key ownership (2026-11-02). An identity key belongs to the network
+whose activation first stored it, which holds the key from then on (C1). Who
+may activate a key, on either family:
+
+- A key no network holds: the activation is judged as C2 says, and once it
+  is stored the client's network holds the key.
+- A key the client's network holds: any client of that network. The row takes
+  that client, so a device that returns to its account under a new client
+  keeps its extender, with its id and its history.
+- A key another network holds: no client. The activation is refused.
+
+The refusal is the ordinary answer of C2, a 200 with `activated: false` and
+`refusal: "key_other_network"`, and its `error` is fixed: "This extender key is
+registered to another network, so it cannot be activated for this one. An
+updated app makes a new extender key for this network on its own; otherwise
+remove the extender key file and restart to make a new one." Its first sentence
+is what an extender reads the refusal by from an operator that predates
+`refusal` (2026-11-02 to 11-03, whose second sentence read "Generate a new
+extender key, or ask support to move the key to this network."), so it stays as
+it is. It names no network, and it has no
+`retry_after_seconds`, since waiting does not change the answer. The handler
+reads the key's network once the configuration has passed and before the probe
+guard, so the refusal dials nothing, spends no budget and has no
+`probe_steps`. The store decides again in the transaction that writes, whose
+upsert updates only a row of the activating network: a post that finds the key
+another network's only at that point writes nothing and gets the same refusal,
+with the `probe_steps` of its probe, whose budgets stay spent. A post's
+measurement opt-out (lag.dev/PLAN.md C9) applies only for the network that holds
+the key. A refused post leaves the row, its addresses, its record, its
+activation history and the publish queue as they were, and the uptime task goes
+on probing those addresses (C3). The refusal is counted under stage `owner`
+(C2b).
+
+An extender reads it by `refusal`, or by the first sentence of `error` from an
+operator that predates `refusal` (`connect.ExtenderActivateResult.
+KeyHeldByAnotherNetwork`). The family is held until its tick rather than on the
+backoff, since no wait changes the answer, and a trigger still posts it at once
+(G3). The status reads `error`, case `activation_refused`, with the refusal as
+its reason, unless the directory shows the key revoked, which N3 tests first.
+Only the extender role is refused. The device's VPN and its providing go on.
+
+The key stays on the host when the account changes (B1, E7). So a device
+signed in to another account, one signed in to a new account after the old one
+was deleted, and a state directory copied to a host under another account each
+post a key another network holds.
+
+Nothing frees a key: a revocation (C3), a sign-out, "Reset extenders" (E7), a
+removed client and a removed network all leave it registered, and no route
+changes a key's network.
+
+A key is reissued on the host, by replacing it. The new key is a new extender
+with no history, under the same rule. The old key's row stays with its network,
+and the uptime probes deactivate its addresses once the host answers for the
+new key (C3).
+
+- The provider role of the sdk (G2) makes the new key itself, for a space with
+  local state, which is every app's (decided 2026-11-03). On the refusal the
+  role asks the provider for a key of the network's own, at most once a role.
+  The space makes a key, keeps it in `.extender_network_keys` under the id of
+  the network the client jwt names, and the provider starts the role again on
+  it, as a new process starts, with every family due. While the role runs for
+  that network the space presents that key, to the node as well (B1), and the
+  measurement name is the new extender id's (C4), so it is the network's
+  identity from then on. `.extender_key` is left as it was, and a network with
+  no key of its own runs under it, so a device that goes back to the account
+  that holds `.extender_key` presents it again, with its history. Both files
+  are kept across a sign-out (E7). A space makes a network at most one key a
+  day, so no run of the operator's answers can make it churn through keys; a
+  refusal of the network's key within the day stands in the status. A refusal
+  of a key the space no longer presents for the network, one the role posted
+  before it was replaced, makes none.
+- An app that predates that does it by hand. Stop the app and whatever runs
+  its device (the linux daemon, the windows service), remove `.extender_key`
+  from that process's local state, and start it again: the sdk creates a key
+  when the file is absent (B1). With the automatic key, a network that has a
+  key of its own runs under it, so making it a new key by hand means removing
+  `.extender_network_keys` too. Mobile apps have no extender role (G1).
+- A space with no local state has nowhere to keep a second key and makes none:
+  its embedder keeps the identity and replacing it is the embedder's. The sn
+  miner: stop it, remove `.provider.extender.key` from its state
+  directory (`~/.urnetwork` or `URNETWORK_STATE_DIR`; with `--all-operators`,
+  that operator's directory under `operators/`), and start it again.
+- `connectctl extender`: point `--extender_key_file` at a new path, or remove
+  `.extender_key` from `--state_dir`. With neither flag every start is a new
+  key (G4).
+
+A move of a key to another network is a correction support makes to the row by
+hand; no activation does it. It is made only for the verified admin of the
+network that holds the key, with the operator's approval, and naming a key or
+holding its file is no ground for one. The records then carry no camouflage key
+until the new network's own passing activation posts one (P6).
+
+What support tells someone refused: what the refusal means, and that it touches
+only the extender role; that an updated app makes the new key on its own, and
+how to make one by hand for anything else they run, which is the default
+answer, and that it starts with no history; and that a move is made only as
+above. Support does not say which network holds a key or whose it is, and
+does not ask for a key file or its seed, which are the extender's identity. Only
+public keys and the status text belong in a message.
 
 C3. Uptime probes. Taskworker task every 5 minutes over every active
 address, batched, concurrency 16, a challenge probe over the required path
@@ -1220,7 +1340,10 @@ share, an older id carried by another user's space applies nothing. A
 hosted device never resets: its space is the proxy host's. What a reset
 keeps beyond the directory's own list: `.extender_key`, the gossip mode,
 `.provide_extender` and the bootstrap DoH servers, which are not extender
-knowledge.
+knowledge. A reset, like a sign-out, therefore leaves the device with the
+identity key it had, which stays registered to the network that first activated
+it: under another network's account its activations are refused until the key
+is replaced (C2c).
 
 ### F. SDK surface and network space
 
@@ -1353,15 +1476,13 @@ encode or write is lost and nothing more, logged at most once a minute with the
 count since, so one client's address or a path that is down for a moment cannot
 end the socket every client of the carrier shares. Only a closed socket ends it, and
 that holds however long the writes fail: a socket whose every write fails stays up
-and reads as ready, with its line a minute. A sender can bring that about, since a
-source port of 0 fails every write to it and on a quiet port nothing else succeeds in
-between, so any bound on it is one a sender can reach. A bound of 5 minutes was
-tried and a review ended the server's real alt listeners with 160 datagrams, which
-ends the whole process with no drain, and a restart could not cure egress that
-refuses every write anyway. `Carriers` and `DnsPorts` say what is serving at each
-moment, and a probe's response, the status and the activation all read them. A first
-bind that fails is still the case above: that udp carrier stays down until the role
-restarts.
+and reads as ready, with its line a minute. No count or duration of failed writes
+ends it (decided on review, 2026-11-02): a restart could not cure egress that
+refuses every write, and `TestPacketTranslationServerOutlivesWritesThatAllFail`
+keeps such a bound from coming back. `Carriers` and `DnsPorts` say what is serving
+at each moment, and a probe's response, the status and the activation all read
+them. A first bind that fails is still the case above: that udp carrier stays down
+until the role restarts.
 
 The server itself ends only with `Close` or its context. The role reports its
 tcp carrier: `Listening` is true while it serves, and while it is lost
@@ -1388,15 +1509,32 @@ A role rebuilds rather than exiting the process: it is the spare capacity of a
 provider that is serving (G1), and a desktop app has no supervisor to restart it.
 connectctl, which exists only to run the extender, exits with an error instead (G4).
 
-Decided 2026-11-02 from the outage on network 01979e1c on 2026-11-01. Of about 190
-active extenders, 147 were revoked from 20:00Z. 131 of those went on posting, so their
-processes were up, while 46 of 47 sampled addresses did not answer on tcp 443, and the
-10 that refused it when udp 53 was sampled refused that too. One accept error, one udp
-carrier's exit or one failed write on the dns carrier used to close every carrier for
-the life of the process, nothing restarted the server, and the status went on saying
-listening while the activation went on posting. That is probably what happened: a real
-EMFILE reproduces the state, but no host's log confirms it, and which failure it was
-is not known.
+Decided 2026-11-02 from an outage of one operator's extenders on 2026-11-01. Of
+about 190 active extenders, 147 were revoked from 20:00Z. 131 of those went on
+posting, so their processes were up, while 46 of 47 sampled addresses did not answer
+on tcp 443, and the 10 that refused it when udp 53 was sampled refused that too.
+One accept error, one udp carrier's exit or one failed write on the dns carrier used
+to close every carrier for the life of the process, nothing restarted the server,
+and the status went on saying listening while the activation went on posting. That
+is probably what happened: a real EMFILE reproduces the state, but no host's log
+confirms it, and which failure it was is not known.
+
+`ErrorHandler` hears no client's address (`connect/extender/extender_error.go`). A stage
+reports its name and one class of failure: an errno, a timeout, a close, or a constant
+the site names, and nothing of the text or the chain of the error it came from, so a new
+stage or a new kind of error is scrubbed with nothing further done. Only `forward dial`,
+`datagram forward dial`, `nlayer hop dial` and `nlayer probe dial` keep the whole error,
+since each dials what the operator named (A5, A7, A11) and the client's address only
+chooses the family. Those are what an operator reads, and the role logs the first two.
+
+The extender's http servers keep no log of their own, since every line of theirs an
+operator might read names the client or repeats what the client sent: a broken h2
+greeting, a frame that cannot be read, a panic. The one that matters is the panic, so
+the handler catches its own and logs that it happened and where in the code, from the
+binary and with nothing of the value or the request, and `ErrorHandler` hears it as the
+stage `handler panic`. The gossip listener and the feed server, which the role installs on
+the gossip and feed services, log neither a connection's address nor the text of its
+socket's error.
 
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
@@ -1413,7 +1551,10 @@ A refusal that carries `retry_after_seconds` (C2: a spent activation budget,
 or an operator too busy to probe; connect#230) holds its family exactly that
 long, at least 1 minute and at most 6 hours, whether or not the family is
 private, and leaves its hold as it was: the operator probed nothing. An
-operator that predates the field gets the hold.
+operator that predates the field gets the hold. A refusal of the key as
+another network's (C2c) holds its family until its tick and leaves its hold as
+it was, since no wait changes it, and is told to the role (`OnRefused`), which
+makes a key of the network's own when it can (2026-11-03).
 A family without a global address on the host (`FamilySupported`) is not
 posted and is looked at again every 10 minutes, without doubling, since the
 look is local; one that gains an address is posted within 10 minutes however
@@ -1436,7 +1577,21 @@ another family's answer brings counts too. Once it has activated, something
 forwards to it, so its refusals -- the operator's budgets, a probe that
 failed, the re-post of a revocation -- are held on the backoff as any
 family's are. An interface table that cannot be read counts as public here,
-so it never lengthens a hold. The
+so it never lengthens a hold by itself. A family with a public address is
+held the same way when the operator's required test found no answer from it
+while it has not activated (`ExtenderActivateResult.RequiredTestUnreachable`:
+the tcp step of `probe_steps` failed or ran out of time, C2b, or from an
+operator that predates the steps, an `error` that says the tcp carrier did not
+answer or failed): a firewall that keeps the internet out, or a router that
+does not forward the port to a host it gives a public address, refuses every
+retry alike, as the NAT does. Decided 2026-11-03 for the extender behind NAT
+(support inbox 8154): the role stops retrying on the backoff, and the status
+says what it needs (N3's `activation_unreachable`). It is still posted on
+every trigger and on its tick, so a host whose port is opened activates
+within the day, or at once on a network change or a restart of the role
+(turning Extender off and on). Every other refusal of a public family, and
+every refusal of a family that has activated, is held on the backoff as
+before. The
 measurement request rides the first post of a pass that can carry it
 (lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
 request that is wanted, the families it activated are posted once more at
@@ -1852,6 +2007,20 @@ the api and connect. The H1 websocket stays on the connect service behind
 the lb. Going forward H3 and whodis are canonical on alt; the connect
 service keeps its lb udp listeners for old clients indefinitely.
 
+Alt is the ingress of its api front and its status listener, since no lb
+stands in front of them (server `alt/ingress.go`). Before the limits and before
+any handler, every request gets the forwarding headers nginx sets for a service
+behind the lb (warpctl `addProxyRequestHeaders`), whatever the client sent:
+`X-UR-Forwarded-For` is the peer the request arrived from, in nginx's form (an
+ipv6 address bracketed, an ipv4-mapped one as ipv4), and `X-Forwarded-For`,
+`X-Forwarded-Source-Port` and `X-UR-Request-Buffering` are cleared; the last is
+the lb's mark for a body it streams, and alt reads every body itself, so a
+route's own body policy applies. Every per-address limit and address-based
+decision behind the api, the activation probe of C2 among them, therefore reads
+the peer. A peer alt cannot read leaves no `X-UR-Forwarded-For`, and the session
+refuses the request. The connect front has no such header: it takes the address
+of the QUIC connection.
+
 L2. Ports. Alt's warp service exposes udp 443 and udp 4053 only, never 53:
 warp gains `external_udp_ports` for host-pinned services, allocating a
 host port per entry through the same `WARP_PORTS` mapping as `ports:` and
@@ -1928,7 +2097,11 @@ same connection cap and the existing connection rate limit, refusing a
 QUIC connection over the cap with application error 0x1001. Both answer
 429 like nginx, the bucket holds `burst + 1` and is charged before the
 concurrency cap, matching nginx's evaluation order. Excluded subnets are
-exempt.
+exempt. The api service's `route_rate_limits` give exact routes a per-address
+bucket of their own instead of the shared one, as their nginx locations do, and
+such a route still counts against the address's concurrent request cap. Every
+limit keys on the peer of the connection, never on a header, and the api front
+sets its ingress headers (L1) before the limits run.
 
 ### M. Statistics and the map
 
@@ -4277,10 +4450,14 @@ with the database.
 | `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
 | sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
 | `extender.ExtenderSettings` | `AcceptRetryMinBackoff`, `AcceptRetryMaxBackoff`, `AcceptDownTimeout`, `CarrierRebuildMinBackoff`, `CarrierRebuildMaxBackoff`, `CarrierRebuildStableTimeout` and `CarriersChangeHandler` added; `ListenErrorHandler` also receives what ended a carrier that was serving (G2) |
+| `extender.ExtenderSettings` | `ErrorHandler` hears a stage's name and a class of failure, and the whole error only of the four dial stages, of which `ExtenderErrorStageNLayerHopDial` and `ExtenderErrorStageNLayerProbeDial` are added; a site's error text no longer names an address, a host or a query name (G2) |
 | `extender.ExtenderServer` | `Carriers` and `DnsPorts` read what is serving now, and nothing once it has ended; `Done` added (G2) |
 | `ExtenderActivator` | `TcpCarrierReturned`, `CarriersChanged` and `State` added, with the settings `CarrierReturnJitter`, `PreviousState` and `ReplacedPostJitter`; no post without a required carrier (G2, G3) |
 | packet translation, server modes | a datagram that cannot be written, or on windows is too long to read, is lost, however long that goes on; a temporary read error is waited out; a closed socket or any other read error ends it; `EndError` added; no socket error it logs, keeps or returns names an address (G2) |
 | `sdk.ExtenderProvideStatus` | `Listening` is the tcp carrier serving; `ListenError` also carries what ended it, and no family reads as activated meanwhile (G2, N3) |
+| `POST /network/extender-activate` answer | a key another network holds is refused with the fixed `error` of C2c and no `retry_after_seconds`; old providers read it as any refusal (C2c) |
+| api metrics | stage `owner` on `urnetwork_extender_activations_total` (C2b, C2c) |
+| alt api front and status listener | `X-UR-Forwarded-For` set from the peer; `X-Forwarded-For`, `X-Forwarded-Source-Port` and `X-UR-Request-Buffering` cleared (L1) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -4469,7 +4646,11 @@ Phase 5b follows 4 because both touch the server.
 - Records lag reality by up to one drip rotation; the directory's local
   failure policy covers the gap.
 - An extender behind NAT or without a public address never activates,
-  which the probe-back guarantees silently.
+  which the probe-back guarantees. It is no longer silent: the status says
+  the internet can't reach the device on tcp 443 and what to open or forward
+  (N3, `activation_unreachable`), and a family that has not activated is
+  posted once a day and on its triggers rather than on the backoff (G3,
+  2026-11-03), until the peer-to-peer webrtc test of C2a lands.
 - The spoof list ships empty until operations provide it, so extender
   dialers appear only after that.
 - A client that never dials an unverified dns address has no extender at

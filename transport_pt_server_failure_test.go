@@ -320,13 +320,10 @@ func TestPacketTranslationClientEndsOnAReadFailure(t *testing.T) {
 	fixture.waitEnded(t)
 }
 
-// A socket whose every write fails stays up, however long that goes on. A sender can
-// bring it about: a source port of 0 fails every write to it, and on a quiet port
-// nothing else succeeds in between, so anything here that ended the socket is something
-// a sender can reach. On the server's alt listener losing the socket ends the whole
-// process with no drain, and a review measured that on real sockets, with a bound of 5
-// minutes, at 160 datagrams. This is a week of such failures on the fake clock, so a
-// bound of any length fails it, and it is what must keep one from coming back.
+// A socket whose every write fails stays up, however long that goes on: no count or
+// duration of failed writes may end it (EXTENDER.md G2). This is a week of such
+// failures on the fake clock, so a bound of any length fails it, and it is what must
+// keep one from coming back.
 func TestPacketTranslationServerOutlivesWritesThatAllFail(t *testing.T) {
 	// the pools start a goroutine for good at their first use, which must be outside
 	// the bubble
@@ -537,14 +534,14 @@ func TestPacketTranslationErrorsNameNoAddress(t *testing.T) {
 // from are still there.
 func TestPacketTranslationSocketErrorKeepsTheCause(t *testing.T) {
 	addr := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444}
-	if err := SocketErrorWithoutAddress(nil); err != nil {
+	if err := socketErrorWithoutAddress(nil); err != nil {
 		t.Fatalf("nil = %v", err)
 	}
-	closed := SocketErrorWithoutAddress(&net.OpError{Op: "write", Addr: addr, Err: net.ErrClosed})
+	closed := socketErrorWithoutAddress(&net.OpError{Op: "write", Addr: addr, Err: net.ErrClosed})
 	if !errors.Is(closed, net.ErrClosed) {
 		t.Fatalf("closed = %v", closed)
 	}
-	sent := SocketErrorWithoutAddress(&net.OpError{
+	sent := socketErrorWithoutAddress(&net.OpError{
 		Op:   "write",
 		Addr: addr,
 		Err:  os.NewSyscallError("sendto", syscall.EMSGSIZE),
@@ -558,10 +555,10 @@ func TestPacketTranslationSocketErrorKeepsTheCause(t *testing.T) {
 	}
 	// nothing to scrub is left alone
 	plain := errors.New("a failure this does not know")
-	if err := SocketErrorWithoutAddress(plain); err != plain {
+	if err := socketErrorWithoutAddress(plain); err != plain {
 		t.Fatalf("plain = %v", err)
 	}
-	wrapped := SocketErrorWithoutAddress(fmt.Errorf("through a seam: %w", &net.OpError{Op: "write", Addr: addr, Err: syscall.EPERM}))
+	wrapped := socketErrorWithoutAddress(fmt.Errorf("through a seam: %w", &net.OpError{Op: "write", Addr: addr, Err: syscall.EPERM}))
 	if !errors.Is(wrapped, syscall.EPERM) || strings.Contains(wrapped.Error(), "203.0.113.7") {
 		t.Fatalf("wrapped = %v", wrapped)
 	}

@@ -72,6 +72,13 @@ func TestSmartDialerOrdersTheSerialPath(t *testing.T) {
 		fragment := wiredDialer("fragment", 0, 600*time.Millisecond, &fragmentCarried)
 		normal := wiredDialer("normal", 25, 80*time.Millisecond, &normalCarried)
 		strategy := wiredStrategy(t, fragment, normal)
+		if !on {
+			// The upstream score gate requires delivered payload, not just handshakes.
+			for _, dialer := range []*clientDialer{fragment, normal} {
+				info := strategy.dialerInfo(dialer)
+				strategy.scores.recordVerdict(info.delivery.networkId, info.delivery.dialerKey, verdictDelivered)
+			}
+		}
 
 		if _, err := strategy.HttpSerial(getRequest(t), getRequest(t)); err != nil {
 			t.Fatalf("smart=%v: %v", on, err)
@@ -96,6 +103,13 @@ func TestSmartDialerOrdersTheParallelPath(t *testing.T) {
 		fragment := wiredDialer("fragment", 0, 600*time.Millisecond, &fragmentCarried)
 		normal := wiredDialer("normal", 25, 80*time.Millisecond, &normalCarried)
 		strategy := wiredStrategy(t, fragment, normal)
+		if !on {
+			// The upstream score gate requires delivered payload, not just handshakes.
+			for _, dialer := range []*clientDialer{fragment, normal} {
+				info := strategy.dialerInfo(dialer)
+				strategy.scores.recordVerdict(info.delivery.networkId, info.delivery.dialerKey, verdictDelivered)
+			}
+		}
 
 		if _, err := strategy.HttpParallel(getRequest(t)); err != nil {
 			t.Fatalf("smart=%v: %v", on, err)

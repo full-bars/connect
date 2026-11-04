@@ -138,6 +138,27 @@ func (self *SendSequence) pendingAckLifetime(item *sendItem) (bool, time.Time) {
 	return false, renewedAt.Add(item.ackTimeout)
 }
 
+// An advancing cumulative head proves the receiver is alive and the flight is
+// draining in order, so a message still waiting behind it has not been lost to
+// a dead path. Its lifetime runs from the last advance. A head that stops gets
+// no renewal and the sequence expires as before. Zero means no head has advanced.
+func (self *SendSequence) ackProgressDeadline(item *sendItem) time.Time {
+	if self.lastHeadAckTime.IsZero() {
+		return time.Time{}
+	}
+	return self.lastHeadAckTime.Add(item.ackTimeout)
+}
+
+// The time this item's lifetime ends, counting head progress. A resend capped
+// at the send-time deadline alone would always be due once the item outlives it.
+func (self *SendSequence) ackLifetimeDeadline(item *sendItem) time.Time {
+	deadline := item.sendTime.Add(item.ackTimeout)
+	if progressDeadline := self.ackProgressDeadline(item); deadline.Before(progressDeadline) {
+		return progressDeadline
+	}
+	return deadline
+}
+
 // Future deadlines are constant-time reads. At expiry, reconcile only the due
 // prefix against feedback already received while the owner was pacing. Actual
 // delivery, callbacks and buffer release remain in the ordinary send loop.
@@ -152,6 +173,9 @@ func (self *SendSequence) nextAckLifetime(now time.Time) (time.Time, error) {
 		if delivered {
 			self.ackLifetimes.remove(item)
 			continue
+		}
+		if progressDeadline := self.ackProgressDeadline(item); renewedDeadline.Before(progressDeadline) {
+			renewedDeadline = progressDeadline
 		}
 		if renewedDeadline.After(deadline) {
 			self.ackLifetimes.items[0].at = renewedDeadline

@@ -78,7 +78,7 @@ func TestControlDialNetworkNeverNarrowsAnIPLiteral(t *testing.T) {
 		{"force6 leaves an ipv4 extender literal alone", IpFamilyForce6, 0, "tcp", "192.0.2.7:443"},
 		{"force4 leaves an ipv6 extender literal alone", IpFamilyForce4, 0, "tcp", "[2001:db8::7]:443"},
 		{"a demotion of 6 leaves an ipv4 literal alone", IpFamilyAuto, 6, "tcp", "1.1.1.1:443"},
-		{"a demotion of 4 leaves an ipv6 literal alone", IpFamilyAuto, 4, "tcp", "[2606:4700:4700::1111]:53"},
+		{"an attempted demotion of 4 leaves an ipv6 literal alone", IpFamilyAuto, 4, "tcp", "[2606:4700:4700::1111]:53"},
 		{"a demotion leaves a bare literal alone", IpFamilyAuto, 6, "udp", "1.1.1.1"},
 	}
 	for _, test := range tests {
@@ -89,8 +89,8 @@ func TestControlDialNetworkNeverNarrowsAnIPLiteral(t *testing.T) {
 			defer SetControlIpFamilyPolicy(IpFamilyAuto)
 			if test.demote != 0 {
 				SetControlIpFamilyPolicy(IpFamilyAuto)
-				if !controlFamilyDemote(test.demote) {
-					t.Fatal("expected the demotion to take")
+				if got := controlFamilyDemote(test.demote); got != (test.demote != 4) {
+					t.Fatalf("demote ipv%d = %v, fork never demotes ipv4", test.demote, got)
 				}
 				SetControlIpFamilyPolicy(test.policy)
 			}
@@ -307,6 +307,100 @@ func TestProbeFamilySupportIgnoresOurOwnTunnel(t *testing.T) {
 				t.Fatalf("probeFamilySupport(6) = %v, want %v", got, test.want6)
 			}
 		})
+	}
+}
+
+// The linux and windows apps name their tunnels themselves, urnet0 and the
+// URnetwork adapter, and carry the same addresses: a 10.a.b.h and a ULA from the
+// sdk's /48, both of them IsGlobalUnicast. Read as a path, the ipv6 half wakes
+// the pinned ipv6 transport on an ipv4-only host and lets a failure of ipv4
+// demote the only family it has, and the ipv4 half does the same on an
+// ipv6-only host. 198.18.0.0/15 and 3fff::/20 read as connectivity while naming
+// no real network (TestFamilySupportedReadsTheInterfaceTable).
+func TestProbeFamilySupportIgnoresTheDesktopAppTunnels(t *testing.T) {
+	tunnelAddrs := []net.Addr{ipNet("10.7.3.42/24"), ipNet("fd00:7572:6e65:ffff::2/64")}
+	loopback := controlFamilyInterface{
+		name:  "lo",
+		flags: net.FlagUp | net.FlagLoopback,
+		addrs: []net.Addr{ipNet("127.0.0.1/8"), ipNet("::1/128")},
+	}
+	ipv4Uplink := controlFamilyInterface{
+		name:  "eth0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("198.18.7.20/24"), ipNet("fe80::1/64")},
+	}
+	ipv6Uplink := controlFamilyInterface{
+		name:  "eth0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("3fff:db8::1/64"), ipNet("fe80::1/64")},
+	}
+
+	for _, tunnelName := range []string{"urnet0", "URnetwork"} {
+		tunnel := controlFamilyInterface{
+			name:  tunnelName,
+			flags: net.FlagUp | net.FlagPointToPoint,
+			addrs: tunnelAddrs,
+		}
+		tests := []struct {
+			name   string
+			ifaces []controlFamilyInterface
+			want4  bool
+			want6  bool
+		}{
+			{
+				name:   "ipv4-only host",
+				ifaces: []controlFamilyInterface{loopback, ipv4Uplink, tunnel},
+				want4:  true,
+				want6:  false,
+			},
+			{
+				name:   "ipv6-only host",
+				ifaces: []controlFamilyInterface{loopback, ipv6Uplink, tunnel},
+				want4:  false,
+				want6:  true,
+			},
+			{
+				name:   "no uplink",
+				ifaces: []controlFamilyInterface{loopback, tunnel},
+				want4:  false,
+				want6:  false,
+			},
+		}
+		for _, test := range tests {
+			restore := swapControlFamilyInterfaces(
+				func() ([]controlFamilyInterface, error) { return test.ifaces, nil })
+			controlFamilyClear()
+
+			for _, row := range []struct {
+				family int
+				want   bool
+			}{
+				{family: 4, want: test.want4},
+				{family: 6, want: test.want6},
+			} {
+				if got := probeFamilySupport(row.family); got != row.want {
+					t.Errorf("%s, %s up: probeFamilySupport(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				if got := FamilySupported(row.family); got != row.want {
+					t.Errorf("%s, %s up: FamilySupported(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				if got := pinnedFamilySupported(row.family); got != row.want {
+					t.Errorf("%s, %s up: pinnedFamilySupported(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				// demoting a family takes the other one's word that it works
+				other := 10 - row.family
+				wantDemotion := row.want && other != 4 // the fork never demotes IPv4
+				if got := controlFamilyDemote(other); got != wantDemotion {
+					t.Errorf("%s, %s up: controlFamilyDemote(%d) = %v, want %v",
+						test.name, tunnelName, other, got, wantDemotion)
+				}
+				controlFamilyClear()
+			}
+			restore()
+		}
 	}
 }
 
@@ -791,22 +885,8 @@ func TestADemotionIsRevalidatedOnUseNotOnlyWhenRecorded(t *testing.T) {
 	}
 }
 
-// The use-time guard has its own copy of "which family is the OTHER one", and
-// that copy needs the same discriminating table that pinned the copy in
-// controlFamilyDemote (TestControlFamilyDemoteRefusedWhenOtherFamilyUnusable
-// above). Same defect class, reintroduced in new code.
-//
-// With controlFamilyLiveDemotion's `other := 4; if live == 4 { other = 6 }`
-// mutated so `other` is always 4, the ipv6 row cannot tell the difference --
-// it probes 4 either way. Only the ipv4 row can: the mutant re-validates a
-// demotion of IPv4 against probe(4), which is the family it just demoted, gets
-// true, and keeps steering every control dial in the process onto IPv6 on a
-// device that has no IPv6 at all. That is the self-inflicted outage the guard
-// exists to prevent, arrived at through the guard itself.
-//
-// Both rows demote on a dual-stack path first, because recording a demotion is
-// itself guarded: the ledger cannot be seeded into the state under test any
-// other way.
+// An IPv6 demotion is revalidated when the other family disappears.
+// The fork never demotes IPv4 by design, even on a dual-stack path.
 func TestALiveDemotionIsRevalidatedAgainstTheOtherFamily(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -824,10 +904,18 @@ func TestALiveDemotionIsRevalidatedAgainstTheOtherFamily(t *testing.T) {
 
 			// learned where the guard permits it: both families present
 			restoreDualStack := swapControlFamilyProbe(func(int) bool { return true })
-			if !controlFamilyDemote(test.demote) {
+			demoted := controlFamilyDemote(test.demote)
+			restoreDualStack()
+			// The fork never demotes IPv4 by design.
+			if test.demote == 4 {
+				if demoted || controlFamilyDemotedFamily() != 0 {
+					t.Fatal("IPv4 must never be demoted")
+				}
+				return
+			}
+			if !demoted {
 				t.Fatalf("precondition: demoting ipv%d on a dual-stack path was refused", test.demote)
 			}
-			restoreDualStack()
 
 			// the device moves to a path carrying ONLY the demoted family
 			restore := swapControlFamilyProbe(func(family int) bool {

@@ -26,7 +26,7 @@ func TestExtenderActivatorCountersAdvance(t *testing.T) {
 	fixture := newTestActivatorFixtureWithOperator(
 		t,
 		func(operator *testActivateOperator) {
-			operator.setFamilyRefusal(4, "the tcp carrier did not answer")
+			operator.setFamilyRefusal(4, "the platform did not answer in time")
 		},
 		func(settings *ExtenderActivatorSettings) {
 			settings.Log = log
@@ -55,8 +55,8 @@ func TestExtenderActivatorCountersAdvance(t *testing.T) {
 	if counters.LastFailure != fixture.clock.Now() {
 		t.Fatalf("lastFailure = %v, expected %v", counters.LastFailure, fixture.clock.Now())
 	}
-	if counters.LastFailureReason != "the tcp carrier did not answer" {
-		t.Fatalf("lastFailureReason = %q, expected %q", counters.LastFailureReason, "the tcp carrier did not answer")
+	if counters.LastFailureReason != "the platform did not answer in time" {
+		t.Fatalf("lastFailureReason = %q, expected %q", counters.LastFailureReason, "the platform did not answer in time")
 	}
 
 	// Now the operator accepts the activation.
@@ -89,7 +89,7 @@ func TestExtenderActivatorCountersAdvance(t *testing.T) {
 	if len(tryLines) != 2 {
 		t.Fatalf("tryLines = %v, expected 2 lines", tryLines)
 	}
-	if !strings.Contains(tryLines[0], "try 1 failed after") || !strings.Contains(tryLines[0], "the tcp carrier did not answer") {
+	if !strings.Contains(tryLines[0], "try 1 failed after") || !strings.Contains(tryLines[0], "the platform did not answer in time") {
 		t.Errorf("try line 0 = %q", tryLines[0])
 	}
 	if !strings.Contains(tryLines[1], "try 2 worked in") {
@@ -257,8 +257,8 @@ func TestExtenderActivatorFirstFailureHintPrintsOnce(t *testing.T) {
 	fixture := newTestActivatorFixtureWithOperator(
 		t,
 		func(operator *testActivateOperator) {
-			operator.setFamilyRefusal(4, "the tcp carrier did not answer")
-			operator.setFamilyRefusal(6, "the tcp carrier did not answer")
+			operator.setFamilyRefusal(4, "the platform did not answer in time")
+			operator.setFamilyRefusal(6, "the platform did not answer in time")
 		},
 		func(settings *ExtenderActivatorSettings) {
 			settings.Log = log

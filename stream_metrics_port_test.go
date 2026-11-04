@@ -17,8 +17,7 @@ func TestStreamKindOfPort(t *testing.T) {
 	}
 }
 
-// The exposition must carry the new series and must not carry the v33-only
-// dmca series, which the pinned lineage does not define.
+// The exposition carries both the ported series and the fork's dmca series.
 func TestStreamMetricsPrometheusExposition(t *testing.T) {
 	out := StreamMetricsPrometheus()
 	for _, want := range []string{
@@ -27,12 +26,10 @@ func TestStreamMetricsPrometheusExposition(t *testing.T) {
 		"urnet_stream_control_frames_total",
 		"urnet_tls_handshakes_total",
 		"urnet_dial_backoff_long_tier_active",
+		"urnet_dmca_flows ",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("exposition is missing %q", want)
 		}
-	}
-	if strings.Contains(out, "dmca") {
-		t.Fatal("exposition must not carry the dmca series; the pinned lineage has none")
 	}
 }

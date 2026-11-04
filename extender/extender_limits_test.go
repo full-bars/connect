@@ -71,12 +71,16 @@ func TestExtenderRefusesASourceOverItsConcurrentCap(t *testing.T) {
 		t.Fatal("a second connection from the same source was accepted over the cap")
 	}
 
-	// releasing the held connection frees the slot; the extender must observe
-	// the close before it can accept again, so wait for the attributed drop
+	// releasing the held connection frees the slot. The extender must observe the
+	// close before it can accept again, and the drop is attributed while the
+	// connection's worker still holds the slot, so wait for the count as well
 	held.Close()
 	if _, ok := fixture.nextError(); !ok {
 		t.Fatal("the released connection was not attributed")
 	}
+	waitForNLayer(t, "the released connection's slot", func() bool {
+		return fixture.server.ConnectionCount() == 0
+	})
 	if extenderRefusesAnotherConn(t, fixture) {
 		t.Fatal("a connection was refused after the source released its slot")
 	}
@@ -123,8 +127,9 @@ func TestExtenderRefusesOverTheTotalCap(t *testing.T) {
 // A client that completes the handshake and never sends a header is dropped at
 // the header deadline (A9).
 func TestExtenderDropsAClientThatSendsNoHeader(t *testing.T) {
+	// the deadline covers the handshake too, so it leaves a busy machine room for one
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
-		settings.HeaderTimeout = 250 * time.Millisecond
+		settings.HeaderTimeout = 2 * time.Second
 	})
 
 	conn := dialHandshakedExtenderConn(t, fixture)

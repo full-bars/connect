@@ -98,6 +98,8 @@ func newTestExtenderCarrierRun(t *testing.T) *testExtenderCarrierRun {
 		packetConnFactory:      testLoopbackPacketConn,
 		configureNetworkClient: testHermeticNetworkClient,
 		configureActivator: func(settings *connect.ExtenderActivatorSettings) {
+			// The fake operator accepts both families, independent of host interfaces.
+			settings.IpVersionSupported = func(ipVersion int) bool { return ipVersion == 4 || ipVersion == 6 }
 			// the return's post goes at once, which is what a test here waits on
 			settings.CarrierReturnJitter = -1
 		},

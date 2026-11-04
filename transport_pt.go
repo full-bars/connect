@@ -635,10 +635,10 @@ func (self *packetTranslation) encodeDns() {
 }
 
 // One write on the wire, with an error that names no address
-// (SocketErrorWithoutAddress).
+// (socketErrorWithoutAddress).
 func (self *packetTranslation) writeWire(packetData []byte, addr net.Addr) error {
 	_, err := self.packetConn.WriteTo(packetData, addr)
-	return SocketErrorWithoutAddress(err)
+	return socketErrorWithoutAddress(err)
 }
 
 // A socket's error without the addresses its text carries. A *net.OpError prints
@@ -646,11 +646,10 @@ func (self *packetTranslation) writeWire(packetData []byte, addr net.Addr) error
 // 127.0.0.1:53866->203.0.113.7:4444: sendto: ...`, and on a server the far end is a
 // client's address. What the operator has of these is the log, the status and what
 // sdk/log_upload.go uploads, and none of them may hold a client's address, so nothing
-// here logs, keeps or returns the whole error, and neither does anything else that
-// writes to a client on a shared socket (the extender's dns forwarder). A
-// *net.AddrError names its address too. errors.Is still finds net.ErrClosed and the
-// errno, and errors.As the *os.SyscallError quic-go reads.
-func SocketErrorWithoutAddress(err error) error {
+// here logs, keeps or returns the whole error. A *net.AddrError names its address too.
+// errors.Is still finds net.ErrClosed and the errno, and errors.As the *os.SyscallError
+// quic-go reads.
+func socketErrorWithoutAddress(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -674,12 +673,9 @@ func SocketErrorWithoutAddress(err error) error {
 //
 // Only a closed socket ends the encoder, and that error comes back.
 //
-// That holds however long the writes go on failing. A sender can bring that about: a
-// source port of 0 fails every write to it, and on a quiet port nothing else succeeds
-// in between, so any bound here is one a sender can reach. On the server's alt listener
-// losing the socket ends the whole process with no drain, and a restart could not cure
-// egress that refuses every write anyway, so a socket stuck this way stays up, and says
-// so a line a minute.
+// That holds however long the writes go on failing: no count or duration of failed
+// writes ends the socket. A restart could not cure egress that refuses every write, so
+// a socket stuck this way stays up, and says so a line a minute.
 func (self *packetTranslation) dropServerWrite(err error) error {
 	if errors.Is(err, net.ErrClosed) {
 		return err
@@ -883,7 +879,7 @@ func (self *packetTranslation) decodeDns() {
 			default:
 			}
 			retries := packetTranslationReadRetries(err)
-			err = SocketErrorWithoutAddress(err)
+			err = socketErrorWithoutAddress(err)
 			if self.dnsClient {
 				self.log.Infof("[pt]read err = %s\n", err)
 				return

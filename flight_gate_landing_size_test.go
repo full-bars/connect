@@ -15,6 +15,11 @@ const (
 	mergedReceiveAckMessageByteCount = 72
 	// §13.5's timeoutDeferCount and timeoutDeferAckTime
 	deferStateByteCount = 32
+	// The fork's recoveryWriteCount: how many times this item has been written
+	// as a recovery, so a redelivery does not restart the count. It is a fork
+	// mechanism the landing keeps; upstream's merged struct has no such field.
+	recoveryWriteStateByteCount = 8
+
 	// §34.3's laneAckedAtLastFiring: where this item's own lane had got to
 	// when it last looked. §34.5 expected the rule to need no new bytes,
 	// because the per-route slots already hold the sequence numbers its
@@ -67,7 +72,7 @@ func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount + recoveryWriteStateByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
