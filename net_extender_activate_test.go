@@ -73,6 +73,7 @@ type testActivateOperator struct {
 	clock          *testClock
 	rootPrivateKey ed25519.PrivateKey
 	bootstrapKey   ed25519.PublicKey
+	recordLifetime time.Duration
 
 	v4Url    string
 	v6Url    string
@@ -122,6 +123,7 @@ func newTestActivateOperator(
 		clock:          clock,
 		rootPrivateKey: rootPrivateKey,
 		bootstrapKey:   newTestExtenderKey(t),
+		recordLifetime: 25 * time.Hour,
 		posts:          make(chan *testActivatePost, 64),
 		hellos:         make(chan struct{}, 64),
 		clientAddress:  testActivateIpv4 + ":41001",
@@ -263,7 +265,7 @@ func (self *testActivateOperator) activateResult(
 	}
 	self.stateLock.Unlock()
 
-	expireTime := now.Add(14 * 24 * time.Hour)
+	expireTime := now.Add(self.recordLifetime)
 	record, err := self.signRecord(publicKey, activatedIps, now, expireTime, args.Carriers)
 	if err != nil {
 		return nil, err

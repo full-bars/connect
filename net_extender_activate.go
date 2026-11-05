@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -787,8 +788,11 @@ func (self *extenderActivateSchedule) missesACarrier(carriers []string, dnsPorts
 
 // After a success: the family's next post is its tick, and its hold is back to
 // the floor.
-func (self *extenderActivateSchedule) tick(now time.Time, settings *ExtenderActivatorSettings) {
+func (self *extenderActivateSchedule) tick(now time.Time, settings *ExtenderActivatorSettings, renewal time.Time) {
 	self.nextActivateTime = now.Add(settings.ActivateTimeout)
+	if !renewal.IsZero() {
+		self.nextActivateTime = renewal
+	}
 	self.backoff = settings.MinBackoff
 	self.activatedInRun = true
 }
@@ -1503,6 +1507,8 @@ const (
 // reads it.
 type extenderActivateAnswer struct {
 	outcome extenderActivateOutcome
+	// The renewal point from this answer's verified record, or zero for the tick.
+	renewal time.Time
 	// whether the post delivered the measurement request, which only a post
 	// that activated does (C4)
 	carried bool
@@ -1594,7 +1600,7 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		case outcome == extenderActivateCarrierHeld:
 			schedule.holdForCarrier(now, self.settings)
 		case outcome == extenderActivateActivated:
-			schedule.tick(now, self.settings)
+			schedule.tick(now, self.settings, answer.renewal)
 			schedule.postedCarriers = carriers
 			schedule.postedDnsPorts = dnsPorts
 			activated = append(activated, key)
@@ -2001,10 +2007,44 @@ func (self *ExtenderActivator) activateUrl(
 		// with this one (addressChange)
 		delete(self.helloAddresses, ipVersion)
 	}
+	renewal, err := self.renewalTime(result, self.settings.Now())
+	if err != nil {
+		self.log.Infof("[extender] activate v%d cannot use signed record for renewal (%s); using fixed activation interval\n", ipVersion, err)
+	}
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
-	return extenderActivateAnswer{outcome: extenderActivateActivated}
+	return extenderActivateAnswer{outcome: extenderActivateActivated, renewal: renewal}
+}
+
+// renewalTime reads only a record signed by an accepted root for this key.
+func (self *ExtenderActivator) renewalTime(result *ExtenderActivateResult, now time.Time) (time.Time, error) {
+	if result == nil || result.Record == "" || self.settings.Directory == nil {
+		return time.Time{}, fmt.Errorf("record or verification keys unavailable")
+	}
+	record, err := DecodeExtenderRecordBase64(result.Record)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("record cannot be decoded")
+	}
+	body, err := self.settings.Directory.RootKeys().VerifyRecord(record)
+	if err != nil || !bytes.Equal(body.PublicKey, self.settings.PublicKey) {
+		return time.Time{}, fmt.Errorf("record cannot be verified for this extender")
+	}
+	// Protocol timestamps are unsigned; values outside int64 are not times we can use.
+	if body.IssueTimeMs > uint64(1<<63-1) || body.ExpireTimeMs > uint64(1<<63-1) || body.ExpireTimeMs <= body.IssueTimeMs || body.ExpireTimeMs-body.IssueTimeMs > uint64((1<<63-1)/int64(time.Millisecond)) {
+		return time.Time{}, fmt.Errorf("record has no usable lifetime")
+	}
+	issued := time.UnixMilli(int64(body.IssueTimeMs))
+	expire := time.UnixMilli(int64(body.ExpireTimeMs))
+	if !now.Before(expire) {
+		return time.Time{}, fmt.Errorf("record has expired")
+	}
+	lifetime := expire.Sub(issued)
+	point := issued.Add(lifetime - lifetime/4)
+	if lead := expire.Add(-time.Hour); lead.After(point) {
+		point = lead
+	}
+	return point, nil
 }
 
 // The family an activation answer belongs to: what the operator reported, else
