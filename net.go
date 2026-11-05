@@ -215,6 +215,11 @@ type ConnectSettings struct {
 	DialNetworkHook func(network string, addr string)
 }
 
+// dialUsesProxy reports whether DialContext selects the SOCKS proxy path.
+func (self *ConnectSettings) dialUsesProxy() bool {
+	return self.DialContextSettings == nil && self.ProxySettings != nil
+}
+
 // DialContextSettings carries the paired stream and packet egress seams used
 // by headless hosts which must keep one logical client on one source identity.
 // ConnectSettings consumes DialContext; higher-level carrier constructors copy
