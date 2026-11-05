@@ -351,11 +351,9 @@ func TestMultiClientH1ResidenceCumulativeAckOracle(t *testing.T) {
 	}
 }
 
-// Pin the exact captured predecessor progress, rather than treating it as an
-// end-to-end receipt for the still-held request. The 34.369973417s classifier
-// eligibility is not an execution timestamp: the real 1.25s poll owns that.
-// The same predecessor ACK advances the cumulative head, which renews a 30s
-// request's lifetime to that instant; the lifetime, not the poll, ends it.
+// Pin the exact useful predecessor ACK without treating it as delivery of the
+// still-held request. That progress restarts Transfer's tail lifetime and the
+// channel's no-send-ACK clock. The health poll owns its later evaluation time.
 // BusyProbe remains enabled and admits one real IpPing Pack. Its unresolved
 // callback holds the early watchdog before the single-exit sibling gate; local
 // H1 serialization is not a remote verdict or a synthetic probe ACK.
@@ -467,6 +465,8 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 				if err != nil || stats.sendAckCount != 1 || stats.sendNackCount != 1 || !stats.pendingSendTime.Equal(start.Add(predecessorAt)) {
 					t.Fatalf("predecessor ACK did not restart only outstanding-send liveness: stats=%+v err=%v", stats, err)
 				}
+				progressAt := stats.pendingSendTime.Sub(start)
+				requestDeadline := progressAt + tc.lifetime
 				advance(replacementAt - time.Nanosecond)
 				heldProbe, heldCallback := func() (*busyProbeAttempt, bool) {
 					channel.stateLock.Lock()
@@ -500,7 +500,7 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 				advance(30*time.Second - time.Nanosecond)
 				stats, err = channel.WindowStats()
 				if err != nil || channel.IsDone() {
-					t.Fatalf("flow terminated before its unchanged lifetime: %v", err)
+					t.Fatalf("flow terminated before its original send-time deadline: %v", err)
 				}
 				survives := tc.replace && !tc.permanent && !tc.shared
 				if survives && (f.requests.Load() != 1 || stats.sendNackCount != 0 || stats.sendAckCount != 2) {
@@ -511,32 +511,30 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 				// predecessorAt. The request's lifetime runs from that advance as
 				// well as from its send (f25be1b2, connect PR #231), and with the
 				// head stopped there it ends exactly one lifetime later.
-				lifetimeEnd := predecessorAt + tc.lifetime
 				if !survives && tc.lifetime == 30*time.Second {
-					if _, err = channel.WindowStats(); err != nil || channel.IsDone() {
-						t.Fatalf("the head's advance did not renew the request's lifetime: %v", err)
+					if _, err = channel.WindowStats(); err != nil || channel.IsDone() || f.requestFailureAt.Load() != 0 {
+						t.Fatalf("useful predecessor ACK did not preserve the outstanding tail past its original deadline: %v", err)
 					}
-					advance(lifetimeEnd - time.Nanosecond)
-					if _, err = channel.WindowStats(); err != nil || channel.IsDone() {
-						t.Fatalf("flow terminated before its renewed lifetime: %v", err)
+					advance(requestDeadline - time.Nanosecond)
+					if _, err = channel.WindowStats(); err != nil || channel.IsDone() || f.requestFailureAt.Load() != 0 {
+						t.Fatalf("request terminated before one configured lifetime without useful progress: %v", err)
 					}
-					advance(lifetimeEnd)
+					advance(requestDeadline)
 					_, err = channel.WindowStats()
 					if err == nil || !strings.Contains(err.Error(), "Send sequence closed.") {
-						t.Fatalf("30s logical owner did not terminate: %v", err)
+						t.Fatalf("logical owner did not terminate at the progress-based deadline %s: %v", requestDeadline, err)
 					}
-					if got := time.Duration(f.requestFailureAt.Load() - start.UnixNano()); got != lifetimeEnd {
-						t.Fatalf("physical replacement changed the absolute request lifetime: %s", got)
+					if got := time.Duration(f.requestFailureAt.Load() - start.UnixNano()); got != requestDeadline {
+						t.Fatalf("physical replacement changed the useful-progress deadline: got=%s want=%s", got, requestDeadline)
 					}
-					// ACK expiry and a poll can be ready together. The callback's
-					// verdict is exact; joining health is bounded by one unchanged
-					// poll, not by select ordering at the tie.
-					advance(lifetimeEnd + channel.settings.BlackholePollInterval)
-					if !channel.IsDone() || healthAt.Load() < int64(lifetimeEnd) || healthAt.Load() > int64(lifetimeEnd+channel.settings.BlackholePollInterval) {
+					// Callback expiry is exact. The health owner observes that
+					// terminal state within its unchanged configured poll interval.
+					advance(requestDeadline + channel.settings.BlackholePollInterval)
+					if !channel.IsDone() || healthAt.Load() < int64(requestDeadline) || healthAt.Load() > int64(requestDeadline+channel.settings.BlackholePollInterval) {
 						t.Fatalf("health did not join the terminal request within one poll: at=%s", time.Duration(healthAt.Load()))
 					}
 				} else if !survives {
-					eligibility := predecessorAt + channel.noSendAckTimeout()
+					eligibility := progressAt + channel.noSendAckTimeout()
 					advance(eligibility - time.Nanosecond)
 					stats, err = channel.WindowStats()
 					if err != nil {
@@ -642,7 +640,7 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 				if f.requestAt.Load() != 0 {
 					requestElapsed = time.Duration(f.requestAt.Load() - start.UnixNano())
 				}
-				t.Logf("lifetime=%s replace=%t permanent=%t survived=%t no_send_ack_eligible=%s health_return=%s requests=%d request_receipt=%s same_pack_copies=%d replacement_copies=%d covering_peer_acks=%d exact_naming_peer_acks=%d busy_sibling_holds=%d busy_acquittals=%d", tc.lifetime, tc.replace, tc.permanent, survives, predecessorAt+30*time.Second, time.Duration(healthAt.Load()), f.requests.Load(), requestElapsed, requestCopies, replacementCopies, coveringAcks, exactNamingAcks, len(f.log.linesWith("no receiving sibling: uplink unproven")), len(f.log.linesWith("liveness probe answered")))
+				t.Logf("lifetime=%s replace=%t permanent=%t survived=%t useful_progress=%s stalled_tail_deadline=%s no_send_ack_eligible=%s health_return=%s requests=%d request_receipt=%s same_pack_copies=%d replacement_copies=%d covering_peer_acks=%d exact_naming_peer_acks=%d busy_sibling_holds=%d busy_acquittals=%d", tc.lifetime, tc.replace, tc.permanent, survives, progressAt, requestDeadline, progressAt+channel.noSendAckTimeout(), time.Duration(healthAt.Load()), f.requests.Load(), requestElapsed, requestCopies, replacementCopies, coveringAcks, exactNamingAcks, len(f.log.linesWith("no receiving sibling: uplink unproven")), len(f.log.linesWith("liveness probe answered")))
 			})
 		})
 	}
