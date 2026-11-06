@@ -45,8 +45,11 @@ func TestLocalUserNatUdpIdleOverride(t *testing.T) {
 	AssertEqual(t, nat.settings.UdpBufferSettings.IdleTimeout, 30*time.Second)
 	AssertEqual(t, nat.settings.UdpBufferSettings.ReadTimeout, 30*time.Second)
 
-	// and never writes through the caller's shared settings
+	// and never writes through the caller's shared settings. A non-nil Log
+	// keeps the logger fill-in above from copying the buffer first, so this
+	// case fails if the bound ever writes in place.
 	shared := DefaultProviderLocalUserNatSettings()
+	shared.UdpBufferSettings.Log = NewNoopLogger()
 	shared.UdpBufferSettings.DialContextSettings = &DialContextSettings{UdpIdleTimeout: 120 * time.Second}
 	nat = NewLocalUserNat(ctx, "udp-idle-shared", shared)
 	defer nat.Close()
