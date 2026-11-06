@@ -879,6 +879,17 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 			udpCopied.Log = log
 			copied.UdpBufferSettings = &udpCopied
 		}
+		if copied.UdpBufferSettings != nil &&
+			copied.UdpBufferSettings.DialContextSettings != nil &&
+			0 < copied.UdpBufferSettings.DialContextSettings.UdpIdleTimeout {
+			udpCopied := *copied.UdpBufferSettings
+			// an upper bound on both directions of silence (sends: idle,
+			// replies: read); never lengthens a shorter budgeted default
+			limit := copied.UdpBufferSettings.DialContextSettings.UdpIdleTimeout
+			udpCopied.IdleTimeout = min(udpCopied.IdleTimeout, limit)
+			udpCopied.ReadTimeout = min(udpCopied.ReadTimeout, limit)
+			copied.UdpBufferSettings = &udpCopied
+		}
 		if copied.TcpBufferSettings != nil && copied.TcpBufferSettings.Log == nil {
 			tcpCopied := *copied.TcpBufferSettings
 			tcpCopied.Log = log

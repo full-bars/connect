@@ -232,6 +232,15 @@ type DialContextSettings struct {
 	// The caller owns and closes every non-nil endpoint, including one returned
 	// alongside an error. Nil retains the platform's ordinary wildcard socket.
 	PacketConnFactory func(context.Context) (net.PacketConn, error)
+	// UdpIdleTimeout, when positive, caps the NAT idle and read timeouts of
+	// the UDP flows of a LocalUserNat whose UdpBufferSettings carry these
+	// settings (NewLocalUserNat applies it to its own copy). It never
+	// lengthens a shorter timeout, and a buffer timeout of 0 (no reaping)
+	// stays 0. Zero here keeps the buffer's timeouts
+	// (300s for an unbudgeted provider). An embedder sets it on a proxied slot
+	// to release the proxy's UDP relay association sooner than a direct
+	// slot's socket would be released.
+	UdpIdleTimeout time.Duration
 }
 
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
