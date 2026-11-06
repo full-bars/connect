@@ -182,6 +182,9 @@ type ExtenderCarrierRefusal struct {
 	BudgetLeftMs int64 `json:"budget_left_ms"`
 }
 
+// ExtenderActivateCarrierRefusal is the activation result's carrier refusal type.
+type ExtenderActivateCarrierRefusal = ExtenderCarrierRefusal
+
 // One step of the operator's probe, timed on the operator's clock (C2).
 //
 // The steps share one probe budget, so a step that ran out of it is told apart
@@ -2011,6 +2014,10 @@ func (self *ExtenderActivator) activateUrl(
 	if err != nil {
 		self.log.Infof("[extender] activate v%d cannot use signed record for renewal (%s); using fixed activation interval\n", ipVersion, err)
 	}
+	// Optional carriers omitted by the operator are not published.
+	if text := extenderActivateCarrierRefusalsText(result.RefusedCarriers); text != "" {
+		self.log.Infof("[extender]activate v%d left out = %s\n", ipVersion, activationLogText(text, jwt, apiUrl))
+	}
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
@@ -2045,6 +2052,52 @@ func (self *ExtenderActivator) renewalTime(result *ExtenderActivateResult, now t
 		point = lead
 	}
 	return point, nil
+}
+
+// The operator's probe steps on one line, in the order run: each step's name,
+// port and outcome, how long it ran and how much of the budget was left when it
+// started (C2b). A nil step is skipped.
+func extenderActivateProbeStepsText(probeSteps []*ExtenderActivateProbeStep) string {
+	stepTexts := []string{}
+	for _, probeStep := range probeSteps {
+		if probeStep == nil {
+			continue
+		}
+		stepTexts = append(stepTexts, fmt.Sprintf(
+			"%s:%d %s after %s (%s left)",
+			probeStep.Name,
+			probeStep.Port,
+			probeStep.Outcome,
+			extenderActivateMsText(probeStep.ElapsedMs),
+			extenderActivateMsText(probeStep.BudgetLeftMs),
+		))
+	}
+	return strings.Join(stepTexts, ", ")
+}
+
+// The carriers an activation left out on one line, in the order offered, each
+// with the operator's error and timing (C2a). A nil refusal is skipped.
+func extenderActivateCarrierRefusalsText(carrierRefusals []*ExtenderActivateCarrierRefusal) string {
+	refusalTexts := []string{}
+	for _, carrierRefusal := range carrierRefusals {
+		if carrierRefusal == nil {
+			continue
+		}
+		refusalTexts = append(refusalTexts, fmt.Sprintf(
+			"%s:%d after %s (%s left): %s",
+			carrierRefusal.Carrier,
+			carrierRefusal.Port,
+			extenderActivateMsText(carrierRefusal.ElapsedMs),
+			extenderActivateMsText(carrierRefusal.BudgetLeftMs),
+			carrierRefusal.Error,
+		))
+	}
+	return strings.Join(refusalTexts, "; ")
+}
+
+// Milliseconds on the operator's clock as a duration.
+func extenderActivateMsText(ms int64) string {
+	return (time.Duration(ms) * time.Millisecond).String()
 }
 
 // The family an activation answer belongs to: what the operator reported, else
