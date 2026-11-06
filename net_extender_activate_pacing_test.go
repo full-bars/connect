@@ -2,6 +2,7 @@ package connect
 
 import (
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -231,9 +232,10 @@ func TestExtenderActivatorFailedRenewalKeepsTheRecord(t *testing.T) {
 	}
 }
 
-// A restart reads the stored pacing: no post before NextAllowedAttemptAt, the
+// A restart whose stored family holds against the triggers (the operator's budget, a
+// failed renewal) reads the stored pacing: no post before NextAllowedAttemptAt, the
 // valid record shows as activated, and the post goes out at the instant.
-func TestExtenderActivatorRestartHonoursTheStoredPacing(t *testing.T) {
+func TestExtenderActivatorRestartHonoursAStoredHold(t *testing.T) {
 	store := newTestPacingStore()
 	var startTime, next, expire time.Time
 	fixture := newTestActivatorFixtureWithPrepare(
@@ -242,14 +244,17 @@ func TestExtenderActivatorRestartHonoursTheStoredPacing(t *testing.T) {
 			startTime = fixture.clock.Now()
 			next = startTime.Add(2 * time.Hour)
 			expire = startTime.Add(3 * time.Hour)
+			applyTestOperatorRecord(t, fixture.directory, fixture.operator, fixture.publicKey,
+				startTime, expire, testActivateIpv4)
 			store.record = &ExtenderActivationPacingRecord{
 				PublicKey: fixture.publicKey,
 				Families: map[int]ExtenderActivationPacing{4: {
-					State:                ExtenderPacingActivated,
+					State:                ExtenderPacingRenewalRefused,
 					RecordExpireTime:     expire,
 					Ip:                   netip.MustParseAddr(testActivateIpv4),
 					LastAttemptAt:        startTime.Add(-time.Hour),
 					NextAllowedAttemptAt: next,
+					Hold:                 true,
 				}},
 			}
 		},
@@ -260,10 +265,10 @@ func TestExtenderActivatorRestartHonoursTheStoredPacing(t *testing.T) {
 	)
 	fixture.waitPass()
 	status := fixture.activator.Status().Family(4)
-	if !status.Activated || status.ExpireTime != expire || status.PacingState != ExtenderPacingActivated {
+	if !status.Activated || !status.ExpireTime.Equal(expire) || status.PacingState != ExtenderPacingRenewalRefused {
 		t.Fatalf("restored status = %+v", status)
 	}
-	if pacing := fixture.activator.Pacing()[4]; pacing.NextAllowedAttemptAt != next {
+	if pacing := fixture.activator.Pacing()[4]; !pacing.NextAllowedAttemptAt.Equal(next) {
 		t.Fatalf("restored pacing = %+v", pacing)
 	}
 
@@ -277,6 +282,87 @@ func TestExtenderActivatorRestartHonoursTheStoredPacing(t *testing.T) {
 	post := fixture.waitPost()
 	if post.postTime != next {
 		t.Fatalf("post at %s, expected the stored time", post.postTime.Sub(startTime))
+	}
+}
+
+// A restart with a valid record does not wait for its renewal, a day out, to learn
+// what the new process serves: it posts once, spread by the jitter, and then paces
+// from the renewal of the record that post brings (F1).
+func TestExtenderActivatorRestartPostsOnceJitteredFromAValidRecord(t *testing.T) {
+	store := newTestPacingStore()
+	var startTime time.Time
+	fixture := newTestActivatorFixtureWithPrepare(
+		t,
+		func(fixture *testActivatorFixture) {
+			startTime = fixture.clock.Now()
+			expire := startTime.Add(25 * time.Hour)
+			applyTestOperatorRecord(t, fixture.directory, fixture.operator, fixture.publicKey,
+				startTime, expire, testActivateIpv4)
+			store.record = &ExtenderActivationPacingRecord{
+				PublicKey: fixture.publicKey,
+				Families: map[int]ExtenderActivationPacing{4: {
+					State:                ExtenderPacingActivated,
+					RecordExpireTime:     expire,
+					Ip:                   netip.MustParseAddr(testActivateIpv4),
+					LastAttemptAt:        startTime.Add(-time.Hour),
+					NextAllowedAttemptAt: startTime.Add(19 * time.Hour),
+				}},
+			}
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			settings.PacingStore = store
+			settings.postJitterForTest = func(time.Duration) time.Duration { return 10 * time.Minute }
+		},
+	)
+	fixture.waitPass()
+	if status := fixture.activator.Status().Family(4); !status.Activated {
+		t.Fatalf("restored status = %+v", status)
+	}
+	fixture.step(9 * time.Minute)
+	if count := fixture.operator.postCount(4); count != 0 {
+		t.Fatalf("posts before the jittered time = %d, expected none", count)
+	}
+	fixture.clock.advance(time.Minute)
+	fixture.wake()
+	post := fixture.waitPost()
+	if post.postTime != startTime.Add(10*time.Minute) {
+		t.Fatalf("post at %s, expected the jittered time", post.postTime.Sub(startTime))
+	}
+	fixture.waitActivation()
+	store.waitSave(t)
+	pacing, _ := store.family(4)
+	if pacing.State != ExtenderPacingActivated || !pacing.NextAllowedAttemptAt.After(startTime.Add(20*time.Hour)) {
+		t.Fatalf("pacing after the restart post = %+v, expected the new record's renewal", pacing)
+	}
+	// and not another post until that renewal
+	fixture.step(time.Hour)
+	if count := fixture.operator.postCount(4); count != 1 {
+		t.Fatalf("posts = %d, expected the one", count)
+	}
+}
+
+// The carriers the standing post offered are saved with the record, so a carrier that
+// failed to bind and is off the record is still known after a restart.
+func TestExtenderActivatorPersistsThePostedCarriers(t *testing.T) {
+	store := newTestPacingStore()
+	fixture := newTestActivatorFixtureWithPrepare(
+		t,
+		func(fixture *testActivatorFixture) {
+			fixture.carriers = []string{ExtenderCarrierTcp, ExtenderCarrierDns}
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			settings.PacingStore = store
+		},
+	)
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.waitActivation()
+	store.waitSave(t)
+	pacing, _ := store.family(4)
+	if !slices.Equal(pacing.PostedCarriers, []string{ExtenderCarrierTcp, ExtenderCarrierDns}) {
+		t.Fatalf("posted carriers = %v", pacing.PostedCarriers)
 	}
 }
 

@@ -2,6 +2,7 @@ package connect
 
 import (
 	"bytes"
+	"fmt"
 	"maps"
 	"net/netip"
 	"slices"
@@ -61,6 +62,11 @@ type ExtenderActivationPacing struct {
 	// change, an address change), because it is the operator's budget or a failed
 	// renewal. Without it only the schedule moves it.
 	Hold bool `json:"hold,omitempty"`
+	// the carriers and dns ports the post that made the record offered, so a carrier
+	// that failed to bind and is missing from the record is still known after a
+	// restart (CarriersChanged). Nil for a family that holds no record.
+	PostedCarriers []string `json:"posted_carriers,omitempty"`
+	PostedDnsPorts []int    `json:"posted_dns_ports,omitempty"`
 }
 
 // The record valid at `now`: the operator's record expires at its expiry, not after.
@@ -82,9 +88,11 @@ type ExtenderActivationPacingRecord struct {
 	Families  map[int]ExtenderActivationPacing `json:"families"`
 }
 
-// Where the pacing survives a restart. Both run on the loop goroutine and must not
-// block for long. A load that fails starts as a new process does; a save that
-// fails is logged and the pacing stands in memory.
+// Where the pacing survives a restart. LoadPacing runs once, off the constructor, and
+// is waited for no longer than PacingLoadTimeout; SavePacing runs on the loop goroutine
+// and must not block for long. A load that fails starts as a new process does; a save
+// that fails is logged and the pacing stands in memory. A store that has been released
+// answers both with an error.
 type ExtenderActivationPacingStore interface {
 	LoadPacing() (*ExtenderActivationPacingRecord, error)
 	SavePacing(record *ExtenderActivationPacingRecord) error
@@ -97,16 +105,73 @@ func (self *ExtenderActivator) Pacing() map[int]ExtenderActivationPacing {
 	return maps.Clone(self.pacing)
 }
 
-// Reads the store and applies it to the schedules, once, at start. A record of
-// another key is dropped. A family with a NextAllowedAttemptAt ahead of now waits for
-// it, and one whose record is valid is shown as activated until it expires, since
-// the directory holds the record the status describes.
-func (self *ExtenderActivator) loadPacing() {
+// How long the first read of the store may take before the activator starts without
+// it.
+const extenderPacingLoadTimeout = 2 * time.Second
+
+// The furthest ahead a stored attempt time is trusted at load. A saved time beyond it
+// came from a clock that was ahead, and would keep the family silent for as long.
+const extenderPacingMaxHorizon = 24 * time.Hour
+
+// Closed once the store has been read (or has failed, or timed out): from then on the
+// loop may post. It is closed at once with no store.
+func (self *ExtenderActivator) Ready() <-chan struct{} {
+	return self.pacingReady
+}
+
+// Reads the store off the constructor, which must not wait on a disk, and applies it
+// once. A store that has not answered within PacingLoadTimeout is started without and
+// its late answer is dropped: a post may have gone by then, so it can no longer be
+// the first word on the family.
+func (self *ExtenderActivator) startPacingLoad() {
 	store := self.settings.PacingStore
 	if store == nil {
+		close(self.pacingReady)
 		return
 	}
-	record, err := store.LoadPacing()
+	type loaded struct {
+		record *ExtenderActivationPacingRecord
+		err    error
+	}
+	// buffered so an answer nobody waits for any more does not leak its goroutine
+	results := make(chan loaded, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- loaded{err: fmt.Errorf("the store panicked: %v", r)}
+			}
+		}()
+		record, err := store.LoadPacing()
+		results <- loaded{record: record, err: err}
+	}()
+	timeout := self.settings.PacingLoadTimeout
+	go func() {
+		defer close(self.pacingReady)
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case result := <-results:
+			self.applyPacing(result.record, result.err)
+		case <-timer.C:
+			self.log.Infof("[extender]activate pacing load timed out after %s, starting fresh\n", timeout)
+		case <-self.ctx.Done():
+		}
+	}()
+}
+
+// Applies what the store held, once, before the first pass.
+//
+// A record of another key is dropped. A stored time too far ahead is clamped (F3). A
+// stored record is judged against the directory (verifyPacing): one the directory does
+// not hold is not an activation, and the family posts as a new one does.
+//
+// A family whose record stands is shown as activated and, because the record says
+// nothing of what this process serves, posts once soon, spread over ReplacedPostJitter,
+// and then paces from the renewal of that post's record. Only a hold, the operator's
+// budget or a failed renewal, keeps it from posting then. A role replaced under a
+// running process (PreviousState) already carries its own state and posts as
+// continueFrom set it, so only a hold stands against that.
+func (self *ExtenderActivator) applyPacing(record *ExtenderActivationPacingRecord, err error) {
 	if err != nil {
 		self.log.Infof("[extender]activate pacing load err = %s\n", activationLogError(err.Error()))
 		return
@@ -123,13 +188,33 @@ func (self *ExtenderActivator) loadPacing() {
 		if !ok {
 			continue
 		}
+		if !replaced {
+			pacing = clampPacing(pacing, now)
+			var verdict string
+			pacing, verdict = self.verifyPacing(pacing, now)
+			if verdict != "" {
+				self.log.Infof("[extender]activate pacing v%d cleared: %s\n", key, verdict)
+			}
+		}
 		self.pacing[key] = pacing
-		// a role replaced under a running process posts once more for the things only a
-		// post gives it (continueFrom); only a hold stands against that
-		if (pacing.Hold || !replaced) && schedule.nextActivateTime.Before(pacing.NextAllowedAttemptAt) {
+		valid := pacing.RecordValid(now)
+		holding := pacing.Hold && pacing.NextAllowedAttemptAt.After(now)
+		switch {
+		case !holding && valid && !replaced:
+			postTime := now.Add(uniformJitter(self.settings.ReplacedPostJitter, self.settings.postJitterForTest))
+			// the renewal is sooner than the spread says: it is the post
+			if pacing.NextAllowedAttemptAt.After(now) && pacing.NextAllowedAttemptAt.Before(postTime) {
+				postTime = pacing.NextAllowedAttemptAt
+			}
+			schedule.nextActivateTime = postTime
+		case (pacing.Hold || !replaced) && schedule.nextActivateTime.Before(pacing.NextAllowedAttemptAt):
 			schedule.nextActivateTime = pacing.NextAllowedAttemptAt
 		}
-		if family, ok := self.families[key]; ok && !family.Activated && pacing.RecordValid(now) {
+		if valid && !replaced {
+			schedule.postedCarriers = slices.Clone(pacing.PostedCarriers)
+			schedule.postedDnsPorts = slices.Clone(pacing.PostedDnsPorts)
+		}
+		if family, ok := self.families[key]; ok && !family.Activated && valid {
 			family.Activated = true
 			family.ExpireTime = pacing.RecordExpireTime
 			family.LastActivationTime = pacing.LastAttemptAt
@@ -137,6 +222,54 @@ func (self *ExtenderActivator) loadPacing() {
 		}
 	}
 	self.changedWithLock()
+}
+
+// A stored pacing with its times brought inside what this clock can have written: an
+// attempt in the future is now, and a next attempt more than extenderPacingMaxHorizon
+// ahead is that far.
+func clampPacing(pacing ExtenderActivationPacing, now time.Time) ExtenderActivationPacing {
+	if pacing.LastAttemptAt.After(now) {
+		pacing.LastAttemptAt = now
+	}
+	if limit := now.Add(extenderPacingMaxHorizon); pacing.NextAllowedAttemptAt.After(limit) {
+		pacing.NextAllowedAttemptAt = limit
+	}
+	return pacing
+}
+
+// Judges a stored record against the directory. The directory holds the record the
+// platform serves, so a stored activation it does not hold (missing, revoked, expired,
+// another expiry, or without the address the pacing was kept for) is no activation:
+// the family is cleared to unactivated and posts as a new one does. The second result
+// says why, "" when nothing was cleared. A hold stays, since it is the operator's word
+// on when to come back. With no directory the answer is not known, and the record
+// stands: the post every restart makes re-verifies it.
+func (self *ExtenderActivator) verifyPacing(pacing ExtenderActivationPacing, now time.Time) (ExtenderActivationPacing, string) {
+	if !pacing.RecordValid(now) || self.settings.Directory == nil {
+		return pacing, ""
+	}
+	reason := ""
+	expire, ips, ok := self.settings.Directory.ActiveRecordOf(self.settings.PublicKey)
+	switch {
+	case !ok:
+		reason = "the directory holds no valid record of this key"
+	case expire.UnixMilli() != pacing.RecordExpireTime.UnixMilli():
+		reason = "the directory's record expires at another time"
+	case pacing.Ip.IsValid() && 0 < len(ips) && !slices.Contains(ips, pacing.Ip):
+		reason = "the directory's record does not list the stored address"
+	}
+	if reason == "" {
+		return pacing, ""
+	}
+	pacing.State = ExtenderPacingUnactivated
+	pacing.RecordExpireTime = time.Time{}
+	pacing.Ip = netip.Addr{}
+	pacing.PostedCarriers = nil
+	pacing.PostedDnsPorts = nil
+	if !pacing.Hold {
+		pacing.NextAllowedAttemptAt = time.Time{}
+	}
+	return pacing, reason
 }
 
 // Puts a hold back on the schedules the triggers have made due. It runs ahead of the
@@ -164,6 +297,8 @@ func (self *ExtenderActivator) recordPacing(
 	outcome extenderActivateOutcome,
 	next time.Time,
 	budgetHeld bool,
+	postedCarriers []string,
+	postedDnsPorts []int,
 ) {
 	self.stateLock.Lock()
 	previous := self.pacing[key]
@@ -178,11 +313,15 @@ func (self *ExtenderActivator) recordPacing(
 		if family, ok := self.families[key]; ok {
 			pacing.Ip = family.Ip
 		}
+		pacing.PostedCarriers = slices.Clone(postedCarriers)
+		pacing.PostedDnsPorts = slices.Clone(postedDnsPorts)
 	} else {
 		// a failed renewal does not clear the record: it stands until it expires
 		if previous.RecordValid(now) {
 			pacing.RecordExpireTime = previous.RecordExpireTime
 			pacing.Ip = previous.Ip
+			pacing.PostedCarriers = previous.PostedCarriers
+			pacing.PostedDnsPorts = previous.PostedDnsPorts
 		}
 		valid := pacing.RecordValid(now)
 		switch {
