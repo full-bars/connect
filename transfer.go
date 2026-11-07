@@ -14622,6 +14622,17 @@ func (self receiveSequenceHeadKey) transferKey() TransferKey {
 // same contract, and emitted the same error chain at the cold resend cadence.
 const rejectedReceiveSequenceCapacity = 1024
 
+var receiveHeadMismatchThrottle = newLogThrottle(time.Minute)
+
+func logReceiveHeadMismatch(log Logger, throttle *logThrottle, now time.Time, pack *ReceivePack) {
+	if v := log.V(1); v.Enabled() {
+		if allowed, suppressed := throttle.Allow(now); allowed {
+			v.Infof("[r]drop pack of another lane for sequence %s (%s %s c=%t, %d suppressed)\n",
+				pack.SequenceId, pack.Source, pack.EncryptionRole, pack.EncryptionCompanion, suppressed)
+		}
+	}
+}
+
 type ReceiveBuffer struct {
 	ctx    context.Context
 	client *Client
@@ -14867,13 +14878,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					// Drop the pack rather than judge the sequence, which its own
 					// exit removes.
 					self.mutex.Unlock()
-					if self.log.V(1).Enabled() {
-						self.log.Infof(
-							"[r]drop pack of another lane for sequence %s (%s %s c=%t)\n",
-							receivePack.SequenceId, receivePack.Source,
-							receivePack.EncryptionRole, receivePack.EncryptionCompanion,
-						)
-					}
+					logReceiveHeadMismatch(self.log, receiveHeadMismatchThrottle, time.Now(), receivePack)
 					receivePack.messagePoolReturn()
 					return nil
 				}

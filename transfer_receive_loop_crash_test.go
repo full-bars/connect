@@ -9,6 +9,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +18,32 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+type lockCheckingLogger struct {
+	captureLogger
+	buffer   *ReceiveBuffer
+	unlocked atomic.Bool
+}
+
+type lockCheckingVerbose struct{ logger *lockCheckingLogger }
+
+func (l *lockCheckingLogger) V(level int32) Verbose {
+	if level == 1 {
+		return &lockCheckingVerbose{logger: l}
+	}
+	return &captureVerbose{c: &l.captureLogger}
+}
+func (v *lockCheckingVerbose) Enabled() bool {
+	if v.logger.buffer.mutex.TryLock() {
+		v.logger.buffer.mutex.Unlock()
+		v.logger.unlocked.Store(true)
+	} else {
+		v.logger.unlocked.Store(false)
+	}
+	return true
+}
+func (v *lockCheckingVerbose) Info(...any)          {}
+func (v *lockCheckingVerbose) Infof(string, ...any) {}
 
 // A client whose receive loop reads the frames written to the returned route
 // and whose receive callback reports the content of each simple message
@@ -208,6 +236,8 @@ func TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient(t *testing.T) 
 	}
 	peerId := NewId()
 	client, inbound, delivered := newReceiveLoopTestClient(t, settings, peerId)
+	logger := &lockCheckingLogger{buffer: client.receiveBuffer}
+	client.receiveBuffer.log = logger
 	// registered after the client's cleanup, so it runs first
 	t.Cleanup(func() {
 		close(release)
@@ -256,6 +286,26 @@ func TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient(t *testing.T) 
 	)
 	AssertEqual(t, "after", content)
 	AssertEqual(t, false, client.IsDone())
+	if !logger.unlocked.Load() {
+		t.Fatal("mismatch diagnostic did not run outside the buffer lock")
+	}
+}
+
+func TestReceiveHeadMismatchLogIsBounded(t *testing.T) {
+	log := &captureLogger{enabled: true}
+	throttle := newLogThrottle(time.Minute)
+	pack := &ReceivePack{}
+	now := time.Unix(1000, 0)
+	for i := 0; i < 100; i++ {
+		logReceiveHeadMismatch(log, throttle, now, pack)
+	}
+	if len(log.verbose) != 1 {
+		t.Fatalf("got %d log lines, want 1", len(log.verbose))
+	}
+	logReceiveHeadMismatch(log, throttle, now.Add(time.Minute), pack)
+	if len(log.verbose) != 2 || !strings.Contains(log.verbose[1], "99 suppressed") {
+		t.Fatalf("unexpected log lines: %v", log.verbose)
+	}
 }
 
 // Once a pack's own id has no live sequence, only a stale index can still name
