@@ -105,15 +105,15 @@ func TestExtenderActivatorLoadClearsARecordTheDirectoryLacks(t *testing.T) {
 	}
 }
 
-// The directory holds a record, but not the one stored: another expiry, or an address
+// The directory holds a record, but not the one stored: an earlier expiry, or an address
 // the stored one was not kept for.
 func TestExtenderActivatorLoadClearsARecordThatDoesNotMatch(t *testing.T) {
 	cases := []struct {
 		name  string
 		plant func(f *testPacingLoadFixture, t *testing.T, expire time.Time)
 	}{
-		{"another expiry", func(f *testPacingLoadFixture, t *testing.T, expire time.Time) {
-			f.plant(t, expire.Add(time.Hour), testActivateIpv4)
+		{"an earlier expiry", func(f *testPacingLoadFixture, t *testing.T, expire time.Time) {
+			f.plant(t, expire.Add(-time.Hour), testActivateIpv4)
 		}},
 		{"another address", func(f *testPacingLoadFixture, t *testing.T, expire time.Time) {
 			f.plant(t, expire, "198.51.100.99")
@@ -351,6 +351,47 @@ func (self *testReleasablePacingStore) SavePacing(record *ExtenderActivationPaci
 		return errTestPacingStoreReleased
 	}
 	return self.testPacingStore.SavePacing(record)
+}
+
+func TestExtenderActivatorLoadKeepsAFamilyWhoseRecordWasSuperseded(t *testing.T) {
+	f := newTestPacingLoadFixture(t)
+	stored := f.now.Add(25 * time.Hour)
+	newer := stored.Add(10 * time.Second)
+	f.plant(t, newer, testActivateIpv4)
+	self := newTestPacingLoadActivator(f.publicKey, f.directory, f.now, false)
+	self.applyPacing(f.record(f.activatedPacing(stored)), nil)
+	if !self.families[4].Activated || self.pacing[4].State != ExtenderPacingActivated {
+		t.Fatalf("family = %+v, pacing = %+v, expected the activation to stand", self.families[4], self.pacing[4])
+	}
+	if got := self.pacing[4].RecordExpireTime; got.UnixMilli() != newer.UnixMilli() {
+		t.Fatalf("expiry = %s, expected the directory's newer %s", got, newer)
+	}
+}
+
+func TestExtenderActivatorLoadClearsAFamilyWhenTheNewerRecordDoesNotListItsAddress(t *testing.T) {
+	f := newTestPacingLoadFixture(t)
+	stored := f.now.Add(25 * time.Hour)
+	f.plant(t, stored.Add(10*time.Second), testActivateIpv4)
+	pacing := f.activatedPacing(stored)
+	pacing.Ip = netip.Addr{}
+	self := newTestPacingLoadActivator(f.publicKey, f.directory, f.now, false)
+	self.applyPacing(f.record(pacing), nil)
+	if self.families[4].Activated || self.pacing[4].State != ExtenderPacingUnactivated {
+		t.Fatalf("family = %+v, pacing = %+v, expected cleared without a stored address", self.families[4], self.pacing[4])
+	}
+}
+
+func TestExtenderActivatorLoadBoundsTheRestartSpreadByTheRecordLifetime(t *testing.T) {
+	f := newTestPacingLoadFixture(t)
+	expire := f.now.Add(20 * time.Minute)
+	f.plant(t, expire, testActivateIpv4)
+	self := newTestPacingLoadActivator(f.publicKey, f.directory, f.now, false)
+	self.settings.ReplacedPostJitter = time.Hour
+	self.settings.postJitterForTest = func(maxJitter time.Duration) time.Duration { return maxJitter }
+	self.applyPacing(f.record(f.activatedPacing(expire)), nil)
+	if wait := self.schedules[4].nextActivateTime.Sub(f.now); wait < 0 || 10*time.Minute <= wait {
+		t.Fatalf("next post in %s, expected under 10m", wait)
+	}
 }
 
 func TestExtenderActivatorReleasedStoreDuringReplacement(t *testing.T) {

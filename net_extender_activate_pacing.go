@@ -201,7 +201,11 @@ func (self *ExtenderActivator) applyPacing(record *ExtenderActivationPacingRecor
 		holding := pacing.Hold && pacing.NextAllowedAttemptAt.After(now)
 		switch {
 		case !holding && valid && !replaced:
-			postTime := now.Add(uniformJitter(self.settings.ReplacedPostJitter, self.settings.postJitterForTest))
+			spread := self.settings.ReplacedPostJitter
+			if half := pacing.RecordExpireTime.Sub(now) / 2; half < spread {
+				spread = half
+			}
+			postTime := now.Add(uniformJitter(spread, self.settings.postJitterForTest))
 			// the renewal is sooner than the spread says: it is the post
 			if pacing.NextAllowedAttemptAt.After(now) && pacing.NextAllowedAttemptAt.Before(postTime) {
 				postTime = pacing.NextAllowedAttemptAt
@@ -253,10 +257,17 @@ func (self *ExtenderActivator) verifyPacing(pacing ExtenderActivationPacing, now
 	switch {
 	case !ok:
 		reason = "the directory holds no valid record of this key"
-	case expire.UnixMilli() != pacing.RecordExpireTime.UnixMilli():
-		reason = "the directory's record expires at another time"
 	case pacing.Ip.IsValid() && 0 < len(ips) && !slices.Contains(ips, pacing.Ip):
 		reason = "the directory's record does not list the stored address"
+	case expire.UnixMilli() == pacing.RecordExpireTime.UnixMilli():
+		// The directory holds the stored record.
+	case expire.After(pacing.RecordExpireTime) && pacing.Ip.IsValid() && slices.Contains(ips, pacing.Ip):
+		// A newer record keeps this family only if it lists its address.
+		pacing.RecordExpireTime = expire
+	case expire.After(pacing.RecordExpireTime):
+		reason = "the directory's newer record does not list the stored address"
+	default:
+		reason = "the directory's record expires at another time"
 	}
 	if reason == "" {
 		return pacing, ""
