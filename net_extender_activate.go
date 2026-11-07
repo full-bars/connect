@@ -636,8 +636,10 @@ type ExtenderActivator struct {
 	// goroutine alone.
 	schedules map[int]*extenderActivateSchedule
 	// the pacing of each family by schedule key (ExtenderActivationPacing), under
-	// stateLock
-	pacing map[int]ExtenderActivationPacing
+	// stateLock, and any stored pacing waiting for directory root keys before its
+	// record can be verified
+	pacing           map[int]ExtenderActivationPacing
+	unverifiedPacing map[int]ExtenderActivationPacing
 	// closed once the pacing store has been read, timed out or failed (Ready)
 	pacingReady    chan struct{}
 	helloAddresses map[int]netip.Addr
@@ -932,6 +934,7 @@ func NewExtenderActivator(
 		families:               map[int]*ExtenderFamilyActivationStatus{},
 		schedules:              map[int]*extenderActivateSchedule{},
 		pacing:                 map[int]ExtenderActivationPacing{},
+		unverifiedPacing:       map[int]ExtenderActivationPacing{},
 		pacingReady:            make(chan struct{}),
 		helloAddresses:         map[int]netip.Addr{},
 		counters:               map[int]*ExtenderFamilyCounters{},
@@ -1161,6 +1164,7 @@ func (self *ExtenderActivator) run() {
 			_, directoryChange = self.settings.Directory.ChangeMonitor().Get()
 		}
 		now := self.settings.Now()
+		self.resolveUnverifiedPacing(now)
 
 		// a revocation and a network change leave every record of this host in
 		// doubt, so every family is due, whatever its own schedule says
@@ -1256,7 +1260,7 @@ func (self *ExtenderActivator) run() {
 // operator refuses leaves the revocation standing, and retrying it on every
 // directory change instead of on the backoff would spin.
 func (self *ExtenderActivator) observeRevocation(now time.Time) (observed bool) {
-	if self.settings.Directory == nil || len(self.settings.PublicKey) == 0 {
+	if self.settings.Directory == nil || self.settings.Directory.RootKeys().Len() == 0 || len(self.settings.PublicKey) == 0 {
 		return false
 	}
 	revoked := false
