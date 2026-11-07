@@ -1562,6 +1562,28 @@ func (self *ExtenderServer) ConnectionCount() int {
 	return self.connectionCount
 }
 
+// ServedCounts returns accepted requests handed over to a client stream by service.
+func (self *ExtenderServer) ServedCounts() map[string]uint64 {
+	counts := map[string]uint64{}
+	for index, name := range servedServiceNames {
+		if count := self.served[index].Load(); count != 0 {
+			counts[name] = count
+		}
+	}
+	return counts
+}
+
+var servedServiceNames = [...]string{"forward", "gossip", "feed", "other"}
+
+func (self *ExtenderServer) recordServed(service uint32) {
+	index := len(servedServiceNames) - 1
+	switch service {
+	case connect.ExtenderServiceForward, connect.ExtenderServiceGossip, connect.ExtenderServiceFeed:
+		index = int(service)
+	}
+	self.served[index].Add(1)
+}
+
 // ExtenderStats is the traffic one extender has relayed, summed over every
 // carrier and cumulative for the life of the server like the packet stats of a
 // device (O1). It is operator-centric: ingress is what moves from a client
