@@ -162,6 +162,9 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	defer clientConn.Close()
+	if probe == nil {
+		server.recordServed(header.Service)
+	}
 
 	handleCtx, handleCancel := context.WithCancel(req.Context())
 	defer handleCancel()

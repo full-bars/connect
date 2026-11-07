@@ -521,6 +521,8 @@ type ExtenderServer struct {
 	connectionCount        int
 	sourceConnectionCounts map[string]int
 
+	served [4]atomic.Uint64
+
 	// the relayed traffic of O1, summed over every carrier and cumulative for
 	// the life of the server. They are taken at the relay copy of each
 	// direction rather than at a carrier, so a byte is counted exactly once
@@ -2057,6 +2059,7 @@ func (self *ExtenderServer) handleV1Connection(
 	if self.settings.HeaderHandler != nil {
 		self.settings.HeaderHandler(header)
 	}
+	self.recordServed(connect.ExtenderServiceForward)
 
 	if 0 < len(self.nlayerHops) {
 		// an NLayer extender relays the inner stream to another extender,
