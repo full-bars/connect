@@ -179,7 +179,38 @@ type ExtenderCarrierRefusal struct {
 	ElapsedMs int64 `json:"elapsed_ms"`
 	// how much of the activation's probe budget was left when the probe
 	// started. A dns port is also bounded by its own budget.
-	BudgetLeftMs int64 `json:"budget_left_ms"`
+	BudgetLeftMs       int64 `json:"budget_left_ms"`
+	elapsedMsAbsent    bool
+	budgetLeftMsAbsent bool
+}
+
+// UnmarshalJSON distinguishes omitted or null timings from measured zero.
+func (self *ExtenderCarrierRefusal) UnmarshalJSON(data []byte) error {
+	type carrierRefusal ExtenderCarrierRefusal
+	value := carrierRefusal(*self)
+	decoded := &struct {
+		*carrierRefusal
+		ElapsedMs    *int64 `json:"elapsed_ms"`
+		BudgetLeftMs *int64 `json:"budget_left_ms"`
+	}{carrierRefusal: &value}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded == nil {
+		return nil
+	}
+	value.ElapsedMs = 0
+	value.BudgetLeftMs = 0
+	value.elapsedMsAbsent = decoded.ElapsedMs == nil
+	value.budgetLeftMsAbsent = decoded.BudgetLeftMs == nil
+	if decoded.ElapsedMs != nil {
+		value.ElapsedMs = *decoded.ElapsedMs
+	}
+	if decoded.BudgetLeftMs != nil {
+		value.BudgetLeftMs = *decoded.BudgetLeftMs
+	}
+	*self = ExtenderCarrierRefusal(value)
+	return nil
 }
 
 // ExtenderActivateCarrierRefusal is the activation result's carrier refusal type.
@@ -2146,12 +2177,18 @@ func extenderActivateCarrierRefusalsText(carrierRefusals []*ExtenderActivateCarr
 		if carrierRefusal == nil {
 			continue
 		}
+		timingText := ""
+		if !carrierRefusal.elapsedMsAbsent {
+			timingText += fmt.Sprintf(" after %s", extenderActivateMsText(carrierRefusal.ElapsedMs))
+		}
+		if !carrierRefusal.budgetLeftMsAbsent {
+			timingText += fmt.Sprintf(" (%s left)", extenderActivateMsText(carrierRefusal.BudgetLeftMs))
+		}
 		refusalTexts = append(refusalTexts, fmt.Sprintf(
-			"%s:%d after %s (%s left): %s",
+			"%s:%d%s: %s",
 			carrierRefusal.Carrier,
 			carrierRefusal.Port,
-			extenderActivateMsText(carrierRefusal.ElapsedMs),
-			extenderActivateMsText(carrierRefusal.BudgetLeftMs),
+			timingText,
 			carrierRefusal.Error,
 		))
 	}
