@@ -122,6 +122,7 @@ func newTestScaleDirectory(t *testing.T, configure func(settings *ExtenderDirect
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	directory := NewExtenderDirectory(ctx, settings)
+	directory.SetRootKeys(NewExtenderRootKeySet(newTestExtenderKey(t)))
 	t.Cleanup(func() {
 		directory.Close()
 		cancel()
