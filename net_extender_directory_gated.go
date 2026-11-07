@@ -738,7 +738,7 @@ func (self *ExtenderDirectory) gatedModeWithLock(mode string) {
 		self.gated.fallbackReason = ""
 	}
 	if self.log.V(1).Enabled() {
-		self.log.Infof("[extender]gated preference %s\n", mode)
+		self.log.Infof("🌉 [extender]gated preference %s\n", mode)
 	}
 }
 
@@ -755,7 +755,7 @@ func (self *ExtenderDirectory) gatedFallbackWithLock(now time.Time, reason strin
 	}
 	state.fallbackCounts = extenderGatedCountAdd(state.fallbackCounts, reason, 1)
 	if self.log.V(1).Enabled() {
-		self.log.Infof("[extender]gated preference fallback %s\n", reason)
+		self.log.Infof("🌉 [extender]gated preference fallback %s\n", reason)
 	}
 	state.mode = ExtenderGatedModeFallback
 	if !strings.HasPrefix(reason, "release_") {

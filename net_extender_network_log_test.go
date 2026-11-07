@@ -166,7 +166,7 @@ func TestExtenderNetworkClientNamesNoCandidateAddress(t *testing.T) {
 
 	// every route has failed and said so at least once
 	deadline := time.Now().Add(30 * time.Second)
-	prefixes := []string{"[extender]feed", "[extender]probe", "[extender]hello", "[extender]hint"}
+	prefixes := []string{"🌉 [extender]feed", "🌉 [extender]probe", "🌉 [extender]hello", "🌉 [extender]hint"}
 	for {
 		// past the constant the status says while there is no candidate
 		status := networkClient.Status().LastError
@@ -186,7 +186,7 @@ func TestExtenderNetworkClientNamesNoCandidateAddress(t *testing.T) {
 	if status := networkClient.Status().LastError; strings.Contains(status, candidateIp) {
 		t.Errorf("the status names the address: %q", status)
 	}
-	for _, line := range logger.linesWithPrefix("[extender]") {
+	for _, line := range logger.linesWithPrefix("🌉 [extender]") {
 		if strings.Contains(line, candidateIp) {
 			t.Errorf("a default-level line names the address: %q", line)
 		}

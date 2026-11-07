@@ -296,7 +296,7 @@ func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string
 		// signed outside the lock, which nothing waits on
 		var err error
 		if csr, err = newExtenderMeasurementCsr(self.key, names); err != nil {
-			log.Printf("[extender] lag: measurement certificate request err = %s", err)
+			log.Printf("🌉 [extender] lag: measurement certificate request err = %s", err)
 			return ""
 		}
 	}
@@ -578,7 +578,7 @@ func readExtenderMeasurementKey(keyFile string) (*ecdsa.PrivateKey, error) {
 	}
 	if info, err := os.Stat(keyFile); err == nil && info.Mode().Perm()&0077 != 0 {
 		if err := os.Chmod(keyFile, 0600); err != nil {
-			log.Printf("[extender] lag: measurement key %s is readable beyond its owner: %s", keyFile, err)
+			log.Printf("🌉 [extender] lag: measurement key %s is readable beyond its owner: %s", keyFile, err)
 		}
 	}
 	return key, nil
@@ -742,7 +742,7 @@ func newExtenderLagLifecycle(server *ExtenderServer, settings *ExtenderLagLifecy
 	self.settings = &copied
 
 	if strings.TrimSpace(copied.ApiUrl) == "" || copied.ClientStrategy == nil {
-		log.Printf("[extender] lag: the lifecycle has no api to poll or post to")
+		log.Printf("🌉 [extender] lag: the lifecycle has no api to poll or post to")
 		return self
 	}
 	self.reporter = newExtenderLagReporter(server, self.settings)
@@ -851,7 +851,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 	if err != nil {
 		// a read the close interrupted is no failure worth a line
 		if self.server.ctx.Err() == nil {
-			log.Printf("[extender] lag: measurement certificate poll err = %s", err)
+			log.Printf("🌉 [extender] lag: measurement certificate poll err = %s", err)
 		}
 		return now.Add(backoff), nextBackoff
 	}
@@ -876,7 +876,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 			// a chain this key cannot serve is of no use: the operator needs a
 			// request for this key, which a chain for another key asks for
 			// with a pass now
-			log.Printf("[extender] lag: measurement certificate not installed = %s", err)
+			log.Printf("🌉 [extender] lag: measurement certificate not installed = %s", err)
 			self.certificate.setHeld(nil, nil)
 			if errors.Is(err, errExtenderMeasurementKeyMismatch) {
 				self.askForKey("certificate issued", result.KeySha256)
@@ -887,7 +887,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		self.certificate.setHeld(installed.names, installed.names)
 		if self.certificate.install(installed) {
 			log.Printf(
-				"[extender] lag: measurement certificate installed for %s until %s",
+				"🌉 [extender] lag: measurement certificate installed for %s until %s",
 				strings.Join(installed.names, ","),
 				installed.notAfter.Format(time.RFC3339),
 			)
@@ -920,7 +920,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		// the tick, as after any refusal.
 		if dropped := self.certificate.drop(); dropped != nil {
 			log.Printf(
-				"[extender] lag: measurement certificate for %s withdrawn by the operator = %s",
+				"🌉 [extender] lag: measurement certificate for %s withdrawn by the operator = %s",
 				strings.Join(dropped.names, ","),
 				result.Reason,
 			)
@@ -932,7 +932,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 	case ExtenderMeasurementCertStateNone, ExtenderMeasurementCertStateRefused:
 		answeredNames := []string(nil)
 		if result.State == ExtenderMeasurementCertStateRefused {
-			log.Printf("[extender] lag: measurement certificate refused by the operator = %s", result.Reason)
+			log.Printf("🌉 [extender] lag: measurement certificate refused by the operator = %s", result.Reason)
 			if result.KeySha256 == "" || result.KeySha256 == self.certificate.keySha256 {
 				// the refusal of this key's request settles it
 				answeredNames = result.Names
@@ -948,7 +948,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		return self.idlePollTime(now, backoff)
 
 	default:
-		log.Printf("[extender] lag: measurement certificate state %q is not known", result.State)
+		log.Printf("🌉 [extender] lag: measurement certificate state %q is not known", result.State)
 		return now.Add(backoff), nextBackoff
 	}
 }
@@ -973,7 +973,7 @@ func (self *extenderLagLifecycle) askForPass(asked string, why string) {
 		return
 	}
 	self.passAskedFor = asked
-	log.Printf("[extender] lag: %s; asking for a pass now", why)
+	log.Printf("🌉 [extender] lag: %s; asking for a pass now", why)
 	self.certificate.requestReactivate()
 }
 

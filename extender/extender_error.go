@@ -129,7 +129,7 @@ func (self *ExtenderServer) reportHandlerPanic(r any) {
 			locations = append(locations, fmt.Sprintf("%s:%d", path.Base(frame.File), frame.Line))
 		}
 	}
-	connect.DefaultLogger().Errorf("[extender] a request's handler panicked at %s\n", strings.Join(locations, " < "))
+	connect.DefaultLogger().Errorf("🌉 [extender] a request's handler panicked at %s\n", strings.Join(locations, " < "))
 	self.reportError("handler panic", extenderFixedError("the handler panicked"))
 }
 

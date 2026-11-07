@@ -290,7 +290,7 @@ func NewExtenderPeerPinger(
 			copiedAttestor.ExtenderPublicKey = slices.Clone(settings.Attestor.ExtenderPublicKey)
 			attestor = &copiedAttestor
 		} else {
-			log.Infof("[extender]peer ping attestor is not an extender; peers are measured only\n")
+			log.Infof("🌉 [extender]peer ping attestor is not an extender; peers are measured only\n")
 		}
 	}
 	settings.Attestor = attestor
@@ -769,12 +769,12 @@ func (self *ExtenderPeerPinger) ping(publicKey []byte, candidates []*ExtenderCan
 					retryTime = limitedUntil
 				}
 				if self.log.V(1).Enabled() {
-					self.log.Infof("[extender]peer ping %s limited until %s\n", candidate.Ip, retryTime)
+					self.log.Infof("🌉 [extender]peer ping %s limited until %s\n", candidate.Ip, retryTime)
 				}
 				continue
 			}
 			if self.log.V(1).Enabled() {
-				self.log.Infof("[extender]peer ping %s err = %s\n", candidate.Ip, err)
+				self.log.Infof("🌉 [extender]peer ping %s err = %s\n", candidate.Ip, err)
 			}
 			self.addRecord(ExtenderPingRecord{
 				Time:            self.settings.Now(),
@@ -792,7 +792,7 @@ func (self *ExtenderPeerPinger) ping(publicKey []byte, candidates []*ExtenderCan
 		}
 		if self.log.V(1).Enabled() {
 			self.log.Infof(
-				"[extender]peer ping %s rtt=%s outcome=%q reason=%d\n",
+				"🌉 [extender]peer ping %s rtt=%s outcome=%q reason=%d\n",
 				candidate.Ip,
 				candidateProbe.rtt,
 				outcome,

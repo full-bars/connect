@@ -108,7 +108,7 @@ func (self *extenderLagReporter) submit(report *protocol.LagReport) {
 	}
 	reportBytes, err := proto.Marshal(report)
 	if err != nil {
-		log.Printf("[extender] lag: report err = %s", err)
+		log.Printf("🌉 [extender] lag: report err = %s", err)
 		return
 	}
 	self.stateLock.Lock()
@@ -232,7 +232,7 @@ func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
 	}
 	argsBytes, err := json.Marshal(args)
 	if err != nil {
-		log.Printf("[extender] lag: report post err = %s", err)
+		log.Printf("🌉 [extender] lag: report post err = %s", err)
 		return true
 	}
 
@@ -253,12 +253,12 @@ func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
 	if err != nil {
 		var statusError *connect.HttpStatusError
 		if errors.As(err, &statusError) && slices.Contains(extenderLagReportFinalStatusCodes, statusError.StatusCode) {
-			log.Printf("[extender] lag: %d reports refused = %s", len(reportBatch), err)
+			log.Printf("🌉 [extender] lag: %d reports refused = %s", len(reportBatch), err)
 			return true
 		}
 		// a post the close interrupted is no failure worth a line
 		if self.server.ctx.Err() == nil {
-			log.Printf("[extender] lag: report post err = %s", err)
+			log.Printf("🌉 [extender] lag: report post err = %s", err)
 		}
 		return false
 	}
@@ -266,7 +266,7 @@ func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
 	// the operator took the batch; its verdicts are logged, never retried
 	result := &extenderLagReportResult{}
 	if err := json.Unmarshal(bodyBytes, result); err != nil {
-		log.Printf("[extender] lag: report answer err = %s", err)
+		log.Printf("🌉 [extender] lag: report answer err = %s", err)
 		return true
 	}
 	if 0 < len(result.Rejected) {
@@ -277,7 +277,7 @@ func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
 			}
 		}
 		log.Printf(
-			"[extender] lag: the operator rejected %d of %d reports: %s",
+			"🌉 [extender] lag: the operator rejected %d of %d reports: %s",
 			len(result.Rejected), len(reportBatch), strings.Join(reasons, "; "),
 		)
 	}

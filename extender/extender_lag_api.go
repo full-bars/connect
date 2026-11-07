@@ -296,7 +296,7 @@ func newExtenderLagApi(
 		if canonicalOrigin, ok := lagApiCanonicalOrigin(origin); ok {
 			allowedOrigins[canonicalOrigin] = true
 		} else {
-			log.Printf("[extender] lag: allowed origin %q is not kept in this build", origin)
+			log.Printf("🌉 [extender] lag: allowed origin %q is not kept in this build", origin)
 		}
 	}
 

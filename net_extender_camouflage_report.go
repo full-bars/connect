@@ -823,7 +823,7 @@ func (self *ExtenderCamouflageReporter) refused(now time.Time, wait time.Duratio
 
 func (self *ExtenderCamouflageReporter) logOutcome(outcome string) {
 	if self.log.V(1).Enabled() {
-		self.log.Infof("[extender]camouflage report %s\n", outcome)
+		self.log.Infof("🌉 [extender]camouflage report %s\n", outcome)
 	}
 }
 

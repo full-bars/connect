@@ -149,7 +149,7 @@ func TestExtenderActivatorLogsTheCauseOfEveryAttempt(t *testing.T) {
 			t.Fatalf("v4 status = %+v, expected a failed activation", status)
 		}
 
-		lines := log.linesWithPrefix("[extender] activate v4 failed ")
+		lines := log.linesWithPrefix("🌉 [extender] activate v4 failed ")
 		if len(lines) == 0 {
 			t.Fatal("the failed activation logged no error")
 		}
@@ -245,7 +245,7 @@ func TestExtenderActivatorRefusalLog(t *testing.T) {
 		}
 	}
 	lines := logger.linesContaining("refused")
-	if len(lines) != 1 || !strings.HasPrefix(lines[0], "[extender] activate v4 refused ") {
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "🌉 [extender] activate v4 refused ") {
 		t.Fatalf("refusal lines: %v", lines)
 	}
 	line := lines[0]
