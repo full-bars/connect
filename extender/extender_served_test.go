@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect"
 	"google.golang.org/protobuf/proto"
@@ -23,6 +24,27 @@ func TestExtenderServedCountsAcceptedForwards(t *testing.T) {
 		if got := fixture.server.ServedCounts()["forward"]; got != uint64(i+1) {
 			t.Fatalf("%s: served = %d, want %d", carrier, got, i+1)
 		}
+	}
+}
+
+func TestExtenderServedIgnoresRefusalAndProbe(t *testing.T) {
+	fixture := newExtenderFixture(t, net.IPv6loopback.String(), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, _, err := connect.DialExtender(ctx, fixture.connectSettings(), fixture.extenderConfig(connect.ExtenderCarrierTcp), &connect.ExtenderDial{
+		DestinationHost: "blocked.example", DestinationPort: 443,
+	})
+	if err == nil {
+		conn.Close()
+		t.Fatal("blocked forward was accepted")
+	}
+	conn, _, err = connect.DialExtender(ctx, fixture.connectSettings(), fixture.extenderConfig(connect.ExtenderCarrierTcp), &connect.ExtenderDial{Service: connect.ExtenderServiceProbe})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if got := fixture.server.ServedCounts(); len(got) != 0 {
+		t.Fatalf("refusal or probe counted as served: %v", got)
 	}
 }
 
