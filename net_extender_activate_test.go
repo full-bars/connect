@@ -100,6 +100,10 @@ type testActivateOperator struct {
 	// the `refused_carriers` an activation carries (C2a), none as an operator
 	// that predates the field sends
 	refusedCarriers []*ExtenderActivateCarrierRefusal
+	// answers as an operator that predates the webrtc carrier (EXTENDER.md
+	// S8): a list naming a carrier it does not know, or none with tcp, is
+	// refused before anything is probed, in that operator's words
+	predatesWebRtc bool
 	// the address an activation of a family is answered with, by family; the
 	// family's fixed address while unset
 	publishedIps map[int]string
@@ -114,6 +118,9 @@ type testActivateOperator struct {
 	// keeps each signed record newer than the last, which is what the newest
 	// wins rule of B5 needs when two activations land in the same instant
 	issueSerial int
+	// the `address_ports` an activation carries (S10), false as an operator
+	// that predates the field sends
+	addressPorts bool
 }
 
 func newTestActivateOperator(
@@ -184,6 +191,20 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		probeSteps := self.probeSteps
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
+		if self.predatesWebRtc && refusal == "" {
+			for _, carrier := range args.Carriers {
+				switch carrier {
+				case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns:
+				default:
+					if refusal == "" {
+						refusal = fmt.Sprintf("unknown carrier %q", carrier)
+					}
+				}
+			}
+			if refusal == "" && !slices.Contains(args.Carriers, ExtenderCarrierTcp) {
+				refusal = "an activation must offer the tcp carrier"
+			}
+		}
 		self.stateLock.Unlock()
 		select {
 		case self.posts <- &testActivatePost{ipVersion: ipVersion, args: args, postTime: now}:
@@ -260,6 +281,7 @@ func (self *testActivateOperator) activateResult(
 		ip = publishedIp
 	}
 	refusedCarriers := self.refusedCarriers
+	addressPorts := self.addressPorts
 	self.activatedIps[ipVersion] = ip
 	activatedIps := []string{}
 	for _, activatedIpVersion := range []int{4, 6} {
@@ -294,6 +316,7 @@ func (self *testActivateOperator) activateResult(
 		Record:          record,
 		Bootstrap:       []string{bootstrapRecord},
 		RefusedCarriers: refusedCarriers,
+		AddressPorts:    addressPorts,
 	}, nil
 }
 
@@ -1753,5 +1776,44 @@ func TestExtenderActivatorSendsDnsPorts(t *testing.T) {
 	}
 	if post.args.DnsPort != ExtenderDnsPort {
 		t.Fatalf("dns port = %d, expected %d", post.args.DnsPort, ExtenderDnsPort)
+	}
+}
+
+// A post offers the ports a router's mapping forwards to this extender, read
+// at each post: they replace the configured ports one by one, and a mapping the
+// router moved is offered by the next post (S10, the port mapping).
+func TestExtenderActivatorOffersTheMappedPorts(t *testing.T) {
+	var stateLock sync.Mutex
+	tcpPort, udpPort, dnsPort := 40443, 0, 44053
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.OfferedPorts = func() (int, int, int) {
+			stateLock.Lock()
+			defer stateLock.Unlock()
+			return tcpPort, udpPort, dnsPort
+		}
+	})
+
+	fixture.waitPass()
+	for range 2 {
+		post := fixture.waitPost()
+		// the unmapped udp carrier keeps its configured port
+		if post.args.TcpPort != 40443 || post.args.UdpPort != ExtenderQuicPort || post.args.DnsPort != 44053 {
+			t.Fatalf("v%d ports = %d/%d/%d, expected the mapped tcp and dns ports",
+				post.ipVersion, post.args.TcpPort, post.args.UdpPort, post.args.DnsPort)
+		}
+	}
+
+	func() {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		tcpPort, udpPort = 41443, 40444
+	}()
+	fixture.activator.Reactivate()
+	for range 2 {
+		post := fixture.waitPost()
+		if post.args.TcpPort != 41443 || post.args.UdpPort != 40444 || post.args.DnsPort != 44053 {
+			t.Fatalf("v%d ports after the move = %d/%d/%d, expected the moved mapping",
+				post.ipVersion, post.args.TcpPort, post.args.UdpPort, post.args.DnsPort)
+		}
 	}
 }

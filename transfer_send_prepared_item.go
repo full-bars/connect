@@ -2,6 +2,8 @@
 package connect
 
 import (
+	"fmt"
+
 	"github.com/urnetwork/connect/protocol"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,9 +20,12 @@ func (self *SendSequence) prepareSendItem(
 	queuedInput bool,
 ) (item *sendItem, effectiveAck bool, groupMemoryBytes ByteCount, err error) {
 	groupMemoryBytes = disposition.memoryByteCount()
-	effectiveAck = ack || self.sendContract != nil && !self.sendContractAcked
+	effectiveAck = ack || self.sendContract != nil && !self.sendContractAcked &&
+		// a headroom debit rides a contract the receiver holds, never the
+		// acknowledged lane (FILLFRACTION.md)
+		self.noAckHeadroomCharge == nil
 	item = takeSendItem()
-	*item = sendItem{acks: acks}
+	*item = sendItem{acks: acks, noBudget: len(frames) == 0 || acks.bypassesBudget(), deliverImmediately: acks.deliversImmediately()}
 	prepared := false
 	defer func(owner *sendItem) {
 		if !prepared {
@@ -34,9 +39,14 @@ func (self *SendSequence) prepareSendItem(
 	}
 	err = item.acks.commitPreparedHandoffs(func() error {
 		if err := self.ctx.Err(); err != nil {
+			// This optional opening still has no wire ordinal. Losing its
+			// source is local retirement, not evidence against the provider.
+			if group, ok := disposition.target.(*parsedPacketGroup); ok && group.isSynRetry() && group.synRetry.openingSerial != 0 {
+				return newUnwrittenSendPackError(fmt.Errorf("%w: %w", errNativeSynOpeningSuperseded, err))
+			}
 			return err
 		}
-		if !effectiveAck || !self.resendQueue.lifetimeBudget {
+		if item.noBudget || !effectiveAck || !self.resendQueue.lifetimeBudget {
 			return nil
 		}
 		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(frames), len(frames))
@@ -56,6 +66,11 @@ func (self *SendSequence) prepareSendItem(
 	})
 	if err != nil {
 		return nil, effectiveAck, groupMemoryBytes, err
+	}
+	if effectiveAck && !ack && self.client != nil {
+		// carried on the acknowledged lane because its contract is not yet
+		// acknowledged (FILLFRACTION.md)
+		self.client.noAckContractPromotedCount.Add(1)
 	}
 	prepared = true
 	return item, effectiveAck, groupMemoryBytes, nil
@@ -89,9 +104,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	item, effectiveAck, groupMemoryBytes, err := self.prepareSendItem(frames, acks, ack, aheadContract, disposition, false)
 	if err != nil {
 		ownInput = false
-		if self.sendContract != nil {
-			self.sendContract.rollbackUnwritten(MessageByteCount(frames))
-		}
+		self.rollbackUnwrittenContractDebit(MessageByteCount(frames))
 		disposition.complete(false)
 		for _, frame := range frames {
 			MessagePoolReturn(frame.MessageBytes)

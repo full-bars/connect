@@ -998,7 +998,7 @@ type windowServiceCoverage struct {
 // Offer coverage is separate from raw delivery ownership. Missing production
 // offers stay distinct from legacy observations that never carried this proof.
 type windowServiceSupply struct {
-	// Kept only for one exact confirmed original, never a merged prefix.
+	// A singleton or one exact confirmed ready run; unrelated merges clear it.
 	readyAtNanos       int64
 	readyLane          Id
 	earliestSentNanos  int64
@@ -1018,6 +1018,7 @@ type windowServiceSupply struct {
 	complete           bool
 	rawClock           bool
 	headComplete       bool
+	readyTrain         bool
 }
 
 // Copy full provenance without the suffix, queue flags or bucket placement.
@@ -1077,7 +1078,10 @@ func (self *windowServiceCoverage) merge(other windowServiceCoverage) {
 		return
 	}
 	self.supply.recorded = self.supply.recorded || other.supply.recorded
-	self.supply.readyAtNanos, self.supply.readyLane = 0, Id{}
+	if !self.supply.readyTrain || !other.supply.readyTrain || self.supply.readyLane != other.supply.readyLane ||
+		self.supply.readyAtNanos != other.supply.readyAtNanos {
+		self.supply.readyAtNanos, self.supply.readyLane, self.supply.readyTrain = 0, Id{}, false
+	}
 	self.supply.complete = self.supply.complete && other.supply.complete
 	offerGap := max(int64(0), other.supply.earliestSentNanos-self.supply.latestSentNanos,
 		self.supply.earliestSentNanos-other.supply.latestSentNanos)
@@ -1191,6 +1195,19 @@ func (self windowServiceSupply) pacedOfferSpan(span, headStart, offerStart int64
 		self.readyAtNanos <= 0 || self.readyAtNanos > self.earliestSentNanos ||
 		lane == (Id{}) || self.readyLane != lane ||
 		self.readyAtNanos-offerStart > int64(2*interval) {
+		return 0
+	}
+	return max(span, self.headMaximumAtNanos-headStart, self.latestSentNanos-offerStart)
+}
+
+// A confirmed consecutive ready run survives cumulative ACK grouping. Both
+// endpoints must belong to that exact run; raw, head and offer time still
+// bound the denominator. This supplies only growth from an achieved rate.
+func (self windowServiceSupply) readyTrainOfferSpan(span, headStart, offerStart int64, lane Id) int64 {
+	if span <= 0 || !self.readyTrain || !self.recorded || !self.complete || !self.headComplete ||
+		headStart <= 0 || self.headMaximumAtNanos <= headStart || offerStart <= 0 ||
+		self.earliestSentNanos < offerStart || self.latestSentNanos < self.earliestSentNanos ||
+		self.readyAtNanos <= 0 || self.readyAtNanos > offerStart || lane == (Id{}) || self.readyLane != lane {
 		return 0
 	}
 	return max(span, self.headMaximumAtNanos-headStart, self.latestSentNanos-offerStart)
@@ -1574,7 +1591,7 @@ func (self *windowPacingService) observeAckSampleWithLock(credit windowServiceAc
 	timing := self.roundTripEvidenceWithLock(at)
 	ackSample := windowServiceSample{firstAtNanos: at.UnixNano(), firstBytes: bytes, lastAtNanos: at.UnixNano(), bytes: bytes,
 		supply: windowServiceSupply{recorded: credit.offerRecorded,
-			readyAtNanos: credit.readyAtNanos, readyLane: credit.readyLane,
+			readyAtNanos: credit.readyAtNanos, readyLane: credit.readyLane, readyTrain: credit.readyTrain,
 			complete: credit.offerRecorded && credit.offerComplete && credit.firstSentAtNanos > 0 &&
 				credit.lastSentAtNanos >= credit.firstSentAtNanos && timing.minimum > 0,
 			rawClock:          !credit.receiverTimingObserved,
@@ -1932,6 +1949,23 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 		after := self.receiverHeldPrefixAtNanos
 		return measured > hold && after != 0 && (atNanos <= after || span >= atNanos-after)
 	}
+	// A compressed raw window ends on the receiver's timer, not on an arrival.
+	// Exact cumulative heads time the credited bytes themselves. When the
+	// reply's own wait is shorter than one more message at the held rate, that
+	// message may still have been serializing as the turn ended: at 125 kB/s a
+	// 50 ms turn holds one or two 31.688 ms messages. The window's excess over
+	// the heads then proves no slower serializer, so a decrease falls no lower
+	// than the heads show. A longer wait proves a stall; the window stands.
+	headBoundedDecrease := func(measured, bytes ByteCount, atNanos int64, supply windowServiceSupply, headStart int64) ByteCount {
+		if measured >= hold || compression <= 0 || self.maxMessageByteCount <= 0 || !supply.headComplete ||
+			headStart <= 0 || supply.headMaximumAtNanos <= headStart || atNanos < supply.headMaximumAtNanos {
+			return measured
+		}
+		if time.Duration(atNanos-supply.headMaximumAtNanos) >= windowPacingSerializationTime(self.maxMessageByteCount, hold) {
+			return measured
+		}
+		return min(hold, max(measured, byteRate(bytes, supply.headMaximumAtNanos-headStart)))
+	}
 	// A bounded drain has not yet distinguished queueing from propagation.
 	// Preserve qualified service through its physical proof and write handoff;
 	// expiry or abandonment ends the hold, while new bytes may raise it.
@@ -2003,7 +2037,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			}
 		}
 	}
-	observeRate := func(bytes ByteCount, span, atNanos int64, intervalLimited, firstQueued bool, supply windowServiceSupply, receiverStart, headStart int64, receiverTimed bool, offerStart int64, readyLane Id) bool {
+	observeRate := func(bytes ByteCount, span, atNanos int64, intervalLimited, firstQueued bool, supply windowServiceSupply, receiverStart, headStart int64, receiverTimed bool, offerStart int64, readyLane Id, readyTrain bool) bool {
 		proofAtNanos := atNanos
 		offerOnly := false
 		if qualified := supply.qualifiedSpan(span, receiverStart, headStart, interval, receiverTimed); qualified > 0 {
@@ -2019,7 +2053,11 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				if hold <= 0 {
 					return false
 				}
-				offerSpan = supply.pacedOfferSpan(span, headStart, offerStart, readyLane, interval)
+				if readyTrain {
+					offerSpan = supply.readyTrainOfferSpan(span, headStart, offerStart, readyLane)
+				} else {
+					offerSpan = supply.pacedOfferSpan(span, headStart, offerStart, readyLane, interval)
+				}
 				if offerSpan <= 0 || byteRate(bytes, offerSpan) <= hold {
 					return false
 				}
@@ -2035,6 +2073,9 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			return false
 		}
 		measured := byteRate(bytes, span)
+		if !receiverTimed {
+			measured = headBoundedDecrease(measured, bytes, atNanos, supply, headStart)
+		}
 		if heldPrefixIncrease(measured, span, atNanos) || measured > hold && intervalLimited && span < increaseSpan && (hold > 0 || firstQueued) {
 			// A retained prefix or carrier reader can empty a completed flight
 			// at memory speed. Preserve its delivery without letting that release
@@ -2079,7 +2120,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 					receiverStart = newer.firstAtNanos
 				}
 				selected := newer.coverageAfterFirst()
-				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, selected.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0, Id{})
+				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, selected.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0, Id{}, false)
 			} else {
 				invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
 			}
@@ -2108,6 +2149,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			headStart := int64(0)
 			offerStart := int64(0)
 			readyLane := Id{}
+			readyTrain := false
 			if samples[j].supply.headComplete {
 				headStart = samples[j].supply.headLastMinAtNanos
 			}
@@ -2117,6 +2159,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				offerStart = samples[j].supply.latestSentNanos
 				if samples[j].supply.readyAtNanos > 0 {
 					readyLane = samples[j].supply.readyLane
+					readyTrain = samples[j].supply.readyTrain
 				}
 			}
 			if receiverTimed && samples[j].receiverBytes == samples[j].bytes {
@@ -2141,6 +2184,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				headStart = 0
 				offerStart = 0
 				readyLane = Id{}
+				readyTrain = false
 				if samples[j].supply.headComplete {
 					headStart = samples[j].supply.headFirstAtNanos
 				}
@@ -2158,7 +2202,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				}
 				if span <= 0 {
 					invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
-				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued || compression > 0 && !receiverTimed, firstQueued, candidateSupply, receiverStart, headStart, receiverTimed, offerStart, readyLane) {
+				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued || compression > 0 && !receiverTimed, firstQueued, candidateSupply, receiverStart, headStart, receiverTimed, offerStart, readyLane, readyTrain) {
 					offerSet = false
 					break
 				}
@@ -2232,7 +2276,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				if span <= 0 {
 					break
 				}
-				measured := byteRate(bytes, span)
+				measured := headBoundedDecrease(byteRate(bytes, span), bytes, newer.lastAtNanos, candidateSupply, headStart)
 				if !heldPrefixIncrease(measured, span, newer.lastAtNanos) && self.outstandingWithLock() > self.flightBoundAtWithLock(measured, timing.residence) {
 					heldAfterRejection = false
 					latest = measured
@@ -2260,7 +2304,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 					receiverStart = cycle.firstAtNanos
 				}
 				selected := cycle.coverageAfterFirst()
-				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, selected.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0, Id{}) {
+				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, selected.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0, Id{}, false) {
 					completedFallback = true
 					break
 				}

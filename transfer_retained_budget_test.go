@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -568,7 +569,7 @@ func TestRetainedReceiveDuplicatePreservesCommitAndHeadProgress(t *testing.T) {
 		fixture := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
 			settings.ReceiveQueueRetainedByteAccounting = true
 			settings.ReceiveQueueBudget = budget
-			settings.ReceiveHoldPolicy = ReceiveHoldRefuse
+			settings.ReceiveHoldPolicy = ReceiveHoldCommittedPrefix
 		})
 		fixture.forward(fixture.write(100), fixture.receiverIn)
 		fixture.acknowledge()
@@ -582,6 +583,19 @@ func TestRetainedReceiveDuplicatePreservesCommitAndHeadProgress(t *testing.T) {
 		held := seq.receiveQueue.GetBySequenceNumber(2)
 		if held == nil || !held.committed || budget.UsedByteCount() == 0 {
 			t.Fatal("future item was not committed under an exact reservation")
+		}
+		// Owned predecode must fund the missing original before publishing its
+		// successor's SACK. The former Refuse fixture relied on an unpaid
+		// direct-head path after it deliberately exhausted physical capacity.
+		path, err := FilteredTransferPath(head.bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan, status := scanReceiveMemoryPack(head.bytes, path)
+		if status != receiveMemoryPackScanReady || !seq.holdPromise.set || seq.holdPromise.boundary != held.sequenceNumber ||
+			seq.holdPromise.reservedByteCount < scan.retainedByteCount ||
+			budget.UsedByteCount() != held.QueueByteCount()+seq.holdPromise.reservedByteCount+seq.heldHeadRepair.reservedByteCount {
+			t.Fatal("selective custody did not prepay the real missing predecessor and repair metadata")
 		}
 		budget.SetTotalByteCount(budget.UsedByteCount())
 		reserved, _ := budget.Counts()
@@ -604,5 +618,174 @@ func assertRetainedBudgetBalance(t *testing.T, budget *TransferMemoryBudget) {
 	reserved, released := budget.Counts()
 	if budget.UsedByteCount() != 0 || reserved != released {
 		t.Fatalf("retained budget imbalance: used=%d reserved=%d released=%d", budget.UsedByteCount(), reserved, released)
+	}
+}
+
+// A shared old carrier remains immutable while real v1/v2 full-head rewriting
+// spends its original three/five-root grant. The synthetic stored bytes scope
+// this to encoding and custody; signed proof validation has separate controls.
+func TestRetainedExtendedPoolFullBudgetRewriteKeepsCarrier(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	assertMessagePoolOwnership(t)
+	for _, version := range []int{1, 2} {
+		for _, payloadBytes := range []int{1030, 1280} {
+			func() {
+				before := encodingPoolBoundaryNow()
+				budget := NewTransferMemoryBudget(64 * 1024)
+				defer func() {
+					assertRetainedBudgetBalance(t, budget)
+					encodingPoolRequireBalanced(t, before)
+				}()
+				settings := DefaultSendBufferSettings()
+				settings.ProtocolVersion = version
+				settings.ResendQueueBudget = budget
+				settings.ResendQueueRetainedByteAccounting = true
+				sequence := NewSendSequence(context.Background(), &Client{log: NewNoopLogger()}, nil,
+					NewId(), MultiHopId{}, false, false, false, sequenceTlsRoleClient, false, settings)
+				defer sequence.Close()
+				contractId := NewId()
+				contract := &sequenceContract{contractId: contractId,
+					contract: &protocol.Contract{StoredContractBytes: make([]byte, 128)}}
+				sequence.sendContract = contract
+				sequence.openSendContracts[contractId] = contract
+				frames, witnesses := transferGroupTestFrames(t, 8, payloadBytes)
+				defer func() {
+					for _, frame := range frames {
+						MessagePoolReturn(frame.MessageBytes)
+					}
+					releaseTransferGroupTestWitnesses(t, frames, witnesses)
+				}()
+				item := takeSendItem()
+				*item = sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: 1}, contractId: &contractId, expectsAck: true}
+				sequence.sendItems = []*sendItem{item}
+				defer sequence.releaseRetainedSendItems(context.Canceled)
+				estimate := sequence.retainedSendFrameByteCount(MessageByteCount(frames), len(frames))
+				charge := item.retainedMemoryByteCount(estimate, len(frames), version < 2)
+				roots := ByteCount(3)
+				if version < 2 {
+					roots = 5
+				}
+				if payloadBytes == 1030 {
+					if estimate <= 8192 || estimate > 12288 || retainedMessageCapacity(estimate) != 12300 ||
+						charge-item.retainedMemoryByteCount(8192, len(frames), version < 2) != roots*(12300-8204) {
+						t.Fatal("extended rewrite did not charge every rounded lifetime root")
+					}
+				} else if estimate <= 8192 || estimate > 12288 || retainedMessageCapacity(estimate) != 12300 {
+					t.Fatal("eight1280 full envelope did not acquire its complete pooled charge")
+				}
+				budget.SetTotalByteCount(charge - 1)
+				if item.reserveMemory(budget, charge) || budget.UsedByteCount() != 0 {
+					t.Fatal("underfunded lifetime owner was admitted")
+				}
+				budget.SetTotalByteCount(charge)
+				if !item.reserveMemory(budget, charge) {
+					t.Fatal("exact lifetime claim was refused")
+				}
+				extra := budget.TryReserve(1)
+				if extra {
+					budget.Release(1)
+					t.Fatal("full lifetime claim admitted an unrelated byte")
+				}
+				pack := &protocol.Pack{MessageId: item.messageId.Bytes(), SequenceId: sequence.sequenceId.Bytes(), SequenceNumber: 1, Frames: frames}
+				transferFrame := &protocol.TransferFrame{Pack: pack}
+				var legacyPackBytes []byte
+				defer func() { MessagePoolReturn(legacyPackBytes) }()
+				if version < 2 {
+					packBytes, err := ProtoMarshal(pack)
+					if err != nil {
+						t.Fatal(err)
+					}
+					legacyPackBytes = packBytes
+					transferFrame.Pack = nil
+					transferFrame.Frame = &protocol.Frame{MessageType: protocol.MessageType_TransferPack, MessageBytes: packBytes}
+				}
+				var err error
+				item.transferFrameBytes, err = ProtoMarshal(transferFrame)
+				if err != nil {
+					t.Fatal(err)
+				}
+				MessagePoolReturn(legacyPackBytes)
+				legacyPackBytes = nil
+				if transferFrame.Frame != nil {
+					transferFrame.Frame.MessageBytes = nil
+				}
+				carrier := MessagePoolShareReadOnly(item.transferFrameBytes)
+				defer MessagePoolReturn(carrier)
+				original := append([]byte(nil), carrier...)
+				pooled, shared := MessagePoolCheck(carrier)
+				if payloadBytes == 1030 && (!pooled || !shared || cap(carrier) != 12300) {
+					t.Fatal("full-budget rewrite did not retain a real pooled carrier share")
+				}
+				if payloadBytes == 1280 && (!pooled || !shared || cap(carrier) != 12300) {
+					t.Fatal("eight1280 did not retain a real pooled carrier share")
+				}
+				sequence.resendQueue.Add(item)
+				sequence.resendQueue.RemoveByMessageId(item.messageId)
+				rewritten, full, err := sequence.setHead(item, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !full || budget.UsedByteCount() != charge || !bytes.Equal(carrier, original) || &rewritten[0] == &carrier[0] {
+					MessagePoolReturn(rewritten)
+					t.Fatal("full-root rewrite borrowed memory or changed the retained carrier")
+				}
+				MessagePoolReturn(item.transferFrameBytes)
+				item.transferFrameBytes = rewritten
+				decoded := &decodedTransferFrame{}
+				defer decoded.release()
+				if !unmarshalOwnedTransferFrame(rewritten, decoded, false) {
+					t.Fatal("rewritten full head did not decode")
+				}
+				var actual *protocol.Pack
+				if decoded.frame.Pack != nil {
+					actual = decoded.frame.Pack
+				} else if decoded.frame.Frame != nil {
+					actual = &protocol.Pack{}
+					if err := ProtoUnmarshal(decoded.frame.Frame.MessageBytes, actual); err != nil {
+						t.Fatal(err)
+					}
+					defer returnDecodedPackMessageBytes(actual)
+				}
+				if actual == nil || !actual.Head || actual.ContractFrame == nil || len(actual.Frames) != 8 {
+					t.Fatal("rewritten full head lost contract or application frames")
+				}
+				t.Logf("version=%d packet_bytes=%d estimate=%d retained_charge=%d old_wire=%d rewritten_wire=%d pooled_old=%t", version, payloadBytes, estimate, charge, len(carrier), len(rewritten), pooled)
+			}()
+		}
+	}
+}
+
+// The real legacy protobuf decoder allocates ordinary message bytes. Its
+// cleanup must detach them without treating normal allocator cap as a pool id.
+func TestRetainedExtendedPoolLegacyDecodeDoesNotAdoptHeapBytes(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	before := encodingPoolBoundaryNow()
+	t.Cleanup(func() { encodingPoolRequireBalanced(t, before) })
+	for _, size := range []int{9472, 9000} {
+		func() {
+			want := bytes.Repeat([]byte{0x5a}, size)
+			encoded, err := ProtoMarshal(&protocol.Frame{MessageType: protocol.MessageType_TestSimpleMessage, MessageBytes: want})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer MessagePoolReturn(encoded)
+			decoded := &protocol.Frame{}
+			if err := ProtoUnmarshal(encoded, decoded); err != nil {
+				t.Fatal(err)
+			}
+			ordinary := decoded.MessageBytes
+			if cap(ordinary) != 9472 {
+				t.Fatalf("legacy decoder premise changed: size=%d cap=%d", size, cap(ordinary))
+			}
+			pooled, shared := MessagePoolCheck(ordinary)
+			returnDecodedFrameMessageBytes(decoded)
+			if pooled || shared || decoded.MessageBytes != nil || !bytes.Equal(ordinary, want) {
+				t.Fatalf("NONPOOL_PROTOBUF_CAPACITY_COLLISION: size=%d cap=%d pooled=%t mutated=%t", size, cap(ordinary), pooled, !bytes.Equal(ordinary, want))
+			}
+		}()
 	}
 }

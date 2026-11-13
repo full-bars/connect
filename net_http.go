@@ -2751,13 +2751,18 @@ type extenderIpProfile struct {
 }
 
 // The dialer priority of a carrier (E2). tcp is tried before quic before dns,
-// which is the order of how ordinary the traffic looks.
+// which is the order of how ordinary the traffic looks. webrtc comes last
+// (EXTENDER.md S3, S8): it is a second path that needs this client's own
+// exchange connection to signal through, the order orderedExtenderCarriers
+// gives the feed and the probes.
 func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 	switch connectMode {
 	case ExtenderConnectModeQuic:
 		return 110
 	case ExtenderConnectModeDns:
 		return 120
+	case ExtenderConnectModeWebRtc:
+		return 130
 	default:
 		return 100
 	}
@@ -2772,7 +2777,9 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 // (directorySpoofDomains). The tcp config also carries the record's camouflage
 // key and the client's borrow country (borrowCountryCode, the directory's
 // SpoofCountryCode), so its dial fronts the camouflaged attempt with the name
-// the extender covers (EXTENDER-UPDATE2 §3.1, §3.2).
+// the extender covers (EXTENDER-UPDATE2 §3.1, §3.2). The webrtc config is no
+// ip:port dial: the carrier signals to the record's rendezvous id, and there is
+// no outer tls to front, so it carries no outer name (EXTENDER.md S1, S8).
 func extenderConfigsForCandidate(
 	candidate *ExtenderCandidate,
 	secret string,
@@ -2781,7 +2788,7 @@ func extenderConfigsForCandidate(
 ) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile, dnsPorts []int) {
-		if 0 < len(spoofDomains) {
+		if 0 < len(spoofDomains) && profile.ConnectMode != ExtenderConnectModeWebRtc {
 			profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
 		}
 		if profile.Port <= 0 {
@@ -2819,6 +2826,13 @@ func extenderConfigsForCandidate(
 				profile.Port = dnsPorts[0]
 			}
 			appendConfig(profile, dnsPorts)
+		case ExtenderConnectModeWebRtc:
+			// the port is the tcp carrier's default only so the request
+			// authority is well formed, as the operator's webrtc probe sets it:
+			// nothing dials it, and a record's tcp port says nothing about
+			// this carrier (webRtcProbeExtenderConfig)
+			profile.Port = ExtenderTcpPort
+			appendConfig(profile, nil)
 		default:
 			profile.Port = candidate.TcpPort
 			// fragment and reorder apply to tcp only
@@ -3473,9 +3487,10 @@ func httpPostWithStrategyRaw(
 // HttpStatusError carries a non-200 response so callers can act on the STATUS rather
 // than string-matching an error message.
 //
-// This matters for 402: when a network is over its plan, the server answers 402 and
-// the body carries x402 payment terms. An agent needs to see the status and the body
-// to sign a payment and retry -- an opaque error string is unusable for that.
+// This matters for 402: when a network is over its plan and the caller asked for
+// x402 terms (`X-UR-X402: 1`), the server answers 402 and the body carries x402
+// payment terms. An agent needs to see the status and the body to sign a payment and
+// retry -- an opaque error string is unusable for that.
 //
 // Error() renders exactly as the untyped error it replaces, so existing callers that
 // only log or string-match are unaffected.

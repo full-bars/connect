@@ -3,6 +3,7 @@ package connect
 import (
 	"slices"
 	"sync"
+	"time"
 )
 
 // sendSchedulingKey keeps the exact five-tuple local. The scheduler consumes
@@ -48,6 +49,9 @@ type sendPackAdmission struct {
 	byKey    map[sendSchedulingKey]int
 	waiters  []*sendPackAdmissionWaiter
 	closed   bool
+	// Created only after a retained protocol SYN actually refuses. The same
+	// mutex publishes count vacancy after ordinary waiters receive their slots.
+	protocolReadiness *resendCapacityGate
 }
 
 // One blocked acquire. A grant sets granted under the admission mutex before
@@ -79,7 +83,35 @@ func (self *sendPackAdmission) tryTakeWithLock(key sendSchedulingKey) bool {
 	}
 	self.count += 1
 	self.byKey[key] += 1
+	self.publishProtocolReadinessWithLock()
 	return true
+}
+
+// A protocol Pack has no per-flow slot restriction. Its refused native SYN
+// may watch the total count without adding a worker, timer or packet owner.
+// Capture current vacancy under the same lock as release; an opening before
+// registration remains a level that watch rechecks rather than a lost edge.
+func (self *sendPackAdmission) protocolReadinessGate() *resendCapacityGate {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.protocolReadiness == nil {
+		self.protocolReadiness = new(resendCapacityGate)
+		self.publishProtocolReadinessWithLock()
+	}
+	return self.protocolReadiness
+}
+
+// Ordinary FIFO grants already own their slots before readiness opens. The
+// directed subscriber gets a retry turn, never a second slot or capacity credit.
+func (self *sendPackAdmission) publishProtocolReadinessWithLock() {
+	if self.protocolReadiness == nil {
+		return
+	}
+	if self.closed {
+		self.protocolReadiness.close()
+	} else {
+		self.protocolReadiness.Store(self.capacity <= self.count)
+	}
 }
 
 // Takes a slot that fits key. Otherwise, when wait is set and admission is
@@ -114,6 +146,7 @@ func (self *sendPackAdmission) tryAcquireEmpty(key sendSchedulingKey) bool {
 	}
 	self.count = 1
 	self.byKey[key] = 1
+	self.publishProtocolReadinessWithLock()
 	return true
 }
 
@@ -142,6 +175,7 @@ func (self *sendPackAdmission) releaseWithLock(key sendSchedulingKey) {
 			return
 		}
 	}
+	self.publishProtocolReadinessWithLock()
 }
 
 // Withdraws a waiter whose caller stopped waiting. A slot granted to it in the
@@ -165,6 +199,7 @@ func (self *sendPackAdmission) close() {
 		return
 	}
 	self.closed = true
+	self.publishProtocolReadinessWithLock()
 	for _, waiter := range self.waiters {
 		close(waiter.ready)
 	}
@@ -297,6 +332,84 @@ func (self *sendPackScheduler) TakeFifoEligible(
 	return nil
 }
 
+// TakeFifoEligibleAround is TakeFifoEligible with the Packs `held` reports
+// passed over. A held Pack is a no-acknowledgement Pack waiting at a contract
+// boundary for the receiver to acknowledge its next contract
+// (FILLFRACTION.md); no-acknowledgement data is unordered, so what is behind
+// it may go first. The first Pack that is not held keeps the FIFO rule, taken
+// only if it is eligible, so ordered traffic is never reordered among itself.
+// With nothing held this is TakeFifoEligible.
+func (self *sendPackScheduler) TakeFifoEligibleAround(
+	held func(*SendPack) bool,
+	eligible func(*SendPack) bool,
+) *SendPack {
+	for _, sendPack := range self.order {
+		if held(sendPack) {
+			continue
+		}
+		if !eligible(sendPack) {
+			return nil
+		}
+		flow := self.flows[sendPack.schedulingKey]
+		if flow == nil || len(flow.packs) == 0 {
+			return nil
+		}
+		if flow.packs[0] == sendPack {
+			for activeIndex, activeFlow := range self.active {
+				if activeFlow == flow {
+					return self.takeFromFlow(flow, activeIndex, false)
+				}
+			}
+			return nil
+		}
+		// behind a held Pack of its own flow
+		return self.takeUnordered(sendPack)
+	}
+	return nil
+}
+
+// The earliest caller's deadline among Packs that waited at a contract
+// boundary (`SendPack.contractHeld`), and whether any such Pack carries one.
+func (self *sendPackScheduler) earliestContractHeldDeadline() (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, sendPack := range self.order {
+		if !sendPack.contractHeld || sendPack.deadline.IsZero() {
+			continue
+		}
+		if !found || sendPack.deadline.Before(earliest) {
+			earliest = sendPack.deadline
+			found = true
+		}
+	}
+	return earliest, found
+}
+
+// Removes one Pack from wherever it is in its flow and in the ingress order.
+func (self *sendPackScheduler) takeUnordered(sendPack *SendPack) *SendPack {
+	flow := self.flows[sendPack.schedulingKey]
+	for i, candidate := range flow.packs {
+		if candidate == sendPack {
+			copy(flow.packs[i:], flow.packs[i+1:])
+			flow.packs[len(flow.packs)-1] = nil
+			flow.packs = flow.packs[:len(flow.packs)-1]
+			break
+		}
+	}
+	self.removeOrder(sendPack)
+	self.count--
+	if len(flow.packs) == 0 {
+		delete(self.flows, flow.key)
+		for i, candidate := range self.active {
+			if candidate == flow {
+				self.removeActive(i)
+				break
+			}
+		}
+	}
+	return sendPack
+}
+
 // TakeEligible selects the first eligible active flow, then rotates that flow
 // behind every other currently active flow.
 func (self *sendPackScheduler) TakeEligible(
@@ -346,27 +459,7 @@ func (self *sendPackScheduler) TakeUnorderedEligible(eligible func(*SendPack) bo
 		if !eligible(pack) {
 			continue
 		}
-		flow := self.flows[pack.schedulingKey]
-		for i, candidate := range flow.packs {
-			if candidate == pack {
-				copy(flow.packs[i:], flow.packs[i+1:])
-				flow.packs[len(flow.packs)-1] = nil
-				flow.packs = flow.packs[:len(flow.packs)-1]
-				break
-			}
-		}
-		self.removeOrder(pack)
-		self.count--
-		if len(flow.packs) == 0 {
-			delete(self.flows, flow.key)
-			for i, candidate := range self.active {
-				if candidate == flow {
-					self.removeActive(i)
-					break
-				}
-			}
-		}
-		return pack
+		return self.takeUnordered(pack)
 	}
 	return nil
 }
@@ -381,4 +474,23 @@ func (self *sendPackScheduler) Drain(dispose func(*SendPack)) {
 	self.active = nil
 	self.order = nil
 	self.count = 0
+}
+
+// Only ordinary TCP feedback may pass older DATA of its own flow. A lifecycle
+// owner cannot pass any predecessor, and no later member may cross that fence.
+// Cancellation uses the separate removal path and never writes around it.
+func (self *sendPackScheduler) canPassTcpLifecycle(candidate *SendPack) bool {
+	flow := self.flows[candidate.schedulingKey]
+	if flow == nil {
+		return false
+	}
+	for _, prior := range flow.packs {
+		if prior == candidate {
+			return true
+		}
+		if candidate.tcpOrderBarrier || prior.tcpOrderBarrier {
+			return false
+		}
+	}
+	return false
 }

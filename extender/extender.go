@@ -1465,7 +1465,9 @@ func (self *ExtenderServer) CloseAndWait() {
 // An empty secret list is an open extender, which is what an operator
 // activated extender is; a non-empty list requires the hmac over timestamp and
 // nonce to match one entry, which is the private extender of a network space's
-// manual configuration (A4).
+// manual configuration (A4). The signature is client-supplied and the expected
+// value is secret-keyed, so the comparison is constant-time: an early-exit
+// compare would time how many leading bytes of a guess are right.
 func (self *ExtenderServer) IsAllowedSecret(header *protocol.ExtenderHeader) bool {
 	if len(self.allowedSecrets) == 0 {
 		return true

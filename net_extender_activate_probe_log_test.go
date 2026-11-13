@@ -2,6 +2,7 @@ package connect
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -76,9 +77,10 @@ func TestExtenderActivateProbeTexts(t *testing.T) {
 // from an operator that predates the steps logs its words alone.
 func TestExtenderActivatorLogsTheProbeStepsOfARefusal(t *testing.T) {
 	for _, c := range []struct {
-		name     string
-		steps    []*ExtenderActivateProbeStep
-		expected []string
+		name             string
+		steps            []*ExtenderActivateProbeStep
+		expectedFork     []string
+		expectedUpstream []string
 	}{
 		{
 			name: "with steps",
@@ -86,14 +88,18 @@ func TestExtenderActivatorLogsTheProbeStepsOfARefusal(t *testing.T) {
 				{Name: ExtenderCarrierTcp, IpVersion: 4, Port: 443, ElapsedMs: 9500, BudgetLeftMs: 10000, Outcome: "ok"},
 				{Name: "forward", IpVersion: 4, Port: 443, ElapsedMs: 500, BudgetLeftMs: 500, Outcome: "timeout"},
 			},
-			expected: []string{
+			expectedFork: []string{
 				"🌉 [extender]activate v4 probe stopped at forward on port 443: timeout after 500ms with 500ms of the budget left when it started\n",
+			},
+			expectedUpstream: []string{
+				"[extender]activate v4 probe = tcp:443 ok after 9.5s (10s left), forward:443 timeout after 500ms (500ms left)\n",
 			},
 		},
 		{
-			name:     "without steps",
-			steps:    nil,
-			expected: []string{},
+			name:             "without steps",
+			steps:            nil,
+			expectedFork:     []string{},
+			expectedUpstream: []string{},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -113,9 +119,13 @@ func TestExtenderActivatorLogsTheProbeStepsOfARefusal(t *testing.T) {
 			if refused := log.linesWithPrefix("🌉 [extender] activate v4 refused "); len(refused) != 1 {
 				t.Fatalf("refused lines = %q, expected the operator's words once", refused)
 			}
-			probeLines := log.linesWithPrefix("🌉 [extender]activate v4 probe stopped at ")
-			if strings.Join(probeLines, "") != strings.Join(c.expected, "") {
-				t.Fatalf("probe lines = %q, expected %q", probeLines, c.expected)
+			probeForkLines := log.linesWithPrefix("🌉 [extender]activate v4 probe stopped at ")
+			if strings.Join(probeForkLines, "") != strings.Join(c.expectedFork, "") {
+				t.Fatalf("fork probe lines = %q, expected %q", probeForkLines, c.expectedFork)
+			}
+			probeUpstreamLines := log.linesWithPrefix("[extender]activate v4 probe = ")
+			if strings.Join(probeUpstreamLines, "") != strings.Join(c.expectedUpstream, "") {
+				t.Fatalf("upstream probe lines = %q, expected %q", probeUpstreamLines, c.expectedUpstream)
 			}
 		})
 	}
@@ -125,9 +135,10 @@ func TestExtenderActivatorLogsTheProbeStepsOfARefusal(t *testing.T) {
 // none out logs no such line.
 func TestExtenderActivatorLogsTheCarriersAnActivationLeftOut(t *testing.T) {
 	for _, c := range []struct {
-		name            string
-		refusedCarriers []*ExtenderActivateCarrierRefusal
-		expected        []string
+		name             string
+		refusedCarriers  []*ExtenderActivateCarrierRefusal
+		expected         []string
+		expectedUpstream []string
 	}{
 		{
 			name: "left out",
@@ -137,6 +148,9 @@ func TestExtenderActivatorLogsTheCarriersAnActivationLeftOut(t *testing.T) {
 			expected: []string{
 				"🌉⚠️ [extender] IPv4 is active, but the platform left out udp 443 (quic) after its probes. Check the host firewall and any cloud security group; the next renewal will retry. Probe details: quic:443 after 6.4s (6.4s left): no answer\n",
 			},
+			expectedUpstream: []string{
+				"[extender]activate v4 left out = quic:443 after 6.4s (6.4s left): no answer\n",
+			},
 		},
 		{
 			name: "two carriers left out",
@@ -145,16 +159,21 @@ func TestExtenderActivatorLogsTheCarriersAnActivationLeftOut(t *testing.T) {
 				{Carrier: ExtenderCarrierDns, Port: 4053, Error: "no answer"},
 			},
 			expected: []string{"🌉⚠️ [extender] IPv4 is active, but the platform left out udp 443 (quic), udp 4053 (dns) after its probes. Check the host firewall and any cloud security group; the next renewal will retry. Probe details: quic:443 after 0s (0s left): no answer; dns:4053 after 0s (0s left): no answer\n"},
+			expectedUpstream: []string{
+				"[extender]activate v4 left out = quic:443 after 0s (0s left): no answer; dns:4053 after 0s (0s left): no answer\n",
+			},
 		},
 		{
-			name:            "none left out",
-			refusedCarriers: nil,
-			expected:        []string{},
+			name:             "none left out",
+			refusedCarriers:  nil,
+			expected:         []string{},
+			expectedUpstream: []string{},
 		},
 		{
-			name:            "nil entries",
-			refusedCarriers: []*ExtenderActivateCarrierRefusal{nil, nil},
-			expected:        []string{},
+			name:             "nil entries",
+			refusedCarriers:  []*ExtenderActivateCarrierRefusal{nil, nil},
+			expected:         []string{},
+			expectedUpstream: []string{},
 		},
 		{
 			name: "redact operator text",
@@ -162,6 +181,9 @@ func TestExtenderActivatorLogsTheCarriersAnActivationLeftOut(t *testing.T) {
 				{Carrier: "dns", Port: 53, Error: "failed\nhttps://example.org/path?token=secret"},
 			},
 			expected: []string{"🌉⚠️ [extender] IPv4 is active, but the platform left out udp 53 (dns) after its probes. Check the host firewall and any cloud security group; the next renewal will retry. Probe details: dns:53 after 0s (0s left): failed example.org\n"},
+			expectedUpstream: []string{
+				"[extender]activate v4 left out = dns:53 after 0s (0s left): failed\nhttps://example.org/path?token=secret\n",
+			},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -180,10 +202,173 @@ func TestExtenderActivatorLogsTheCarriersAnActivationLeftOut(t *testing.T) {
 			if ipVersion := fixture.waitActivation(); ipVersion != 4 {
 				t.Fatalf("activated v%d, expected v4", ipVersion)
 			}
-			leftOutLines := log.linesWithPrefix("🌉⚠️ [extender] IPv4 is active, but the platform left out ")
-			if strings.Join(leftOutLines, "") != strings.Join(c.expected, "") {
-				t.Fatalf("left out lines = %q, expected %q", leftOutLines, c.expected)
+			leftOutForkLines := log.linesWithPrefix("🌉⚠️ [extender] IPv4 is active, but the platform left out ")
+			if strings.Join(leftOutForkLines, "") != strings.Join(c.expected, "") {
+				t.Fatalf("left out fork lines = %q, expected %q", leftOutForkLines, c.expected)
+			}
+			if c.expectedUpstream != nil {
+				leftOutUpstreamLines := log.linesWithPrefix("[extender]activate v4 left out = ")
+				if strings.Join(leftOutUpstreamLines, "") != strings.Join(c.expectedUpstream, "") {
+					t.Fatalf("left out upstream lines = %q, expected %q", leftOutUpstreamLines, c.expectedUpstream)
+				}
 			}
 		})
 	}
 }
+
+// Raw operator responses reach the real activation loop, so a fixture's Go
+// encoder cannot manufacture the timings an older operator never sent. The
+// activation callback is the barrier after the log and remains a success for
+// every timing shape; neither the operator's error nor accepted carriers change.
+func TestExtenderActivatorLogsCarrierTimingPresenceFromJson(t *testing.T) {
+	cases := []struct {
+		name       string
+		timingJson string
+		timingText string
+	}{
+		{name: "legacy"},
+		{name: "measured zeros", timingJson: `,"elapsed_ms":0,"budget_left_ms":0`, timingText: " after 0s (0s left)"},
+		{name: "elapsed only", timingJson: `,"elapsed_ms":12`, timingText: " after 12ms"},
+		{name: "budget only", timingJson: `,"budget_left_ms":6400`, timingText: " (6.4s left)"},
+		{name: "null timings", timingJson: `,"elapsed_ms":null,"budget_left_ms":null`},
+		{name: "null elapsed", timingJson: `,"elapsed_ms":null,"budget_left_ms":0`, timingText: " (0s left)"},
+		{name: "null budget", timingJson: `,"elapsed_ms":0,"budget_left_ms":null`, timingText: " after 0s"},
+		{name: "full timing", timingJson: `,"elapsed_ms":12,"budget_left_ms":6400`, timingText: " after 12ms (6.4s left)"},
+	}
+	const carrierFields = `"carrier":"quic","port":443,"error":"context deadline exceeded"`
+	// A defined type uses the original plain-struct decoder. The same legacy
+	// object used below then reproduces the invented zero timing deterministically.
+	type oldCarrierRefusal ExtenderActivateCarrierRefusal
+	var oldRefusal oldCarrierRefusal
+	if err := json.Unmarshal([]byte(`{`+carrierFields+`}`), &oldRefusal); err != nil {
+		t.Fatal(err)
+	}
+	oldText := extenderActivateCarrierRefusalsText([]*ExtenderActivateCarrierRefusal{(*ExtenderActivateCarrierRefusal)(&oldRefusal)})
+	if expected := "quic:443 after 0s (0s left): context deadline exceeded"; oldText != expected {
+		t.Fatalf("old decoder = %q, expected the pre-fix false timing %q", oldText, expected)
+	}
+
+	answers := make(chan string, 1)
+	operator := newFamilyHttptestServer(t, 4, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/hello" {
+			json.NewEncoder(w).Encode(map[string]string{"client_address": testActivateIpv4 + ":41001"})
+			return
+		}
+		if r.URL.Path != ExtenderActivatePath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		select {
+		case answer := <-answers:
+			json.NewEncoder(w).Encode(json.RawMessage(answer))
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(operator.Close)
+	log := &testActivateLogger{}
+	activatedResults := make(chan *ExtenderActivateResult, 1)
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV4 = operator.URL
+		settings.ApiUrlV6 = ""
+		settings.Log = log
+		onActivated := settings.OnActivated
+		settings.OnActivated = func(ipVersion int, result *ExtenderActivateResult) {
+			activatedResults <- result
+			onActivated(ipVersion, result)
+		}
+	})
+	expectedLines := []string{}
+	for i, c := range cases {
+		answers <- `{"activated":true,"ip":"` + testActivateIpv4 + `","ip_version":4,"carriers":["tcp"],` +
+			`"refused_carriers":[{` + carrierFields + c.timingJson + `}]}`
+		if 0 < i {
+			fixture.networkChanged()
+		}
+		if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+			t.Fatalf("%s: activated v%d, expected v4", c.name, ipVersion)
+		}
+		result := <-activatedResults
+		if !result.Activated || result.Error != "" || strings.Join(result.Carriers, ",") != ExtenderCarrierTcp ||
+			len(result.RefusedCarriers) != 1 || result.RefusedCarriers[0].Error != "context deadline exceeded" {
+			t.Fatalf("%s: activation callback changed the operator's answer: %+v", c.name, result)
+		}
+		if family := fixture.activator.Status().Family(4); family == nil || !family.Activated || family.LastRefused || family.LastError != "" {
+			t.Fatalf("%s: activation status = %+v, expected a success", c.name, family)
+		}
+		expectedLines = append(expectedLines, "[extender]activate v4 left out = quic:443"+c.timingText+": context deadline exceeded\n")
+		lines := log.linesWithPrefix("[extender]activate v4 left out = ")
+		if strings.Join(lines, "") != strings.Join(expectedLines, "") {
+			t.Fatalf("%s: left out lines = %q, expected %q", c.name, lines, expectedLines)
+		}
+	}
+}
+
+// A decoder can reuse a refusal directly or a result slice's element. Missing
+// and null timings clear prior measurements, and present zeros clear prior
+// absence; a null object still leaves an existing value alone.
+func TestExtenderActivateCarrierRefusalReusedDecodeReplacesTiming(t *testing.T) {
+	refusal := &ExtenderActivateCarrierRefusal{Carrier: ExtenderCarrierQuic, Port: 443, Error: "no answer"}
+	for _, c := range []struct {
+		document     string
+		elapsedMs    int64
+		budgetLeftMs int64
+		timingText   string
+	}{
+		{document: `{"elapsed_ms":12,"budget_left_ms":6400}`, elapsedMs: 12, budgetLeftMs: 6400, timingText: " after 12ms (6.4s left)"},
+		{document: `{}`},
+		{document: `{"elapsed_ms":0}`, timingText: " after 0s"},
+		{document: `{"budget_left_ms":0}`, timingText: " (0s left)"},
+		{document: `{"elapsed_ms":12,"budget_left_ms":6400}`, elapsedMs: 12, budgetLeftMs: 6400, timingText: " after 12ms (6.4s left)"},
+		{document: `{"elapsed_ms":null,"budget_left_ms":null}`},
+		{document: `{"elapsed_ms":0,"budget_left_ms":0}`, timingText: " after 0s (0s left)"},
+		{document: `null`, timingText: " after 0s (0s left)"},
+	} {
+		if err := json.Unmarshal([]byte(c.document), refusal); err != nil {
+			t.Fatal(err)
+		}
+		if refusal.ElapsedMs != c.elapsedMs || refusal.BudgetLeftMs != c.budgetLeftMs {
+			t.Fatalf("%s: timings = %d, %d, expected %d, %d", c.document, refusal.ElapsedMs, refusal.BudgetLeftMs, c.elapsedMs, c.budgetLeftMs)
+		}
+		if text, expected := extenderActivateCarrierRefusalsText([]*ExtenderActivateCarrierRefusal{refusal}), "quic:443"+c.timingText+": no answer"; text != expected {
+			t.Fatalf("%s: refusal = %q, expected %q", c.document, text, expected)
+		}
+	}
+
+	result := &ExtenderActivateResult{}
+	if err := json.Unmarshal([]byte(`{"refused_carriers":[{"carrier":"quic","port":443,"error":"no answer","elapsed_ms":12,"budget_left_ms":6400}]}`), result); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"refused_carriers":[{"carrier":"quic","port":443,"error":"no answer"}]}`), result); err != nil {
+		t.Fatal(err)
+	}
+	if text, expected := extenderActivateCarrierRefusalsText(result.RefusedCarriers), "quic:443: no answer"; text != expected {
+		t.Fatalf("reused result = %q, expected %q", text, expected)
+	}
+}
+
+// Public Go literals keep reporting both int64 values, including zero, and
+// encoding a refusal retains the existing five-field json schema. Presence is
+// only decode metadata, never a new wire field or a custom encoder contract.
+func TestExtenderActivateCarrierRefusalKeepsGoValuesAndJson(t *testing.T) {
+	refusal := &ExtenderActivateCarrierRefusal{Carrier: ExtenderCarrierQuic, Port: 443, Error: "no answer"}
+	if text, expected := extenderActivateCarrierRefusalsText([]*ExtenderActivateCarrierRefusal{refusal}), "quic:443 after 0s (0s left): no answer"; text != expected {
+		t.Fatalf("constructed zero timings = %q, expected %q", text, expected)
+	}
+	const expectedJson = `{"carrier":"quic","port":443,"error":"no answer","elapsed_ms":0,"budget_left_ms":0}`
+	for _, decodeLegacy := range []bool{false, true} {
+		if decodeLegacy {
+			if err := json.Unmarshal([]byte(`{"carrier":"quic","port":443,"error":"no answer"}`), refusal); err != nil {
+				t.Fatal(err)
+			}
+		}
+		encoded, err := json.Marshal(refusal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != expectedJson {
+			t.Fatalf("decoded legacy %t: json = %s, expected %s", decodeLegacy, encoded, expectedJson)
+		}
+	}
+}
+

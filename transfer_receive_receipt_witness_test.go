@@ -102,11 +102,11 @@ func receiptAdmissionGenericOwnersError(frames []*protocol.Frame, sequences map[
 }
 
 // The same actual callback/ACK/owner path straddles the last pool class.
-// Exact V3 fails only the 8193-byte final-share oracle during cleanup.
+// Include both historical/new pooled boundaries and a genuinely unpooled root.
 func TestReceiveReceiptAdmissionGenericPoolBoundary(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		for _, size := range []int{8192, 8193} {
+		for _, size := range []int{8192, 8193, 12288, 12289} {
 			f := newReceiptAdmissionFixtureWithProvider(t, 1, false)
 			delivered := f.observeGeneric()
 			var observed *protocol.Frame
@@ -123,7 +123,7 @@ func TestReceiveReceiptAdmissionGenericPoolBoundary(t *testing.T) {
 			messageId := NewId()
 			f.offerGeneric(0, messageId, size)
 			sequence := f.sequence(f.sequenceId, 0)
-			if observed == nil || observed.MessageBytes != nil || pooled != (size == 8192) ||
+			if observed == nil || observed.MessageBytes != nil || pooled != (size <= 12288) ||
 				delivered.Load() != 1 || !f.hasAck(f.sequenceId, messageId, false) ||
 				sequence == nil || sequence.ctx.Err() != nil || sequence.nextSequenceNumber != 1 ||
 				sequence.receiveQueue.Len() != 0 || sequence.deliveryQueue != nil {
@@ -151,12 +151,12 @@ func TestReceiveReceiptWitnessPooledFinalReturnRequiresLastOwner(t *testing.T) {
 // Its separate oracle must reject a nonempty frame until actual detachment.
 func TestReceiveReceiptWitnessUnpooledFrameMustDetach(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	frame, err := ToFrame(&protocol.SimpleMessage{Content: strings.Repeat("g", 8190)}, DefaultProtocolVersion)
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: strings.Repeat("g", 12286)}, DefaultProtocolVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer returnDecodedFrameMessageBytes(frame)
-	if pooled, _ := MessagePoolCheck(frame.MessageBytes); pooled || len(frame.MessageBytes) != 8193 {
+	if pooled, _ := MessagePoolCheck(frame.MessageBytes); pooled || len(frame.MessageBytes) != 12289 {
 		t.Fatal("unpooled negative control did not cross the real last pool class")
 	}
 	frames := []*protocol.Frame{frame}
@@ -199,7 +199,7 @@ func TestReceiveReceiptAdmissionUnpooledHeldCancelClearsOwners(t *testing.T) {
 		})
 		delivered := f.observeGeneric()
 		messageId := NewId()
-		f.offerGeneric(1, messageId, 12*1024)
+		f.offerGenericWithDecodedOwner(true, 1, messageId, 12*1024+1)
 		sequence := f.sequence(f.sequenceId, 0)
 		if sequence == nil {
 			t.Fatal("actual unpooled held sequence was not constructed")
@@ -207,11 +207,12 @@ func TestReceiveReceiptAdmissionUnpooledHeldCancelClearsOwners(t *testing.T) {
 		held := sequence.receiveQueue.GetByMessageId(messageId)
 		if held == nil || len(held.frames) != 1 || !held.committed || held.memoryBudget != f.receiveBudget ||
 			!f.hasAck(f.sequenceId, messageId, true) || f.hasAck(f.sequenceId, messageId, false) ||
-			delivered.Load() != 0 || sequence.deliveryQueue != nil {
+			held.decodedOwner == nil || !held.decodedOwner.receivePack.receiveMemoryOwned ||
+			!held.decodedOwner.receivePack.heldHeadRepairEligible || delivered.Load() != 0 || sequence.deliveryQueue != nil {
 			t.Fatal("actual unpooled selective owner was not established")
 		}
 		frame := held.frames[0]
-		if pooled, _ := MessagePoolCheck(frame.MessageBytes); pooled || len(frame.MessageBytes) != 12*1024 {
+		if pooled, _ := MessagePoolCheck(frame.MessageBytes); pooled || len(frame.MessageBytes) != 12*1024+1 {
 			t.Fatal("held cancellation control did not retain an unpooled root")
 		}
 		f.cancel()

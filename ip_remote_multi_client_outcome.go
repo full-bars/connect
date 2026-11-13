@@ -204,6 +204,9 @@ func deriveStallReason(counts [windowFailureClassCount]int) string {
 
 // windowName renders the window type for the [rel] grammar.
 func (self *multiClientWindow) windowName() string {
+	if self.windowType == WindowTypeLimited {
+		return "limited"
+	}
 	if name := self.windowType.RankMode(); name != "" {
 		return name
 	}
@@ -438,6 +441,9 @@ func (self *multiClientWindow) notifyNetworkChanged() {
 	self.errorStreak.Store(0)
 	// a discovery window's expansion backoff grew on the old path too
 	self.clearDiscoveryExpandRetry()
+	// and the providers it found failing failed on the old path
+	// (ip_remote_multi_client_cooloff.go)
+	self.clearCooloff("network_change")
 	if self.networkChangeMonitor != nil {
 		self.networkChangeMonitor.NotifyAll()
 	}
@@ -675,6 +681,9 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 	if cancelEpoch != nil {
 		cancelEpoch()
 	}
+	// the rebuild is the programmatic form of a reconnect, and a reconnect
+	// starts with no cool-off (ip_remote_multi_client_cooloff.go)
+	self.clearCooloff("rebuild")
 
 	// zero Added means no installed clients by construction; cancel any
 	// straggler so the resize pass reaps it through the ordinary WindowStats

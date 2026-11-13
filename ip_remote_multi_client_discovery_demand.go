@@ -26,10 +26,11 @@ type discoveryAcquisitionDemand struct {
 	pendingFlow    *multiClientChannelUpdate
 	pendingStamp   uint64
 	pendingMembers map[Id]*multiClientChannel
-	ipVersion      int
-	reads          int
-	nextRead       time.Time
-	mintClaimed    bool
+	// what the waiting flow needs from the candidate
+	need        flowNeed
+	reads       int
+	nextRead    time.Time
+	mintClaimed bool
 }
 
 // A lease cannot move to a later slot or pass. Its context cancels when the
@@ -39,7 +40,7 @@ type discoveryDemandRead struct {
 	slot            uint64
 	ctx             context.Context
 	deadline        time.Time
-	ipVersion       int
+	need            flowNeed
 	update          *multiClientChannelUpdate
 	stamp           uint64
 	members         map[Id]*multiClientChannel
@@ -107,6 +108,14 @@ func (self *multiClientWindow) beginDiscoveryDemandSlot(owner *multiClientEvalua
 // The normal receiver owns the handoff. A demand result for an older request
 // is retired before evaluation and does not consume a new acquisition slot.
 func (self *multiClientWindow) acceptDiscoveryDemandArgs(owner *multiClientEvaluationOwner, args *multiClientChannelArgs) bool {
+	// Listed before its provider failed in this window: the cool-off
+	// (ip_remote_multi_client_cooloff.go) refuses it here, before the demand
+	// slot is taken, so the expansion retires its args and waits for the
+	// next candidate. A candidate the starvation escape listed after the
+	// failure is evaluated.
+	if !args.deferredClientArgs && self.cooloffRefuses(args.Destination, args.cooloffListing) {
+		return false
+	}
 	var cancel context.CancelFunc
 	self.stateLock.Lock()
 	demand := &self.discoveryDemand
@@ -187,7 +196,8 @@ func (self *multiClientWindow) discoveryDemandLiveWithLock(now time.Time) bool {
 	return self.ctx.Err() == nil && demand.owner != nil && demand.ctx.Err() == nil &&
 		demand.slotOpen && demand.slotCtx.Err() == nil && now.Before(demand.deadline) &&
 		!now.Before(self.discoveryRetry.notBefore) &&
-		(!self.settings.StrictWindowSizeHardMax || demand.hardMax <= 0 || len(self.clients) < demand.hardMax)
+		(!self.settings.StrictWindowSizeHardMax || demand.hardMax <= 0 || len(self.clients) < demand.hardMax ||
+			self.serviceRefreshLiveWithLock() && self.strictPass != nil && self.strictPass.handover != nil && self.strictPass.handover.serviceRefresh != nil)
 }
 
 func (self *multiClientWindow) discoveryDemandReadLive(read *discoveryDemandRead) bool {
@@ -255,7 +265,7 @@ func (self *multiClientWindow) waitDiscoveryDemand(generatorNotify <-chan struct
 				demand.reads++
 				demand.nextRead = now.Add(max(self.settings.DiscoveryDemandListingInterval, time.Second))
 				read := &discoveryDemandRead{owner: demand.owner, slot: demand.slot, ctx: demand.slotCtx,
-					deadline: demand.deadline, ipVersion: demand.ipVersion, update: update, stamp: stamp, members: members, generatorNotify: generatorNotify}
+					deadline: demand.deadline, need: demand.need, update: update, stamp: stamp, members: members, generatorNotify: generatorNotify}
 				self.stateLock.Unlock()
 				return read
 			}
@@ -301,19 +311,32 @@ func (self *multiClientWindow) listDiscoveryDemand(read *discoveryDemandRead, ex
 		if err := read.ctx.Err(); err != nil {
 			return nil, &discoveryDemandLocalCancel{cause: err}
 		}
-		if generator, ok := self.generator.(multiClientGeneratorFamilyDiscoveryContext); ok {
-			family := IpFamilyFilterV4Capable
-			if read.ipVersion == 6 {
-				family = IpFamilyFilterV6Capable
-			}
-			return generator.NextDestinationsWithIpFamilyContext(ctx, 1, excluded, self.windowType.RankMode(), family)
+		family := IpFamilyFilterV4Capable
+		if read.need.ipVersion == 6 {
+			family = IpFamilyFilterV6Capable
 		}
-		return self.generator.(multiClientGeneratorDiscoveryContext).NextDestinationsContext(ctx, 1, excluded, self.windowType.RankMode())
+		// selector mode where the generator has it, with the window's
+		// `select` (server FP2-PROTOCOL.md §7.4)
+		if generator, ok := self.generator.(MultiClientGeneratorWithCapabilities); ok {
+			destinations, _, err := generator.NextDestinationsWithCapabilitiesContext(ctx, 1, excluded, self.requestRankMode(), family, self.providerSelect())
+			return destinations, err
+		}
+		if self.windowType == WindowTypeLimited {
+			// no labels, so no tcp provider to give
+			return nil, nil
+		}
+		if generator, ok := self.generator.(multiClientGeneratorFamilyDiscoveryContext); ok {
+			return generator.NextDestinationsWithIpFamilyContext(ctx, 1, excluded, self.requestRankMode(), family)
+		}
+		return self.generator.(multiClientGeneratorDiscoveryContext).NextDestinationsContext(ctx, 1, excluded, self.requestRankMode())
 	})
 	if err != nil {
 		return nil, err
 	}
 	for destination, stats := range destinations {
+		if !self.admitsCapabilities(stats.Capabilities) {
+			continue
+		}
 		return []enumeratedDestination{{destination: destination, stats: stats}}, nil
 	}
 	return nil, nil
@@ -374,7 +397,8 @@ func (self *multiClientWindow) offerDiscoveryDemandArgs(read *discoveryDemandRea
 // A new source sequence starts this observational clock; the canonical source
 // and failed-service record remain unchanged. Completion replay never resets it.
 type discoveryAttemptObservation struct {
-	stamp uint64
+	stamp        uint64
+	serviceOwner *tcpSynRetry
 }
 
 func (self *multiClientChannelUpdate) observeDiscoveryAttempt(candidates []*multiClientChannel, now time.Time, source *IpPath) (discoveryAttemptObservation, bool) {
@@ -398,11 +422,17 @@ func (self *multiClientChannelUpdate) observeDiscoveryAttempt(candidates []*mult
 	return discoveryAttemptObservation{stamp: self.discoveryAttemptStamp.Load()}, true
 }
 
-func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannelUpdate, ipVersion int, source *IpPath, failed *multiClientChannel) {
+// Records one pending listing for a flow the window cannot place, while the
+// window is below its demand target: the offered exits that can carry the
+// flow have all failed it or outlived the inferred dial-failure timeout, or a
+// paid service-refresh reservation reasserts it. need narrows those exits to
+// the ones whose labels carry the flow and picks the family the listing asks
+// for. Only the enumerator makes the request.
+func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannelUpdate, need flowNeed, source *IpPath, failed *multiClientChannel) {
 	if self.settings == nil || self.settings.DiscoveryDemandListingsPerPass <= 0 || !self.cooperativeDiscoveryDemand() {
 		return
 	}
-	if ipVersion == 6 {
+	if need.ipVersion == 6 {
 		if _, ok := self.generator.(multiClientGeneratorFamilyDiscoveryContext); !ok {
 			return
 		}
@@ -426,7 +456,7 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 			client.stateLock.Lock()
 			defer client.stateLock.Unlock()
 			return client.ctx.Err() == nil && client.endErr == nil && !client.warning && !client.quarantined,
-				client.supportsIpVersion(ipVersion)
+				client.supportsFlow(need.ipVersion, need.ipProtocol)
 		}()
 		if offered {
 			offeredCount++
@@ -436,6 +466,9 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 		}
 	}
 	observation, eligible := update.observeDiscoveryAttempt(candidates, time.Now(), source)
+	if !eligible {
+		observation, eligible = self.observeServiceRefreshAttempt(update, source)
+	}
 	if !eligible {
 		return
 	}
@@ -450,11 +483,14 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 			return
 		}
 	}
+	if observation.serviceOwner != nil && (self.serviceRefreshOwner != observation.serviceOwner || !self.serviceRefreshLiveWithLock()) {
+		return
+	}
 	if update.discoveryAttemptStamp.Load() != observation.stamp || update.ctx.Err() != nil ||
 		update.receivedInbound.Load() || update.sourceReset.Load() || update.sequenceCloseReady.Load() {
 		return
 	}
-	self.discoveryDemand.pendingFlow, self.discoveryDemand.pendingStamp, self.discoveryDemand.pendingMembers, self.discoveryDemand.ipVersion = update, observation.stamp, members, ipVersion
+	self.discoveryDemand.pendingFlow, self.discoveryDemand.pendingStamp, self.discoveryDemand.pendingMembers, self.discoveryDemand.need = update, observation.stamp, members, need
 	if !self.discoveryDemand.pending {
 		self.discoveryDemand.pending = true
 		self.notifyDiscoveryDemandWithLock()
@@ -466,15 +502,17 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 func (self *RemoteUserNatMultiClient) requestDiscoveryForSourceSyn(update *multiClientChannelUpdate, path *IpPath) {
 	if path.Protocol == IpProtocolTcp && path.Syn && !path.Ack {
 		for _, window := range self.windows {
-			window.requestDiscoveryDemand(update, path.Version, path, nil)
+			window.requestDiscoveryDemand(update, flowNeedOf(path), path, nil)
 		}
+		self.requestServiceRefresh(update, path)
 	}
 }
 
 func (self *RemoteUserNatMultiClient) requestDiscoveryForFailedAttempt(update *multiClientChannelUpdate, failed *multiClientChannel, path *IpPath) {
 	if update != nil && path.Protocol == IpProtocolTcp {
 		for _, window := range self.windows {
-			window.requestDiscoveryDemand(update, path.Version, nil, failed)
+			window.requestDiscoveryDemand(update, flowNeedOf(path), nil, failed)
 		}
+		self.requestServiceRefresh(update, path)
 	}
 }

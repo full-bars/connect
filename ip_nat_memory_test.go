@@ -166,24 +166,37 @@ func TestNatMemoryTwoNatsAndRetiringGenerationShareCeiling(t *testing.T) {
 }
 
 func TestNatMemoryNearCapacitySynDoesNotCreateFlow(t *testing.T) {
+	assertMessagePoolOwnership(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	settings := DefaultTcpBufferSettingsWithBufferSize(4)
 	settings.Log = NewNoopLogger()
-	settings.MemoryBudget = NewTransferMemoryBudget(natTcpFlowMemoryByteCount(settings))
+	settings.MemoryBudget = NewTransferMemoryBudget(mib(2))
+	settings = boundedNatTcpMemorySettings(settings, settings.MemoryBudget)
+	settings.MemoryBudget = NewTransferMemoryBudget(natTcpFlowMemoryByteCount(settings) - 1)
 	var dials atomic.Int64
 	settings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) {
 		dials.Add(1)
 		return nil, errors.New("unexpected socket")
 	}}
 	buffer := NewTcp4Buffer(ctx, func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {}, settings)
-	packet := MessagePoolGet(40)
-	defer MessagePoolReturn(packet)
+	defer func() { cancel(); buffer.waitForLifecycle() }()
 	source := SourceId(NewId())
 	for i := range 100 {
-		tcp := parsedTcp{sourceIp: net.IPv4(10, 0, 0, 1).To4(), destinationIp: net.IPv4(203, 0, 113, 1).To4(),
-			sourcePort: uint16(40000 + i), destinationPort: 443, syn: true}
-		if accepted, err := buffer.send(source, protocol.ProvideMode_Network, &tcp, 0, packet); accepted || err != nil {
+		path := &IpPath{Version: 4, Protocol: IpProtocolTcp, SourceIp: net.IPv4(10, 0, 0, 1), DestinationIp: net.IPv4(203, 0, 113, 1),
+			SourcePort: 40000 + i, DestinationPort: 443}
+		packet := MessagePoolCopy(ipOosTcpPacket(path, tcpFlagSyn, nil))
+		_, sourceIp, destinationIp, transport, valid := parseIpv4(packet)
+		var tcp parsedTcp
+		if !valid || !parseTcpPacket(sourceIp, destinationIp, transport, &tcp) {
+			MessagePoolReturn(packet)
+			t.Fatal("actual SYN fixture is malformed")
+		}
+		accepted, err := buffer.send(source, protocol.ProvideMode_Network, &tcp, 0, packet)
+		if !accepted {
+			MessagePoolReturn(packet)
+		}
+		if accepted || err != nil {
 			t.Fatalf("near-full SYN admitted: %t %v", accepted, err)
 		}
 	}
@@ -192,7 +205,8 @@ func TestNatMemoryNearCapacitySynDoesNotCreateFlow(t *testing.T) {
 	}
 }
 
-func TestNatMemoryControlPartitionIsPrechargedAndBounded(t *testing.T) {
+func TestNatMemoryProtocolAdmissionNeedsNoByteReserve(t *testing.T) {
+	assertMessagePoolOwnership(t)
 	budget := NewTransferMemoryBudget(natMemoryFixedBytes)
 	settings := DefaultLocalUserNatSettings()
 	settings.MemoryBudget = budget
@@ -211,22 +225,19 @@ func TestNatMemoryControlPartitionIsPrechargedAndBounded(t *testing.T) {
 	if !natControlPackets([][]byte{packet}) {
 		t.Fatal("pure ACK not recognized")
 	}
-	charge := natPacketMemoryByteCount(packet) + 320
-	count := 0
-	for nat.controlMemory.TryReserve(charge) {
-		count++
+	before := budget.Stats()
+	memory, admitted := nat.reserveSendPacketsMemory([][]byte{packet})
+	if !admitted || memory.budget != nil || memory.bytes != 0 || budget.Stats() != before {
+		t.Fatal("protocol admission acquired DATA or reserved protocol bytes")
 	}
-	if count == 0 || nat.controlMemory.UsedByteCount() > kib(16) || budget.UsedByteCount() != natMemoryFixedBytes {
-		t.Fatal("control partition added hidden root capacity")
-	}
-	nat.controlMemory.Release(ByteCount(count) * charge)
 	packetWithHugeRoot := make([]byte, len(packet), 4096)
 	copy(packetWithHugeRoot, packet)
 	if natControlPackets([][]byte{packetWithHugeRoot}) {
 		t.Fatal("large backing root escaped through control classification")
 	}
-	if !nat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Network, MessagePoolShareReadOnly(packet), 0) {
-		MessagePoolReturn(packet)
+	owned := MessagePoolShareReadOnly(packet)
+	if !nat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Network, owned, 0) {
+		MessagePoolReturn(owned)
 		t.Fatal("full data budget blocked pure ACK admission")
 	}
 }
@@ -260,7 +271,8 @@ func TestNatMemoryReplayMetadataAndSiblingWake(t *testing.T) {
 
 func TestNatMemoryPacketizationBoundsTinyMss(t *testing.T) {
 	state := ConnectionState{ipVersion: 4, peerMss: 1}
-	if got := state.natPacketizationByteLimit(DefaultMtu); got != natMemoryBatchCount {
+	maximum := DefaultTcpBufferSettings().MemoryColdWriteBatchSize
+	if got := state.natPacketizationByteLimit(DefaultMtu, maximum); got != maximum {
 		t.Fatalf("MSS=1 packetization grew beyond charged producer roots: %d", got)
 	}
 }
@@ -353,16 +365,46 @@ func TestNatMemoryUdpCallbackRetainsFlowThroughClose(t *testing.T) {
 }
 
 func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
-	testNatMemoryTcpAckProgressAtFullDataBudget(t, 0)
+	assertMessagePoolOwnership(t)
+	testNatMemoryTcpAckProgressAtFullDataBudget(t, 0, false)
 }
 
 func TestNatProviderMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
-	t.Run("legacy", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 1) })
-	t.Run("raw", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 2) })
+	t.Run("legacy", func(t *testing.T) {
+		assertMessagePoolOwnership(t)
+		testNatMemoryTcpAckProgressAtFullDataBudget(t, 1, false)
+	})
+	t.Run("raw", func(t *testing.T) {
+		assertMessagePoolOwnership(t)
+		testNatMemoryTcpAckProgressAtFullDataBudget(t, 2, false)
+	})
 }
 
-func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolVersion int) {
+// The NAT dispatch shard is held from the pressure boundary until the bubble
+// is idle, so no ACK is applied while the synthetic peer answers every segment
+// it has. At a full data budget the source then holds only the return chunk
+// that was in flight at the fill, and the NAT has admitted its ACKs.
+//
+// The fixture used to fill the budget while the flow's adaptive return queue
+// held its optional hot funding. The queue's demotion returned that credit,
+// the reader retained the rest of the download with no ACK applied, and the
+// peer's ACK per segment overran the NAT's 16-KiB control partition whenever
+// the shard lagged 16 ACKs behind it.
+func TestNatMemoryTcpAckProgressAtFullDataBudgetWithHeldDispatch(t *testing.T) {
 	assertMessagePoolOwnership(t)
+	for _, providerProtocolVersion := range []int{0, 1, 2} {
+		t.Logf("provider protocol version %d", providerProtocolVersion)
+		synctest.Test(t, func(t *testing.T) {
+			testNatMemoryTcpAckProgressAtFullDataBudget(t, providerProtocolVersion, true)
+		})
+	}
+}
+
+// Version 0 sends the synthetic peer's packets to the NAT directly; versions 1
+// and 2 send them through provider ingress. heldDispatch requires a synctest
+// bubble. Callers assert pool ownership first, outside any bubble, which also
+// starts the pool's lazy stats worker outside it.
+func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolVersion int, heldDispatch bool) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	budget := NewTransferMemoryBudget(mib(2))
@@ -372,9 +414,37 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	local, origin := net.Pipe()
 	defer origin.Close()
 	settings.TcpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) { return local, nil }}
+	sequences := make(chan *TcpSequence, 1)
+	settings.TcpBufferSettings.beforeSequenceRunWithStateForTest = func(sequence *TcpSequence) {
+		select {
+		case sequences <- sequence:
+		default:
+		}
+	}
 	nat, err := TryNewLocalUserNat(ctx, "tcp-full", settings)
 	if err != nil {
 		t.Fatal(err)
+	}
+	processed := make(chan struct{}, 1)
+	nat.afterSendPacketForTest = func() {
+		select {
+		case processed <- struct{}{}:
+		default:
+		}
+	}
+	var dispatchHeld atomic.Bool
+	var heldSendPacketCount atomic.Int64
+	releaseDispatch := make(chan struct{})
+	var releaseDispatchOnce sync.Once
+	unblockDispatch := func() { releaseDispatchOnce.Do(func() { close(releaseDispatch) }) }
+	if heldDispatch {
+		// Installed before the first packet, so the shard reads it race-free.
+		nat.beforeSendPacketForTest = func(*SendPacket) {
+			if dispatchHeld.Load() {
+				heldSendPacketCount.Add(1)
+				<-releaseDispatch
+			}
+		}
 	}
 	var provider *RemoteUserNatProvider
 	if providerProtocolVersion != 0 {
@@ -412,16 +482,21 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	var allowAckOnce sync.Once
 	unblockAck := func() { allowAckOnce.Do(func() { close(allowAck) }) }
 	defer func() {
-		// A setup failure must release the callback barrier before joining the
-		// NAT, rather than waiting for the test deadline and reporting teardown
-		// cancellation as additional ACK-admission failures.
+		// A setup failure must release the callback and dispatch barriers
+		// before joining the NAT, rather than waiting for the test deadline and
+		// reporting teardown cancellation as additional ACK-admission failures.
 		cancel()
 		unblockAck()
+		unblockDispatch()
 		nat.CloseAndWait(context.Background())
 	}()
 	var handshakeOnce sync.Once
 	var dataStarted atomic.Bool
 	var received atomic.Int64
+	var receiveLock sync.Mutex
+	var receiveBase, receiveNext uint32
+	var receiveStarted bool
+	var queueRefusals, ackAdmissions atomic.Int64
 	const total = 32 * 1024
 	nat.AddReceivePacketCallback(func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
 		if ctx.Err() != nil {
@@ -440,23 +515,54 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 				return
 			}
 		}
-		ackNumber := tcp.seq + uint32(len(tcp.payload))
-		if tcp.syn {
-			ackNumber++
+		// A replay is not a second delivery. This peer acknowledges only its
+		// contiguous frontier and never counts duplicate payload toward total.
+		receiveLock.Lock()
+		if tcp.syn && !receiveStarted {
+			receiveBase = tcp.seq + 1
+			receiveNext = receiveBase
+			receiveStarted = true
 		}
+		end := tcp.seq + uint32(len(tcp.payload))
+		if receiveStarted && !tcp.syn && int32(tcp.seq-receiveNext) <= 0 && 0 < int32(end-receiveNext) {
+			receiveNext = end
+		}
+		ackNumber := receiveNext
+		uniqueReceived := int64(uint32(receiveNext - receiveBase))
+		received.Store(uniqueReceived)
+		receiveLock.Unlock()
 		state := ConnectionState{ipVersion: 4, sourceIp: path.DestinationIp, sourcePort: uint16(path.DestinationPort),
 			destinationIp: path.SourceIp, destinationPort: uint16(path.SourcePort), sendSeq: ackNumber, windowSize: 65535}
 		ack := state.tcpPacket(tcpFlagAck, 101, nil)
+		memory, permitted := nat.reserveSendPacketsMemory([][]byte{ack})
+		if !protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, ack) || !permitted || memory.budget != nil || memory.bytes != 0 {
+			memory.release()
+			MessagePoolReturn(ack)
+			t.Error("actual cumulative TCP ACK acquired or required packet-byte credit")
+			return
+		}
 		if !sendPacket(ack) {
 			MessagePoolReturn(ack)
 			if ctx.Err() == nil {
-				t.Error("full data budget refused a releasing TCP ACK")
+				// This is a shared, nonblocking callback. With byte permission
+				// proved above and the lifecycle open, false is queue capacity;
+				// the next cumulative ACK/replay can regenerate this feedback.
+				nat.sendLock.Lock()
+				closing := nat.sendClosed
+				nat.sendLock.Unlock()
+				if closing {
+					t.Error("live ACK fixture unexpectedly closed NAT admission")
+				} else {
+					queueRefusals.Add(1)
+				}
 			}
+		} else {
+			ackAdmissions.Add(1)
 		}
 		if tcp.syn {
 			handshakeOnce.Do(func() { close(handshake) })
 		}
-		if received.Add(int64(len(tcp.payload))) >= total {
+		if uniqueReceived == total {
 			select {
 			case complete <- struct{}{}:
 			default:
@@ -473,17 +579,66 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+	var sequence *TcpSequence
+	select {
+	case sequence = <-sequences:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// The origin sends exactly one return chunk before the fill and the rest
+	// after it. The reader cuts chunks at the read queue's cold depth (its
+	// window and replay limits are larger here), so these segments fit that
+	// queue without promotion and the fill captures no optional funding that a
+	// later demotion could hand back to the reader. Every later chunk is then
+	// retained only after an ACK releases an earlier one, which bounds the
+	// peer's outstanding ACKs to about one chunk's segments.
+	firstChunkByteCount := func() int {
+		sequence.mutex.Lock()
+		defer sequence.mutex.Unlock()
+		tcp := sequence.tcpBufferSettings
+		return min(tcp.ReadBufferByteCount, sequence.natPacketizationByteLimit(tcp.Mtu, tcp.MemoryColdWriteBatchSize))
+	}()
+	payload := bytes.Repeat([]byte{1}, total)
+	pressured := make(chan struct{})
 	written := make(chan error, 1)
-	go func() { _, err := origin.Write(bytes.Repeat([]byte{1}, total)); written <- err }()
+	writerJoined := false
+	defer func() {
+		if !writerJoined {
+			cancel()
+			origin.Close()
+			select {
+			case <-written:
+			case <-time.After(5 * time.Second):
+				t.Error("origin writer did not join after cancellation")
+			}
+		}
+	}()
+	go func() {
+		if _, err := origin.Write(payload[:firstChunkByteCount]); err != nil {
+			written <- err
+			return
+		}
+		select {
+		case <-pressured:
+		case <-ctx.Done():
+			written <- ctx.Err()
+			return
+		}
+		_, err := origin.Write(payload[firstChunkByteCount:])
+		written <- err
+	}()
 	select {
 	case <-firstData:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	// The callback barrier does not stop socket read-ahead from retaining its
-	// next replay chunk. Fill atomically with respect to those legitimate
-	// claims; Available followed by TryReserve is only an advisory snapshot
-	// and can correctly fail under contention before this test starts.
+	if heldDispatch {
+		// The reader has retained the first chunk and waits on the origin.
+		synctest.Wait()
+	}
+	// Fill atomically with respect to other legitimate claims; Available
+	// followed by TryReserve is only an advisory snapshot and can correctly
+	// fail under contention before this test starts.
 	admissionRoot := budget.admissionRoot()
 	admissionRoot.admissionLock.Lock()
 	fill := budget.Available()
@@ -497,16 +652,169 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	if !full {
 		t.Fatal("data budget was not full at the pressure boundary")
 	}
+	if workspace := sequence.IpPath().tcpReturnBatchWorkspace; workspace != nil && workspace.funded.Load() {
+		t.Fatal("the fill captured the return queue's optional funding")
+	}
+	dispatchHeld.Store(heldDispatch)
+	close(pressured)
 	unblockAck()
+	if heldDispatch {
+		synctest.Wait()
+		if heldSendPacketCount.Load() != 1 {
+			t.Fatalf("dispatch held %d packets, want the first ACK after the fill", heldSendPacketCount.Load())
+		}
+		if got := received.Load(); got != int64(firstChunkByteCount) {
+			t.Fatalf("source received %d bytes with every ACK held, want only the %d in flight at the fill", got, firstChunkByteCount)
+		}
+		if budget.UsedByteCount() != budget.TotalByteCount() {
+			t.Fatal("data budget released capacity before any ACK was applied")
+		}
+		unblockDispatch()
+	}
 	select {
 	case <-complete:
 	case <-ctx.Done():
 		t.Fatalf("ACKs failed to release replay pressure: %v, bytes=%d", ctx.Err(), received.Load())
 	}
-	if err := <-written; err != nil {
-		t.Fatal(err)
+	writeErr := <-written
+	writerJoined = true
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	receiveLock.Lock()
+	wantAck := receiveNext
+	uniqueReceived := uint32(receiveNext - receiveBase)
+	receiveLock.Unlock()
+	if uniqueReceived != total || ackAdmissions.Load() == 0 {
+		t.Fatalf("unique cumulative progress=%d, admitted ACKs=%d", uniqueReceived, ackAdmissions.Load())
+	}
+	for {
+		sequence.mutex.Lock()
+		actualAck, retained := sequence.receiveSeqAck, sequence.returnByteCount
+		sequence.mutex.Unlock()
+		if actualAck == wantAck && retained == 0 {
+			if sequence.ctx.Err() != nil {
+				t.Fatal("flow teardown cannot stand in for cumulative ACK progress")
+			}
+			break
+		}
+		select {
+		case <-processed:
+		case <-ctx.Done():
+			t.Fatalf("final cumulative ACK did not retire actual return chunks: ack=%d want=%d retained=%d queue_refusals=%d", actualAck, wantAck, retained, queueRefusals.Load())
+		}
 	}
 	if budget.UsedByteCount() > budget.TotalByteCount() {
 		t.Fatal("TCP progress overdrew its budget")
 	}
+	t.Logf("unique_bytes=%d final_ack=%d retained_return_bytes=0 ack_admissions=%d zero_wait_queue_refusals=%d packet_byte_claim=0 ingress_count_cap=%d", uniqueReceived, wantAck, ackAdmissions.Load(), queueRefusals.Load(), cap(nat.sendPackets))
+}
+
+// A shared callback may regenerate an ACK refused by the existing count
+// boundary. Refusal must leave its exact root with the caller; clearing that
+// queue makes the same owner admissible without releasing DATA budget.
+func TestNatMemoryProtocolQueueFullRefusalKeepsOwnerAndRecovers(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	budget := NewTransferMemoryBudget(mib(2))
+	settings := DefaultLocalUserNatSettings()
+	settings.MemoryBudget = budget
+	settings.Log = NewNoopLogger()
+	settings.TcpBufferSettings.EnableOrphanRst = false
+	nat, err := TryNewLocalUserNat(ctx, "protocol-count-full", settings)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var held atomic.Bool
+	processed := make(chan struct{}, providerReturnBatchMaxFrames+2)
+	nat.beforeSendPacketForTest = func(*SendPacket) {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	nat.afterSendPacketForTest = func() { processed <- struct{}{} }
+	var fill ByteCount
+	defer func() {
+		cancel()
+		unblock()
+		if err := nat.CloseAndWait(context.Background()); err != nil {
+			t.Error(err)
+		}
+		budget.Release(fill)
+		if stats := budget.Stats(); stats.UsedByteCount != 0 || stats.ReservedByteCount != stats.ReleasedByteCount {
+			t.Errorf("protocol queue cleanup leaked roots or DATA claims: %+v", stats)
+		}
+	}()
+	available := budget.Available()
+	if !budget.TryReserve(available) {
+		t.Fatal("could not fill DATA before protocol admission")
+	}
+	fill = available
+	if cap(nat.sendPackets) != providerReturnBatchMaxFrames || budget.Available() != 0 {
+		t.Fatal("fixture lost the real16-entry ingress queue or full DATA budget")
+	}
+	path := &IpPath{Version: 4, Protocol: IpProtocolTcp, SourceIp: net.IPv4(10, 0, 0, 1), SourcePort: 40000,
+		DestinationIp: net.IPv4(203, 0, 113, 1), DestinationPort: 443}
+	template := ipOosTcpPacket(path, tcpFlagAck, nil)
+	source := SourceId(NewId())
+	offer := func() {
+		packet := MessagePoolCopy(template)
+		if !nat.SendPacket(source, protocol.ProvideMode_Network, packet, 0) {
+			MessagePoolReturn(packet)
+			t.Fatal("protocol ACK was refused before the fixed queue filled")
+		}
+	}
+	offer()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("first actual shard owner did not reach its barrier")
+	}
+	for range providerReturnBatchMaxFrames {
+		offer()
+	}
+	if len(nat.sendPackets) != providerReturnBatchMaxFrames {
+		t.Fatal("real shard barrier did not saturate exact ingress count")
+	}
+	refused := MessagePoolCopy(template)
+	defer func() { MessagePoolReturn(refused) }()
+	memory, permitted := nat.reserveSendPacketsMemory([][]byte{refused})
+	if !permitted || memory.budget != nil || memory.bytes != 0 {
+		memory.release()
+		t.Fatal("protocol ACK did not have zero-byte permission at the count boundary")
+	}
+	before := budget.Stats()
+	if nat.SendPacket(source, protocol.ProvideMode_Network, refused, 0) {
+		refused = nil
+		t.Fatal("zero-wait protocol send bypassed the full ingress queue")
+	}
+	if !bytes.Equal(refused, template) || budget.Stats() != before || len(nat.sendPackets) != providerReturnBatchMaxFrames {
+		t.Fatal("count refusal consumed caller ownership or modified byte admission")
+	}
+	unblock()
+	for range providerReturnBatchMaxFrames + 1 {
+		select {
+		case <-processed:
+		case <-ctx.Done():
+			t.Fatal("admitted protocol owners did not drain after the shard barrier")
+		}
+	}
+	if !nat.SendPacket(source, protocol.ProvideMode_Network, refused, 0) {
+		t.Fatal("same retained ACK owner did not recover after queue capacity returned")
+	}
+	refused = nil
+	select {
+	case <-processed:
+	case <-ctx.Done():
+		t.Fatal("recovered exact ACK owner did not reach final NAT disposition")
+	}
+	if budget.Stats() != before || budget.Available() != 0 {
+		t.Fatal("protocol count recovery required DATA capacity or a byte reserve")
+	}
+	t.Logf("queue_count_cap=%d forced_zero_wait_refusals=1 same_owner_recovered=true packet_byte_claim=0", cap(nat.sendPackets))
 }

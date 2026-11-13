@@ -1,5 +1,9 @@
 package extender
 
+// Regression tests for the private-extender admission check. The expected
+// signature is an hmac under the extender secret and the presented one is
+// client-supplied, so the two must be compared in constant time.
+
 import (
 	"bytes"
 	"crypto/hmac"
@@ -13,6 +17,9 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Constant time is not observable from a behavioural test, so this reads the
+// method's own source: the signature comparison must be hmac.Equal, and no
+// early-exit equality may appear in the method.
 func TestAllowedSecretComparesInConstantTime(t *testing.T) {
 	file, err := parser.ParseFile(token.NewFileSet(), "extender.go", nil, 0)
 	if err != nil {
@@ -46,14 +53,19 @@ func TestAllowedSecretComparesInConstantTime(t *testing.T) {
 	}
 	for _, name := range []string{"bytes.Equal", "slices.Equal", "reflect.DeepEqual"} {
 		if calls[name] {
-			t.Errorf("early-exit comparison %s", name)
+			t.Errorf("the admission signature is compared with %s, which stops at the first differing byte", name)
 		}
 	}
 }
 
+// Only the whole hmac admits a header: a prefix, an extension, an empty
+// signature or one flipped bit is refused.
 func TestAllowedSecretRefusesPartialSignatures(t *testing.T) {
 	server := &ExtenderServer{allowedSecrets: []string{testSecret}}
-	header := &protocol.ExtenderHeader{Timestamp: 1, Nonce: []byte("synthetic-nonce-0001")}
+	header := &protocol.ExtenderHeader{
+		Timestamp: 1,
+		Nonce:     []byte("synthetic-nonce-0001"),
+	}
 	mac := hmac.New(sha256.New, []byte(testSecret))
 	timestamp := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestamp, header.Timestamp)
@@ -62,14 +74,21 @@ func TestAllowedSecretRefusesPartialSignatures(t *testing.T) {
 	signature := mac.Sum(nil)
 	header.Signature = signature
 	if !server.IsAllowedSecret(header) {
-		t.Fatal("valid signature refused")
+		t.Fatal("the whole signature was refused")
 	}
 	flipped := bytes.Clone(signature)
 	flipped[len(flipped)-1] ^= 1
-	for _, invalid := range [][]byte{signature[:len(signature)-1], append(bytes.Clone(signature), 0), nil, flipped} {
-		header.Signature = invalid
+	partialSignatures := [][]byte{
+		signature[:len(signature)-1],
+		append(bytes.Clone(signature), 0),
+		nil,
+		flipped,
+	}
+	for _, partialSignature := range partialSignatures {
+		header.Signature = partialSignature
 		if server.IsAllowedSecret(header) {
-			t.Fatal("invalid signature admitted")
+			t.Errorf("a %d-byte partial signature was admitted", len(partialSignature))
 		}
 	}
 }
+

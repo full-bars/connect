@@ -85,7 +85,9 @@ func TestTransferPayloadOwnerSnapshotFencesAndConcurrency(t *testing.T) {
 		t.Fatalf("snapshot allocates: %g", n)
 	}
 	// The payload instrumentation must not grow each retained packet object.
-	if unsafe.Sizeof(sendItem{}) != 592+recoveryWriteStateByteCount || unsafe.Sizeof(ForwardPack{}) != 88 {
+	// Payload instrumentation adds no fields; immediate policy flags retain
+	// their explicitly priced aligned word and recovery write state is kept.
+	if unsafe.Sizeof(sendItem{}) != 592+recoveryWriteStateByteCount+immediateSendItemPolicyStateByteCount || unsafe.Sizeof(ForwardPack{}) != 88 {
 		t.Fatalf("packet objects grew: send=%d forward=%d", unsafe.Sizeof(sendItem{}), unsafe.Sizeof(ForwardPack{}))
 	}
 }

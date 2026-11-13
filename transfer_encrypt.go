@@ -713,6 +713,9 @@ type EncryptionSettings struct {
 
 	// MaxClientKeyHistoryGenerations bounds an accepted chain.
 	MaxClientKeyHistoryGenerations int
+	// Bounds admission retries after another resolver changes the pin snapshot.
+	// Nonpositive values refuse admission through a configured pin store.
+	MaxClientKeyPinAdmissionAttempts int
 
 	// ProvideTlsCertificatePem, when set together with
 	// `ProvideTlsPrivateKeyPem`, loads the local sequence-level TLS server-role
@@ -806,7 +809,8 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		// The bound exists to cap verification work on a hostile response,
 		// where each generation costs a signature recovery and a re-marshal,
 		// not to be a tight fit.
-		MaxClientKeyHistoryGenerations: 64,
+		MaxClientKeyHistoryGenerations:   64,
+		MaxClientKeyPinAdmissionAttempts: 4,
 		// Undecryptable-wrap nack pacing (see EncryptedControlUnknownWrapNack
 		// in the proto): the emit interval bounds nack traffic against a
 		// sealing burst (one per interval per session, not per frame); the
@@ -2172,7 +2176,7 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 			// capability evidence for a session this client initiated, as the
 			// handshake's is, recorded before the callbacks below so a Sealed
 			// event's consumer already reads it
-			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId)
+			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId, self)
 		}
 		// the established + identity-verified peer set grew (or the
 		// established epoch swapped): the only promote path runs above
@@ -2794,6 +2798,27 @@ func (self *peerEncryptionSession) encryptionStateSnapshot() (
 	return
 }
 
+// A probe's current ordinary sending epoch, using the same cipher gate as
+// application sends. Called outside the recorder lock; no packet-path work
+// is added, and a retired or companion session supplies no positive proof.
+func (self *peerEncryptionSession) capabilitySession() PeerCapabilitySession {
+	if self.role != sequenceTlsRoleClient || self.companion || self.ctx.Err() != nil {
+		return PeerCapabilitySession{}
+	}
+	clientId := self.client.ClientId()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.cipherWithLock() == nil {
+		return PeerCapabilitySession{}
+	}
+	return PeerCapabilitySession{
+		ClientId:    clientId,
+		EpochId:     self.establishedEpoch.epochId,
+		KeyExchange: tlsKeyExchangeName(self.establishedEpoch.negotiatedCurveId),
+		PostQuantum: isPostQuantumKeyExchange(self.establishedEpoch.negotiatedCurveId),
+	}
+}
+
 // Cipher returns the AEAD cipher, or nil if the session can't safely
 // wrap/unwrap application frames. Nil means "treat as plaintext for this peer."
 // The AEAD is withheld until both:
@@ -2827,8 +2852,7 @@ func (self *peerEncryptionSession) cipherWithLock() *sequenceCipher {
 	// verify normally; what does not happen is any application byte leaving
 	// for, or being accepted from, a peer whose key the platform may have
 	// chosen. A rejected resolution is terminal and never re-enters pending.
-	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+	if !self.keyHistoryAdmitsApplicationWithLock() {
 		if self.client.log.V(2).Enabled() {
 			self.client.log.V(2).Infof(
 				"[key]%s Cipher()=nil: signed identity %s\n", self.logTag, self.keyHistoryState,
@@ -2946,22 +2970,42 @@ func (self *peerEncryptionSession) notifyRequiredCipherChangedWithLock() {
 func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+	if !self.keyHistoryAdmitsApplicationWithLock() {
 		return true
 	}
 	return self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil ||
 		self.epoch != self.establishedEpoch
 }
 
-// decryptCiphers returns the candidate ciphers for unwrapping an inbound
-// frame: the established cipher and, briefly after a rekey, the prior
-// established cipher (a peer may still send under the old key until it swaps
-// to the new one). The unwrap path tries each until one authenticates. Empty
-// until the session establishes.
-func (self *peerEncryptionSession) decryptCiphers() []*sequenceCipher {
+// Shares the signed-identity policy across outbound and inbound application
+// admission. Handshake controls use their separate plaintext bootstrap path.
+func (self *peerEncryptionSession) keyHistoryAdmitsApplicationWithLock() bool {
+	switch self.keyHistoryState {
+	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+		return false
+	default:
+		return true
+	}
+}
+
+// Linearizes one application dispatch against signed-identity transitions.
+// An admitted callback may finish after rejection; later queued dispatches
+// must check again. No session lock crosses a callback or packet ownership move.
+func (self *peerEncryptionSession) admitInboundApplication() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.keyHistoryAdmitsApplicationWithLock()
+}
+
+// Returns the established/prior decrypt candidates and whether signed identity
+// admits them. A policy refusal must not masquerade as an unknown wrap and
+// restart a healthy peer's handshake. Delivery rechecks admission after queuing.
+func (self *peerEncryptionSession) decryptCiphers() ([]*sequenceCipher, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !self.keyHistoryAdmitsApplicationWithLock() {
+		return nil, false
+	}
 	var out []*sequenceCipher
 	if self.establishedEpoch != nil && self.establishedEpoch.derivedTlsCipher != nil {
 		out = append(out, self.establishedEpoch.derivedTlsCipher)
@@ -2969,7 +3013,7 @@ func (self *peerEncryptionSession) decryptCiphers() []*sequenceCipher {
 	if self.priorEstablishedEpoch != nil && self.priorEstablishedEpoch.derivedTlsCipher != nil {
 		out = append(out, self.priorEstablishedEpoch.derivedTlsCipher)
 	}
-	return out
+	return out, true
 }
 
 // markEstablishedWithLock promotes epoch e to the established epoch — its

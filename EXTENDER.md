@@ -361,8 +361,12 @@ DnsOtherHandler(query []byte, addr net.Addr)` hook, which the extender sets
 to a forwarder: parse the query, refuse `ANY`, resolve the question through
 the extender's own DoH cache (`DohCache.Forward` for the raw response, with
 the connect default DoH server list, overridable in `ExtenderSettings`),
-rewrite the message id, and write the answer on the dns socket it came
-in on directly. Per-source limit 10 queries per second with burst 20, total 500
+give the answer the query's message id and question name, case included
+for a 0x20 client (the cache asks in lower case), drop the upstream's OPT
+record for a query that had none (RFC 6891), and write the answer on the
+dns socket it came in on directly (`connect.DnsResponseForQuery`, as the
+mux does). An answer to another question is not sent. Per-source limit 10
+queries per second with burst 20, total 500
 per second with the same burst, one in-flight query per source address, a
 bounded worker pool of 64 so the translation's read loop never blocks,
 a 5 s forward timeout, and a response cap of 4096 bytes with the TC bit
@@ -794,8 +798,13 @@ within one 10 s probe budget, in this order: the required test (C2a) --
 name, sends a header with a challenge and verifies the response signature
 against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
 verified `GET /hello` through the tcp carrier to the api url -- and only
-then each offered optional carrier: each dns port under its own 3 s (L2),
-then quic with what is left. Result `{activated, ip, ip_version,
+then every offered optional carrier at once, each dns port (L2) and quic,
+each until it answers or the probe budget ends (connect#230): none waits on
+another, so a port with nothing bound costs only itself and a slow carrier
+has all of what is left of the budget. An activation that offers webrtc
+runs the webrtc test, one dial over the carrier through the signaling relay
+of S8, beside the tcp test and at once, and its optional carriers start once
+either passes (S8). Result `{activated, ip, ip_version,
 carriers, refused_carriers, probe_steps, error, retry_after_seconds,
 expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
@@ -885,9 +894,9 @@ about the budget, while a step whose budget ran out says how much it had,
 "the forward did not answer within the 0.5 s left of the 10 s probe
 budget: context deadline exceeded" or "the tcp carrier did not answer
 within the 10 s probe budget: ...". A left out carrier that timed out reads
-"no answer within 3 s: ..." for a dns port and "no answer within the 6.5 s
-left of the 10 s probe budget: ..." for quic; one that failed on its own
-keeps its probe's error. Old providers decode the answer into
+"no answer within the 8.5 s left of the 10 s probe budget: ...", the same
+for each, since the optional carriers start together once the required
+test has passed; one that failed on its own keeps its probe's error. Old providers decode the answer into
 `connect.ExtenderActivateResult`, which skips the new fields. The api
 counts every activation in `urnetwork_extender_activations_total{stage,
 outcome, family}` -- stage `request`, `config`, `owner` (the key is registered
@@ -1006,11 +1015,36 @@ the address was accepted on (C2a), 15 s timeout.
 A failure increments `consecutive_probe_failures`; at 6 the address is
 deactivated. When an extender has no active address it becomes inactive,
 `revoke_time` is set and a revocation publish row is inserted. A success
-resets the counter and stamps `last_probe_success_time`. A deactivated
-address is re-probed only by a new activation. The read of an extender's
-remaining active addresses is locked, so two probes losing both families
-of one extender in the same tick cannot each see the other still active
-and leave the extender active with no address and no revocation.
+resets the counter and stamps `last_probe_success_time`. The read of an
+extender's remaining active addresses is locked, so two probes losing both
+families of one extender in the same tick cannot each see the other still
+active and leave the extender active with no address and no revocation.
+
+A pass's failures count only when the prober could have passed them
+(server 6845ebf36, 2026-11-11; `taskworker/work/extender_probe_common_mode.go`,
+`extender_probe_control.go`). Each family of a pass is judged first: it is
+held as the prober's own fault when at least three quarters of its addresses
+failed and either at least three quarters of its networks lost half or more of
+theirs (with at least 4 networks and 8 addresses in the pass), or the prober's
+control target failed over that family with them -- a tls handshake, before and
+after the pass, with the operator's api host, the destination every probe
+names, which counts only once it has answered in this process. A held family's
+failures record nothing, deactivate nothing and revoke no one; its successes
+count as always, and each held pass logs an error line.
+
+A deactivated address is probed for its return as well as re-activated by a new
+activation (`extender_probe_recovery.go`, `model/network_extender_recovery_model.go`).
+For 72 h after it last worked -- an uptime probe or its activation passed --
+an address the probes deactivated, with the failure count that deactivated it
+and on the ip it was deactivated on, is probed in the same passes with the same
+dial: every pass for the first 2 h, then at most every 30 minutes, after the
+active addresses and never counting toward the pass's verdict. The first time it
+passes the same tcp challenge under the extender's published key at that ip, the
+address is active again with a clean count, and a revoked extender is active
+again with a record queued in the same transaction, issued after the revocation
+so it supersedes it in every directory (B5). Only what the probes took away is
+restored: a dead extender still fails its six probes, is revoked half an hour
+after it stopped answering, and never answers a probe for its return.
 
 C4. Publish tick. Taskworker task every 10 minutes. Drip: select up to 8
 active extenders ordered by the oldest `last_publish_time` (nulls first),
@@ -1434,7 +1468,11 @@ tcp 443 first, the one port an extender requires, and only then start
 device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
 L2), each udp carrier bound independently and a failed udp bind disabling
 that carrier alone; the forward dialer is
-the device's egress-aware connect dial narrowed by family, and its failures
+the device's egress-aware connect dial narrowed by family, and it and the
+datagram relay's dialer carry the provider dial control, which refuses before
+the socket connects an address a destination name resolved to that is not
+public or is the provider host's own, on one of its links, an observed
+address or service anycast (IP_SECURITY.md §2.2.4); its failures
 (A7) are logged, the first of each kind at once and then at most one line a
 minute carrying the count since, so an extender whose egress cannot reach
 the operator says so (connect#230); the whitelist is
@@ -4190,8 +4228,11 @@ it closes the peer connection, since that close aborts the association and
 drops what is in flight; a dead association, which never acknowledges and
 which nothing on the peer connection reports, ends the wait through a
 read that fails at once. Not built for js/wasm: the browser owns webrtc
-there (stub). The carrier is off by default everywhere it can be turned on
-(S3, S6) until it is proven in the field.
+there (stub). The sdk turns it on by default on both sides (S6, S8, owner
+2026-11-11): the role answers on the provider client's manager and a device
+dials through it; connect's own defaults leave it off (the directory gate,
+no carrier on `DefaultConnectSettings`), and connectctl serves it on
+`--webrtc`.
 
 S2. Signaling. The rendezvous rides the `ExchangeSignals` frames the p2p
 transport negotiates with, routed by the exchange to the extender's client
@@ -4227,10 +4268,12 @@ and a failure counts against the address's other carriers.
 `ExtenderDirectory.WebRtcClientId(publicKey)` is the lookup a device's
 resolver signals by. With the carrier enabled the strategy expands a
 webrtc dialer per candidate that lists it through the mode dispatch it
-already has (`extenderConfigsForCandidate` in net_http.go is untouched:
-the dialer takes the tcp carrier's priority and port, which is a follow-up
-once that file is free -- the carrier belongs after dns, as
-`orderedExtenderCarriers` already orders it for the feed and the probes).
+already has: `extenderConfigsForCandidate` (net_http.go) gives the webrtc
+config the tcp default port as its request authority only, no outer name
+and no tcp shaping, and `extenderDialerPriority` puts it after dns (130),
+as `orderedExtenderCarriers` orders it for the feed and the probes (S8).
+A failed webrtc dial holds only an address that serves no socket carrier
+(`ExtenderDirectory.RecordFailure`, S8).
 
 S4. Fingerprints. The STUN pool: ten high-collateral servers
 (`defaultStunServerUrls`), a random `IceServerSampleCount` (3) of them
@@ -4245,36 +4288,37 @@ direct p2p transport, on by default for the carrier
 (`DefaultWebRtcExtenderSettings`). No-op on js/wasm.
 
 S5. Acceptance and uptime on the operator (C2a, C3), server. An activation
-may offer "webrtc" among its carriers and must offer tcp or webrtc. Each
-required path offered is proved on its own, the challenge on its carrier
-and then the verified `GET /hello` through it, with the family check of
-A7 per path; a path that fails is left out, and the activation is refused
-only when every required path offered failed, with each failure named. An
+may offer "webrtc" among its carriers and must offer tcp or webrtc. The
+webrtc path is proved only where the tcp path failed or was not offered
+(owner, 2026-11-12; S8). Each required path that runs is proved on its own,
+the challenge on its carrier and then the verified `GET /hello` through it,
+with the family check of A7 per path; a path that fails is left out, and the
+activation is refused only when every required path that ran failed, with
+each failure named. An
 optional carrier (quic; dns per port) is probed when offered and left out
 when it fails, never refusing an activation a required path passed -- the
 two activation tests that asserted the old refusal now assert the drop.
 The stored carriers are the ones that passed, in the order offered; the
-record carries them and the rendezvous. The webrtc tests run connect's
-`ProbeExtenderWebRtcCarrier` and `ProbeExtenderWebRtcForward` through a
-seam, `extenderWebRtcProbeConnectSettings(clientId)`, whose production
-default answers no settings: this deployment has no relay from an api
-process to the exchange resident that holds the extender's client, so
-every webrtc test fails with `ErrExtenderWebRtcSignalingUnavailable` and
-an extender offering only webrtc is refused with that reason until the
-relay lands (S8). Uptime probes an address over the required path it was
-accepted on: the tcp challenge when the address lists tcp, and the webrtc
-challenge when it lists webrtc -- also when its tcp stopped answering, so
-an address is live while any required path it was accepted on answers and
+record carries them and the rendezvous. The webrtc test runs connect's
+`ProbeExtenderWebRtcForward` over a carrier signaled through the relay of
+S8 (the operator's probe settings, `newExtenderWebRtcProbeConnectSettings`
+in the server's extender_webrtc_controller.go); the uptime probe runs
+`ProbeExtenderWebRtcCarrier` the same way. Uptime probes an address over
+the required path it was accepted on: the tcp challenge when the address
+lists tcp, and the webrtc challenge when it lists webrtc -- in place of tcp,
+once tcp has failed, when it lists both (S8) -- so an address is live while
+any required path it was accepted on answers and
 a webrtc-accepted extender is never deactivated for a public tcp port it
 may not have (`NetworkExtenderProbeTarget.ClientId`, read from the
 extender row).
 
 S6. The role (G2), sdk. `DeviceLocalSettings.ProvideExtenderWebRtc`
-(default off; gomobile and the c abi json carry it) turns the carrier on
+(default on since S8, owner 2026-11-11; gomobile and the c abi json carry
+it) turns the carrier on
 for the provider extender role; the role needs a manager to signal through,
 the provider client's (`deviceLocalExtenderSettings.SignalingManager`),
-and installs its answerer on it when it starts serving, removing it when
-it closes. With the carrier available a role that cannot bind tcp 443
+and installs its answerer on it when it starts serving, removing its own
+when it closes (S8). With the carrier available a role that cannot bind tcp 443
 runs anyway: the udp carriers bind, the server lists webrtc, the
 activation offers it, and the tcp bind failure is one more carrier's in
 `ListenError` rather than the role being off; `tcp_unavailable` applies
@@ -4309,41 +4353,238 @@ real server over the carrier (`extender/extender_webrtc_test.go`: the
 served stream with the https forward on the ICE pair's family, the two
 probes, a forward off the whitelist refused, admission by the ICE remote
 address, the carrier listed only when enabled and a server up on it
-alone). server: accepted on webrtc alone, on tcp when webrtc has no path,
-on both with every optional carrier, refused when neither passes and
-without a required path, the optional drops, the record's rendezvous
-(`controller/extender_webrtc_controller_test.go`, the two rewritten tests
-in `extender_controller_test.go`), and the uptime task judging a webrtc
-address over webrtc through more ticks than the budget, keeping a dual
-path address while webrtc answers, never signaling a tcp address, and
-deactivating a webrtc address that stops answering
+alone). server: accepted on webrtc alone, on webrtc in place of a tcp
+path that failed, on tcp with webrtc untested when tcp passes, refused when
+neither passes and without a required path, the optional drops, the
+record's rendezvous (`controller/extender_webrtc_controller_test.go`,
+`extender_activate_webrtc_test.go`, the two rewritten tests in
+`extender_controller_test.go`), and the uptime task judging a webrtc
+address over webrtc through more ticks than the budget, probing a dual path
+address over webrtc only once tcp failed, never signaling a tcp address,
+and deactivating a webrtc address that stops answering
 (`taskworker/work/extender_probe_webrtc_work_test.go`). sdk: a role with
 tcp 443 taken running on the carrier, offering it, reporting the bind
 failure beside the others, installing and removing its answerer; staying
 off without a signaling manager; offering the carrier beside tcp
 (`device_local_extender_webrtc_test.go`).
 
-S8. Phased and not done. The operator-side signaling relay: an api process
-has no path to the exchange resident that holds the extender's client, so
-the seam of S5 answers nothing in production and the webrtc test is refused
--- the relay (api to resident, the resident forwarding the flagged offer to
-its client as it forwards a peers update, the answer back) is the piece
-that makes acceptance on webrtc real, and it is designed but not written.
-The device's dial side: installing a carrier on a device's connect settings
-and enabling its directory, with a resolver from the record's rendezvous
-id through the provider client's manager; a client needs an exchange
-connection to signal, so the carrier is a second path for a device that has
-one and never the bootstrap -- the socket carriers and the dns carrier
-remain the paths where udp is dead or nothing else reaches the operator.
-connectctl's extender gains no flag yet. The webrtc dialer's priority and
-port in `extenderConfigsForCandidate` (net_http.go, in flight elsewhere).
-UPnP-IGD, NAT-PMP and PCP port mapping, which would also let today's socket
-carriers activate on many home routers, scoped as a follow-on: a mapping
-of tcp 443 and udp 443/4053 attempted by the role before its binds, with
-the mapped external port offered to the activation (a port field per
-carrier the record already has), through an MIT or BSD library only. A
-TURN fallback for the symmetric NATs hole punching cannot cross. The apps'
-setting for `ProvideExtenderWebRtc`.
+S8. Built (2026-11-11, owner: "yes this is what we decided, let's do it"),
+on branch `feat/extender-webrtc-s8-1111` in connect, server and sdk, held
+for the owner's release timing. Before it, an api process had no path to
+the exchange resident holding an extender's client, the seam of S5 answered
+nothing, and every webrtc test was refused.
+
+- The relay (server). The prober -- the api's activation, the taskworker's
+  uptime task -- adds one offer item (request id, its deadline, the SDP
+  offer json) to `{<clientId>}w_offer`, a Redis set whose size is bounded
+  at the add (2) and whose ttl each add renews
+  (model/extender_webrtc_relay_model.go), and then wakes the exchange
+  process holding the client's resident: it publishes the client id on that
+  process's own sharded channel, `extender_webrtc_offer_<host>_<service>_<block>`,
+  named by the resident's registration (`ncr_<clientId>`). Each exchange
+  process subscribes to its own channel alone, from its first resident on
+  (connect/extender_webrtc_offer_wakes.go, `server.RunRedisShardSubscription`,
+  which follows the channel's slot), so no process matches a pattern against
+  the keyspace notification of every set on Main (owner, 2026-11-12; S9). A
+  wake kicks the relay listener of that client's resident, which every
+  resident registers beside its close-request listener and which takes once
+  at registration (connect/extender_webrtc_relay.go); every start of the
+  subscription kicks every listener, trickled over the resync spread, since a
+  wake published while the process had no subscription is gone. The
+  listener holds no goroutine while idle, since every resident builds one.
+  It takes each offer once (SPOP),
+  and relays it the way a peers update reaches the client: the resident's
+  internal client, whose id is the control id, sends the flagged
+  `ExchangeSignals` through `WebRtcManager.ExtenderCarrierExchanger` and
+  waits under the offer's stream id for this client's answer alone. The
+  control id is a no-contract peer of every client, so neither direction
+  needs a contract, and the answer reaching the resident's controller is a
+  no-op there (`ConnectControlFrames`). The answer, or why there is none
+  (expired, oversized, malformed, rate_limited, busy, no_answer), is pushed
+  onto `{<clientId>}w_answer:<requestId>`, which the prober waits on with
+  BLPOP within its probe budget, cut to the whole seconds Redis waits; the
+  offer expires when the wait ends, and an offer no resident took is
+  removed. `urnetwork_extender_webrtc_relay_offers_total{outcome}` counts
+  the relay.
+- Not an open relay, not an amplifier. Only the prober originates offers,
+  and only for an extender it is testing: the activation for the client its
+  jwt names, once every check that refuses without a probe has passed and
+  its budgets are spent, and the uptime task for an address it probes; no
+  route takes a client id to signal. A resident relays only offers from its
+  client's own set, which only the prober writes, and only to that client.
+  Offers and answers are bounded at 16 KiB, a client's offers at 12 a
+  minute with a burst of 4, an exchange's relays at 64 at once, an
+  exchange with the client at 15 s (`ExtenderWebRtcRelaySettings`); a
+  refusal is answered, so the prober stops waiting. The prober's ICE
+  checks go only to the answer's candidates on the address being tested --
+  the activation's source address, the caller ip, or the address an uptime
+  probe judges -- by its /32, or by the /64 of an ipv6 one, as the
+  attribution rule matches an extender's address
+  (server model/network_extender_address_cache.go); every other candidate is
+  dropped before the answer applies, so before any check, and of those kept
+  at most 8 are, and connect's filter keeps them off the operator's own host
+  and links (`ExtenderWebRtcProbeSettings`; owner, 2026-11-12). A
+  peer-reflexive candidate Pion learns from a check that reaches it is still
+  answered at the address the check came from, as STUN answers; such a
+  check needs the ICE credentials of this probe's answer, and lives only as
+  long as the probe.
+- Acceptance (server, C2a). An activation must offer tcp or webrtc. The
+  webrtc test runs only where the tcp path failed or was not offered, never
+  beside a tcp test that may still pass (owner, 2026-11-12): an extender the
+  operator reaches on tcp is accepted on tcp, its device is sent no offer,
+  and webrtc is neither stored for it nor listed in `refused_carriers`. One
+  that offers tcp without webrtc is judged exactly as before, under the
+  whole 10 s budget. One that offers webrtc without tcp runs the webrtc test
+  under the whole budget. One that offers both runs the tcp path first, its
+  challenge cut at 5 s (`ExtenderActivateSettings.TcpChallengeTimeout`) --
+  a host behind nat that binds tcp 443 black-holes the challenge, which would
+  otherwise wait out the budget the webrtc test needs -- and when the tcp
+  path fails, at the challenge or after it, the webrtc test runs in its place
+  under a 10 s budget of its own that ends no later than 15 s after the
+  judging began, the uptime probe's address budget; the optional carriers
+  start once a required path passes, under that path's budget. The webrtc
+  test is one dial: the carrier challenges the
+  extender and verifies its key, then the verified `GET /hello` runs
+  through it, then the family check; a carrier probe and a forward probe
+  would be two signaling round trips and two ICE joins in the one budget.
+  The probe's ICE gathers on the activation's family alone
+  (`WebRtcSettings.IceIpVersion`), since the extender's forward follows the
+  family of the pair it was reached on (A7). An activation is refused only
+  when every required path that ran failed, each failure named, at the
+  webrtc step; a tcp path that failed where the webrtc test then passed is
+  listed in `refused_carriers` with its failure. The stage and step `webrtc`
+  join the activation metrics. The record carries the rendezvous (S3).
+- The cap (server). The operator accepts at most
+  `ExtenderActivateSettings.MaxWebRtcOnlyExtenders` extenders on webrtc
+  without tcp, 100 at first (owner, 2026-11-12): active extenders with an
+  active address that lists webrtc and not tcp
+  (`model.ExtenderAddressWebRtcOnly`, `CountActiveWebRtcOnlyNetworkExtenders`),
+  the activating key's own left out, so an extender already counted
+  activates again. The cap is read just before a webrtc test would run;
+  past it the test is not run, the extender's device is sent nothing, and
+  the activation is refused naming the tcp failure and the cap: "the webrtc
+  carrier was not tried: the operator accepts no more extenders on the
+  webrtc carrier without tcp for now (100 accepted, the cap is 100); an
+  extender whose tcp port the internet reaches is accepted on tcp". It is
+  counted as `urnetwork_extender_activations_total{stage="webrtc",outcome="cap"}`
+  (a cap that cannot be read refuses as `error`), and the population as
+  `urnetwork_stats_webrtc_only_extenders`, beside the relay on the extenders
+  dashboard. Each such address costs every uptime pass a relayed offer and
+  an ICE join at the same probe concurrency (16), and one whose test fails
+  holds a worker its 15 s; a hundred extenders, up to two hundred addresses,
+  hold the workers about three minutes of a pass if every one fails. The
+  bound is soft by the activations in flight at once.
+- Never the bootstrap. An address accepted on webrtc alone is in no geo dns
+  set and no seed cohort, and an extender with no socket address is never
+  sampled for an activation's bootstrap (`model.ExtenderAddressFirstContact`):
+  those are a client's first contact, and the carrier signals through an
+  exchange connection a client in first contact does not have. Its records
+  reach connected clients through the drip and the feed.
+- Uptime (C3). An address is probed over the required paths it lists, live
+  while either answers. One that lists both -- which an activation no
+  longer stores, since webrtc is tested only where tcp failed -- is probed
+  over tcp first, its challenge cut at 5 s (the address budget less the
+  activation's, `ExtenderProbeTcpBeforeWebRtcTimeout`), and over webrtc only
+  once tcp has failed, under the rest of the address budget; the two never
+  run at once. So a tcp port that stopped answering does not starve the
+  webrtc probe of the address budget, and a tcp port that answers sends the
+  extender's device no offer.
+- The device's dial side (connect, sdk). `WebRtcExtenderDialSignaling` holds
+  the client a device signals through, resolves an extender's key to the
+  rendezvous id of its verified record and that client's exchanger (never
+  to the device's own client), and opens the directory's gate exactly while
+  a client is set. The sdk installs a carrier with it on every space's
+  strategy settings but a hosted space's, and the device's provider client
+  sets itself as it is built and clears itself as it closes. A failed webrtc
+  dial holds only an address that serves no socket carrier
+  (`ExtenderDirectory.RecordFailure`): the join fails for reasons of the
+  path between the two ends, which say nothing of the extender's tcp, quic
+  and dns. The dialer comes after dns (S3). On a phone the dial carrier's
+  SCTP buffers are bounded to the device's p2p budget through its settings
+  (owner, 2026-11-12): each dial's receive window is the 128 KiB window
+  every p2p connection of the device takes (`deviceLocalP2pReceiveBufferByteCount`),
+  and its largest message fits it, where the carrier's defaults follow the
+  process memory target, 256-512 KiB (sdk
+  `applyMobileExtenderWebRtcDialSettingsForPlatform`); a desktop keeps the
+  carrier's defaults.
+- The role (sdk). `ProvideExtenderWebRtc` is on by default (S6). A role
+  removes only its own answerer as it closes
+  (`WebRtcManager.RemoveExtenderCarrierAnswerer`), so a successor's stays.
+  A role that started on the carrier without tcp 443 has no tcp carrier to
+  lose, so it is not replaced every three minutes for one.
+- Operators that predate the carrier. Such an operator's carrier check
+  refuses a list naming webrtc, `unknown carrier "webrtc"`, before it
+  probes or spends anything. The activator then posts the same list again at
+  once without the carrier and leaves the carrier off for that operator for
+  its life (`ExtenderActivator`), so the miner's other operators, and an api
+  not yet deployed, still activate the socket carriers; a host serving
+  webrtc alone is held for its carriers there, as before.
+- connectctl. `connectctl extender --webrtc` connects a client under its
+  client jwt to `--connect_url` and answers on its manager; the server lists
+  the carrier and a run without a tcp bind serves on it. That client
+  provides to its own network only, so the operator's probes and the
+  network's own devices reach it, and devices of other networks, whose
+  signals ride a contract to it, do not; the owner accepted that for a test
+  tool (2026-11-12).
+- Deploy order. The connect service first (the residents' listeners and
+  each process's offer channel), then the api, alt (which mounts the api router) and
+  the taskworker (the prober), and only then the clients and the miner,
+  through the nightly's sdk, whose role offers the carrier by default: an
+  api that predates it answers each role's first post of each family with
+  the unknown-carrier refusal above, one round trip lost per role. An api
+  ahead of the connect processes finds no subscriber on the channel its
+  wake goes to: the offer expires, the webrtc test fails as it did before,
+  and tcp is unaffected. No migration, no services version, no rpc version.
+  The monitor's relay signal (below) reads unobservable until the connect
+  service exports the relay counter.
+- Monitoring (server monitor, SIGNALS.md §28.6, owner 2026-11-12). The
+  relay's outcomes over the trailing hour, fleet wide: no_answer above half
+  of at least 20 offers for 30 minutes is `extender-webrtc-relay-no-answer-high`
+  (the clients' answerer or the relay path is broken), busy above 5% of at
+  least 20 for 30 minutes is `extender-webrtc-relay-busy-high` (the
+  exchange's 64 relays at once are full), and no relay series is
+  `extender-webrtc-relay-unobservable`. First values, to be revisited after
+  the first week of data.
+- Tests. connect: the gate and the resolver of the dial signaling, an offer
+  resolved through it reaching the extender over the bridged signaling, the
+  dialer's port, outer name, shaping and priority, the directory's failure
+  rule, the pinned ICE family (the network types; Pion's gathering under
+  them on loopback behind the `urnetwork_webrtc_loopback` build tag), the
+  answerer removal, connectctl's flags and a run serving on the carrier
+  alone. server: the acceptance rule over fake
+  probes on a fake clock (webrtc alone; no webrtc test beside a tcp path
+  that passes, a slow challenge within its share included; webrtc in place
+  of a black-holed challenge, cut at 5 s, with a 10 s budget of its own and
+  the optional carriers under it; webrtc in place of a failed forward; the
+  15 s bound after a forward that waited out the budget; neither, one after
+  the other; the webrtc failures as counted stages; a panic contained; no
+  webrtc test without the offer), the cap (refused untried past it, nothing
+  probed for webrtc alone, never asked when tcp passes, the test below it,
+  an unreadable cap; the count against the database), the prober's exchanger
+  over a fake relay (the wake on the resident's channel after the add, the
+  candidates kept to the tested address and its ipv6 /64), the listener over
+  a fake store and exchange (every refusal, the client's burst, the
+  exchange's slots, no worker while idle, the close), the offer channel's
+  wakes over a synthetic shard socket (subscribed with the first listener,
+  every listener kicked at a start, a wake kicking the named client alone),
+  no keyspace pattern for offers, the control no-op, the uptime paths (webrtc
+  only once tcp failed, on the bubble's clock), the monitor's §28.6 classes,
+  and against the test Redis and database the relay keys, the first-contact
+  rule and the relay end to end through a real exchange to a real client's
+  answerer. sdk: the default, the role on by default with the provider
+  client's manager, on the carrier without tcp 443, off without a manager, a
+  successor's answerer kept, a device's dials signaling through its provider
+  client, and a phone's dial window.
+
+Not done: a field proof (the carrier has not run between real home nats
+and the operator's hosts); a TURN fallback for the symmetric NATs hole
+punching cannot cross. UPnP-IGD, NAT-PMP and PCP port mapping, which lets
+today's socket carriers activate on many home routers, is built (S10).
+The apps need no setting for `ProvideExtenderWebRtc`, which is on by
+default. A device's signals to an extender ride an ordinary contract to the
+extender's client (S2), so an extender whose provider does not provide
+publicly, or a device out of balance, cannot be signaled; the owner accepted
+this for v1 (S9).
 
 S9. Decisions. The flag on `ExchangeSignals` rather than a new message
 type: the frames already reach the manager through the client's signal
@@ -4352,11 +4593,175 @@ has to be registered on the wire. The carrier dispatched before the header
 is built: with no outer leaf the dial must own the challenge. The shared
 request after the handshake (`extenderStreamRequest`): one A3 exchange for
 tcp and webrtc, so the server's refusals, limits and framing cannot
-diverge. The directory gate rather than a dial-time check: a failed webrtc
-dial would hold the address's other carriers. The answerer on the manager
-rather than a second signal receiver: one receive path, one ownership. The
-uptime fallback from tcp to webrtc rather than one path per address: an
-extender accepted on both is live while either answers.
+diverge. The directory gate rather than a dial-time check: a webrtc
+candidate with no signaling path is never expanded; and a failed webrtc
+dial holds only a webrtc-only address, since a hold is of the whole
+address. The answerer on the manager rather than a second signal receiver:
+one receive path, one ownership. Uptime over every required path an
+address was accepted on, webrtc only once tcp has failed rather than both
+at once: an extender accepted on both is live while either answers, and a
+device whose tcp port answers is not sent an offer every five minutes for
+nothing. The relay on per-client Redis keys (S8) rather than the
+close-request set: an old connect process, which would take a close set's
+items and ignore an offer, never sees one. BLPOP for the answer on the
+ordinary Redis pool rather than the deadline pool, whose eight connections
+a node serve admission and the liveness lease. One dial for the
+activation's webrtc test and the ICE family pinned rather than the family
+check relaxed. Webrtc never in what a client reaches the operator by.
+
+The owner's review of S8 (2026-11-12) settled eight more, all built on the
+same branch:
+
+1. The webrtc test runs only where the tcp path failed or was not offered,
+   never beside a tcp test that may still pass, in the activation and in
+   uptime. The tcp challenge's 5 s share (rather than the whole budget)
+   keeps a black-holed port from leaving webrtc no time, and the webrtc
+   test then has a budget of its own, so the activation probes at most
+   15 s; `refused_carriers` lists the tcp path that failed where webrtc
+   passed, and never an untested webrtc (S8).
+2. A device's signals to an extender ride an ordinary contract from the
+   device to the extender's client (S2): accepted for v1. So an extender
+   whose provider does not provide publicly, or a device out of balance,
+   cannot be signaled over webrtc; the device's other carriers are
+   unaffected, and so are the operator's probes, which signal from the
+   control id, a no-contract peer of every client (S8).
+3. A phone's dial carrier takes the device's p2p budget through its
+   settings: a 128 KiB SCTP window per dial (S8).
+4. `connectctl extender --webrtc` reaching only its own network is fine
+   for a test tool; no change.
+5. A dedicated pub/sub channel wakes the exchange rather than the keyspace
+   notification pattern `{*}w_offer`, which made every exchange process
+   match the notification of every set on Main: one sharded channel per
+   exchange process, named by the residents' registrations, which follows
+   its slot and resubscribes (`server.RunRedisShardSubscription`). The
+   2-pending cap, the ttls, the size bounds and the answer list are as they
+   were. A wake is advisory, which the keyspace event was too: one lost to
+   a resubscribe is made up by the take every listener makes when the
+   subscription starts, and one that goes to a process the client's
+   resident has just left, by the take the resident's new registration
+   makes when the offer was added before it; an offer nobody takes expires
+   with its prober's wait, and the next probe tries again.
+6. A cap on extenders accepted on webrtc without tcp, 100 at first, with
+   its refusal and its metrics (S8); `ExtenderProbeConcurrency` stays 16.
+7. Monitor alert classes on the relay's no_answer and busy shares
+   (SIGNALS.md §28.6).
+8. The prober's ICE checks go only to the answer's candidates on the
+   tested address -- its /32, or the /64 of an ipv6 address, the
+   attribution rule's prefix -- and every other candidate is dropped before
+   any check (S8).
+
+S10. Router port mapping (built 2026-11-11), connect and sdk. A provider
+extender behind a home router has no inbound path on its carriers unless the
+router forwards them, so the role can ask it to. Owner, 2026-11-11: "make it a
+configurable option. the miners can turn it on by default, but the apps should
+turn it off by default." The setting is the sdk's
+(`DeviceLocal.GetProvideExtenderPortMapping`, `SetProvideExtenderPortMapping`,
+on the `Device` interface and through `DeviceRemote`'s rpc), stored per space
+as `.provide_extender_port_mapping`; until the user sets it the device default
+applies, `DeviceLocalSettings.DefaultProvideExtenderPortMapping`: off in
+`DefaultDeviceLocalSettings`, so off on every app (macOS, Windows and Linux
+carry the switch, "Open a port on my router", under the speed tests switch, and
+its description says it opens a port on the router; Android and iOS carry no
+role), and on in the sn miner (`miner.ProviderDeviceSettings`), which
+`URNETWORK_PORT_MAPPING=0` and `provide --no-port-mapping` turn off and
+`provider status` and `provider doctor` report. A changed setting replaces a
+running role, so off removes what the router forwards.
+
+`connect/portmap` asks the router of the host's ipv4 default route, read with
+go-netroute (BSD-3-Clause): PCP (RFC 6887) first, NAT-PMP (RFC 6886) when the
+server answers the PCP request with its own version, then UPnP IGD through
+goupnp (BSD-2-Clause) for the description and the SOAP actions. PCP and
+NAT-PMP are implemented in the package, a few hundred lines with their wire
+formats tested byte for byte: the one NAT-PMP library, jackpal/go-nat-pmp, is
+Apache-2.0, and no MIT or BSD PCP library exists. The first method that maps
+the tcp carrier is used for every carrier; a method that maps only the udp
+ones is undone and the next is tried. Mappings ask for an hour, renew at half
+the lifetime granted (at least a minute apart), and a mapper that maps nothing
+asks again after five minutes, doubling to an hour. Every exchange is bounded:
+three PCP or NAT-PMP sends from 250 ms, a 1.5 s SSDP search, 2 s per UPnP
+request, 10 s for a whole attempt, 3 s to remove everything.
+
+What it may map is narrow. The role asks only for the carriers it holds once
+its binds settle -- tcp 443, and udp 443 and udp 4053 when they bound -- never
+a port it does not hold, since the router would forward it to whatever does,
+and never udp 53. Every mapping forwards to this host's own address. Only the
+gateway is talked to: a PCP or NAT-PMP answer from another source is dropped,
+the SSDP answer must come from the gateway's address, and a UPnP description
+or control url off the gateway is refused, so another device on the lan can
+neither steer a mapping nor make the host request anything elsewhere; the
+http client uses no proxy and follows no redirect. A UPnP router that grants
+only permanent leases (725) is not used, since a mapping that outlives a
+crashed process would later forward to whichever host takes the address. A
+router whose own external address is private or CGNAT is behind another NAT,
+which nothing on it crosses: its mappings are removed and the attempt fails. A
+host with a public ipv4 address maps nothing (`connect.FamilyPublic(4)`), and
+neither does a host whose default route is a tunnel (`connect.
+IsTunnelInterfaceName`), such as an app's own vpn while connected.
+
+The activation offers what the router forwards, to the family it forwards. The
+first post waits for the router's first answer at most 15 s, so a missing or
+broken router delays the first activation by that and nothing else; each ipv4
+post reads the external ports and each ipv6 post offers the bound ones, since
+only ipv4 is mapped (`ExtenderActivatorSettings.FamilyOfferedPorts` and
+`FamilyDnsPorts`, read per family at each post; a post to the plain api url,
+whose family the operator derives, offers the ipv4 ones); a mapping that lands
+or moves later is posted at once (`Reactivate`), and each family's mesh address
+uses the tcp port its post offered. A router may give an external port other
+than 443: PCP and NAT-PMP pick one, and an IGD:2 router answers a conflict (718)
+through AddAnyPortMapping; IGD:1's conflict fails the method. Only ipv4 is
+mapped; a v6 firewall pinhole (PCP or WANIPv6FirewallControl) is not done.
+
+Each address keeps its own ports (built 2026-11-12). The operator stores the
+tcp and udp ports each family's activation was probed on with that family's
+address (`network_extender_address.tcp_port` and `udp_port`, beside its
+`dns_ports`); the uptime and recovery probes dial an address on its own tcp
+port; the lag.dev measurement takes only the addresses that serve tcp on 443;
+and the signed record names an address's own ports where they are not the
+record's (`protocol.ExtenderAddress` `TcpPort`, `UdpPort` and `DnsPorts`,
+fields 4 to 6), which a client's candidate dials (`ExtenderDirectory`). The
+record's own ports stay the extender's latest activation's, so an address on
+them names none, and the record of an extender whose addresses share their
+ports is the record it always was. A reader that predates the fields skips them
+and dials every address on the record's, which is what it did before; an
+address activated before the operator kept its ports reads the extender's.
+Every answer of such an operator says so (`address_ports`,
+`ExtenderActivateResult.AddressPorts`), and a family's post offers its own
+ports only while the last answer did: until then, and to an operator that
+predates it, every post offers the one set of ports, the router's (the family
+seams asked for family 0), since an operator keeping one port per carrier would
+publish each family on the other's. The first post of a pass is the ipv4 one,
+so the ipv6 post of the same pass already offers its own. The order the
+operator and the extenders are deployed in does not matter.
+
+`ExtenderProvideStatus` reports it: `PortMapping` (off, not_needed, mapping,
+mapped, failed), `PortMappingMethod`, `PortMappingExternalIp`, the external
+`PortMappingTcpPort`, `PortMappingUdpPort` and `PortMappingDnsPort`, and
+`PortMappingError`, why nothing is mapped or why a udp carrier is not. The
+apps show `PortMapping` with `PortMappingMethodName` and `PortMappingPorts`,
+the method and the forwarded ports as one text in every language; never
+`PortMappingError`, whose router words can name an address. Tests,
+all in process: `portmap/` against a PCP and NAT-PMP server answered in memory
+and a UPnP IGD:1 and IGD:2 device on httptest, with a clock whose waits the test
+fires (the methods, the fallback, the router's external port, renewal at the
+granted lifetime and a moved port, the retry backoff, removal on close, the
+partial method undone, permanent leases, conflicts, double NAT, urls off the
+gateway, and every request naming only the caller's ports), and the real udp
+exchange and SSDP search on loopback; connect's
+`TestExtenderActivatorOffersTheMappedPorts`, and for the per-address ports
+`net_extender_address_ports_test.go` (the fields' wire numbers, an address
+without them encoding as before, a candidate on its address's ports and on the
+record's without them, each family's post offering its own ports, a carrier
+change compared per family); the sdk role at the device's entry points with a
+NAT-PMP router behind the mapper's seam (`device_local_extender_port_mapping_test.go`:
+off by default, the router's ports in every ipv4 post and ipv4 mesh address
+and the bound ones over ipv6, nothing asked with a public address, the mappings
+removed when the setting turns off and when the role stops, a moved mapping
+posted at once, the space's stored setting read by a device that starts
+later); the operator's record and measurement rule
+(server `controller/extender_address_ports_test.go`, with an activation of
+each family keeping its ports) and its storage, readers and probe targets
+(`model/network_extender_address_ports_test.go`); the miner's default, the
+environment, the flag and the status lines (`sn/miner/port_mapping_test.go`).
 
 ### I. Tests
 
@@ -4458,6 +4863,10 @@ with the database.
 | `POST /network/extender-activate` answer | a key another network holds is refused with the fixed `error` of C2c and no `retry_after_seconds`; old providers read it as any refusal (C2c) |
 | api metrics | stage `owner` on `urnetwork_extender_activations_total` (C2b, C2c) |
 | alt api front and status listener | `X-UR-Forwarded-For` set from the peer; `X-Forwarded-For`, `X-Forwarded-Source-Port` and `X-UR-Request-Buffering` cleared (L1) |
+| `protocol.ExtenderAddress` | `TcpPort`, `UdpPort` and `DnsPorts` added (fields 4 to 6): an address's own ports where they are not the record's; zero and empty take the record's, and a reader that predates them skips them (S10) |
+| `ExtenderActivatorSettings` | `FamilyOfferedPorts` and `FamilyDnsPorts` added, read per family in place of `OfferedPorts` and `DnsPorts`, for family 0 while the operator keeps no address ports (S10) |
+| `POST /network/extender-activate` answer | `address_ports` added: the operator keeps each address's ports; old providers skip it (S10) |
+| `network_extender_address` | `tcp_port` and `udp_port` added, nullable; null is the extender's (S10) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -4613,7 +5022,9 @@ Phase 5b follows 4 because both touch the server.
 
 ## 6. Known limitations
 
-- Extender relay traffic is not attributed or credited. PROXY-protocol
+- The bytes an extender relays, api and control traffic included, are
+  not measured. Extender pay comes from J2/J3 instead: each contract pays
+  every extender recorded on it an equal hop share. PROXY-protocol
   attribution to a dedicated edge port is a later phase.
 - The reverse proxy answers probers behind a self-signed cert; an active
   prober that validates certificates sees a misconfigured host, which is
@@ -4914,6 +5325,11 @@ migration, no services version, no rpc version.
   production does not yet fill. sdk, written and its role tests run: the
   carrier in the role under G2 (S6). Phased per S8, the operator-side
   signaling relay first.
+- **S8, the signaling relay, webrtc acceptance and the dial side
+  (2026-11-11).** connect, server and sdk on `feat/extender-webrtc-s8-1111`,
+  as S8 describes; the server's S5 work of `feat/webrtc-extender` was
+  written again on the probing of connect#230 rather than merged. Held for
+  the owner's release timing.
 
 ## Design note: fingerprint-drift conformance harness (2026-10-07)
 

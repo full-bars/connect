@@ -27,6 +27,11 @@ const (
 	natProviderControlBytes  ByteCount = 32 * 1024
 	natProviderIngressBytes  ByteCount = 32 * 1024
 	natSmtpFlowBytes         ByteCount = 160 * 1024
+	// Fixed accounting rows of the existing callback partition, not batch
+	// policy: two equal slots, a per-operation row, and per-packet wrapping.
+	natProviderTcpReturnSlotBytes            ByteCount = 32 * 1024
+	natProviderPacketOperationFixedBytes     ByteCount = 24 * 1024
+	natProviderPacketOperationPerPacketBytes ByteCount = 512
 )
 
 // A provider prepays 512 KiB + 4 KiB/source (at most 576 KiB):
@@ -40,8 +45,8 @@ const (
 // evidence, diagnostics, mode/priority maps and six leaf tombstones.
 // SMTP, bulk callback scratch and return roots are separately admitted dynamically.
 // With the required 1-KiB stats registration per provider, two providers plus
-// fallback/old/new NATs cost 1922 KiB, leaving 126 KiB of the shared 2-MiB
-// child for useful traffic during generation overlap.
+// fallback/old/new NATs (240 KiB each) cost 1874 KiB, leaving 174 KiB of the
+// shared 2-MiB child for useful traffic during generation overlap.
 func natProviderMemoryByteCount(sourceCount int) ByteCount {
 	return natProviderFixedBytes + ByteCount(sourceCount)*natProviderSourceBytes
 }
@@ -74,7 +79,15 @@ func newNatProviderSecurityPolicy(ctx context.Context, settings *RemoteUserNatPr
 	}
 	dmca := DefaultDmcaSecurityPolicySettings()
 	dmca.MaxFlows = 64
-	return Reverse(NewSecurityPolicy(ctx, DefaultCfaaSecurityPolicySettings(), dmca, DefaultWebStandardSettings(), stats))
+	return newProviderSecurityPolicy(
+		ctx,
+		DefaultCfaaSecurityPolicySettings(),
+		dmca,
+		DefaultWebStandardSettings(),
+		DefaultProviderLocalSecurityPolicySettings(),
+		processProviderLocalNetworks,
+		stats,
+	)
 }
 
 func waitNatProviderSecurityPolicy(policy SecurityPolicy) {
@@ -325,18 +338,45 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
 	sourceId Id,
 	flowCtx context.Context,
 ) (natMemoryReservation, *providerSourceLifecycle, bool) {
+	return self.startReturnMemoryOperationForSourceWithWorkspace(packets, recovery, sourceId, flowCtx, nil)
+}
+
+// Larger batches bring an exclusive witness for the extra 32 KiB already
+// reserved by their socket flow. Every producer still takes one equal 32-KiB
+// provider slot, preserving two-source concurrency and existing waiter order.
+// The caller returns the witness only after the complete callback operation.
+func (self *RemoteUserNatProvider) startReturnMemoryOperationForSourceWithWorkspace(
+	packets [][]byte,
+	recovery receiveRecoveryMode,
+	sourceId Id,
+	flowCtx context.Context,
+	batchWorkspace *tcpReturnBatchWorkspace,
+) (natMemoryReservation, *providerSourceLifecycle, bool) {
 	if self.tcpReturnMemory == nil || !recovery.waitsForProviderReturnAdmission() {
 		memory, admitted := self.startMemoryOperation(providerPacketOperationBytes(packets))
 		return memory, nil, admitted
 	}
-	if len(packets) > natMemoryBatchCount {
-		return natMemoryReservation{}, nil, false
+	maximumPacketBytes := kib(8)
+	maximumOperationBytes := natProviderTcpReturnSlotBytes
+	if self.localUserNat.settings.TcpBufferSettings.MemoryColdWriteBatchSize < len(packets) {
+		if batchWorkspace == nil || batchWorkspace.maximumBatch < len(packets) ||
+			!batchWorkspace.inUse.Load() || batchWorkspace.ctx != flowCtx ||
+			batchWorkspace.ctx.Err() != nil {
+			return natMemoryReservation{}, nil, false
+		}
+		// The added flow scratch pays for legacy wrapping and larger callback
+		// descriptors. The bounded packet roots fit the other 32 KiB; their
+		// original owners remain charged to the flow's queue/held-root claim.
+		maximumPacketBytes = natProviderTcpReturnSlotBytes
+		maximumOperationBytes = 2 * natProviderTcpReturnSlotBytes
 	}
 	bytes := ByteCount(0)
 	for _, packet := range packets {
 		bytes += natPacketMemoryByteCount(packet)
 	}
-	if bytes > kib(8) || self.ctx.Err() != nil ||
+	if bytes > maximumPacketBytes ||
+		providerPacketOperationBytes(packets) > maximumOperationBytes ||
+		self.ctx.Err() != nil ||
 		flowCtx != nil && flowCtx.Err() != nil || !self.memoryOperations.start() {
 		return natMemoryReservation{}, nil, false
 	}
@@ -363,7 +403,7 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
 		self.memoryOperations.finish()
 		return natMemoryReservation{}, nil, false
 	}
-	if reserved, waiter := self.tcpReturnMemory.tryReserveOrQueue(kib(32)); !reserved {
+	if reserved, waiter := self.tcpReturnMemory.tryReserveOrQueue(natProviderTcpReturnSlotBytes); !reserved {
 		select {
 		case <-self.ctx.Done():
 		case <-sourceDone:
@@ -382,7 +422,7 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
 			return natMemoryReservation{}, nil, false
 		}
 	}
-	memory := natMemoryReservation{budget: self.tcpReturnMemory, bytes: kib(32)}
+	memory := natMemoryReservation{budget: self.tcpReturnMemory, bytes: natProviderTcpReturnSlotBytes}
 	// An immediate grant also races cancellation; do not pass a retired
 	// source/flow into the callback just because its workspace was free.
 	if ownersCanceled() {
@@ -395,9 +435,9 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
 }
 
 func providerPacketOperationBytes(packets [][]byte) ByteCount {
-	bytes := kib(24)
+	bytes := natProviderPacketOperationFixedBytes
 	for _, packet := range packets {
-		bytes = addReceiveQueueByteCount(bytes, natPacketMemoryByteCount(packet)+512)
+		bytes = addReceiveQueueByteCount(bytes, natPacketMemoryByteCount(packet)+natProviderPacketOperationPerPacketBytes)
 	}
 	return bytes
 }

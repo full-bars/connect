@@ -251,8 +251,9 @@ type AuthNetworkClientError struct {
 	ClientLimitExceeded bool `json:"client_limit_exceeded"`
 	// the network is at its PLAN's limit for concurrent connected clients, rather
 	// than a hard cap. The client should prompt the user to upgrade (or, for an
-	// agent, pay inline over x402 -- the same request answers 402 with payment
-	// terms). Distinct from ClientLimitExceeded, which no upgrade can lift.
+	// agent, pay inline over x402 -- a request that asks with `X-UR-X402: 1` is
+	// answered 402 with payment terms instead). Distinct from
+	// ClientLimitExceeded, which no upgrade can lift.
 	UpgradeRequired bool   `json:"upgrade_required,omitempty"`
 	Message         string `json:"message"`
 }
@@ -401,6 +402,12 @@ type FindProviders2Args struct {
 	// answered from its region, then its country, and each provider found
 	// there carries its `Match`. An older server answers exactly either way.
 	Strict bool `json:"strict,omitempty"`
+	// Puts the request in selector mode (server FP2-PROTOCOL.md §5): the
+	// server classifies providers by capability instead of excluding them,
+	// answers each with its labels and echoes the selectors it applied. nil,
+	// as before the field, is legacy mode: exactly the answer an older client
+	// gets. An older server ignores it and does not echo it.
+	Select *FindProvidersSelect `json:"select,omitempty"`
 }
 
 type FindProviders2Result struct {
@@ -410,6 +417,10 @@ type FindProviders2Result struct {
 	// leaves it to the host's setting, and absent, as from an older server,
 	// overrides nothing. See MultiClientGeneratorWithStrictWindowHandoverOverride.
 	WindowStrictHandover *bool `json:"window_strict_handover,omitempty"`
+	// The selectors the server applied, its defaults filled in. Present only
+	// in selector mode, so its absence from the answer to a request that
+	// carried `Select` marks a server that predates selector mode.
+	Select *FindProvidersSelect `json:"select,omitempty"`
 }
 
 type FindProvidersProvider struct {
@@ -435,6 +446,13 @@ type FindProvidersProvider struct {
 	// for a provider of the requested target itself, a provider named by
 	// client id, a `Strict` request, and from an older server.
 	Match string `json:"match,omitempty"`
+	// The provider's labels on the ip and protocol axes. Selector mode only,
+	// on every provider; nil in legacy mode and from an older server.
+	Capabilities *ProviderCapabilities `json:"capabilities,omitempty"`
+	// 1 for a tcp provider given to a dualproto request that its requested
+	// protocol could not fill (server FP2-PROTOCOL.md §6.3); its tier already
+	// carries the overflow offset. Selector mode only; 0 otherwise.
+	OverflowStep int `json:"overflow_step,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {

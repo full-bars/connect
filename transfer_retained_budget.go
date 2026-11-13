@@ -34,8 +34,11 @@ func (self *transferItem) reserveMemoryWithCredit(budget *TransferMemoryBudget, 
 	if self.memoryBudget != nil {
 		panic("transfer owner already has a memory reservation")
 	}
+	root := budget.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
 	credit := min(max(0, *creditByteCount), byteCount)
-	if remainder := byteCount - credit; 0 < remainder && !budget.TryReserve(remainder) {
+	if remainder := byteCount - credit; 0 < remainder && !budget.tryReserveWithLock(remainder) {
 		return false
 	}
 	*creditByteCount -= credit
@@ -103,8 +106,14 @@ func (self *sendItem) reserveFrameRewrite(frameByteCount ByteCount, frameCount i
 // A promised predecessor draws first on the reservation its committed
 // successor made for it (see transfer_receive_hold_promise.go).
 func (self *ReceiveSequence) reserveHeldItem(item *receiveItem, promised bool) bool {
+	if item.noBudget {
+		return true
+	}
 	if !self.receiveQueue.lifetimeBudget {
 		return true
+	}
+	if item.memoryBudget != nil {
+		return item.memoryBudget == self.receiveQueue.budget
 	}
 	if promised {
 		return item.reserveMemoryWithCredit(self.receiveQueue.budget, item.QueueByteCount(), &self.holdPromise.reservedByteCount)
@@ -144,6 +153,9 @@ func (self *SendSequence) retainedSendPackByteCountWithContractBytes(pack *SendP
 }
 
 func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
+	if pack.NoBudget {
+		return true
+	}
 	if pack.logicalGroup && self.contractMultiRouteWriter != nil {
 		// Eligibility and materialization must describe the same H1 chunk.
 		// A first selection without a writer is rechecked atomically after

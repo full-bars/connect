@@ -44,7 +44,6 @@ func (v *lockCheckingVerbose) Enabled() bool {
 }
 func (v *lockCheckingVerbose) Info(...any)          {}
 func (v *lockCheckingVerbose) Infof(string, ...any) {}
-
 // A client whose receive loop reads the frames written to the returned route
 // and whose receive callback reports the content of each simple message
 // delivered from peerId. Closing the client and returning undelivered route

@@ -842,6 +842,11 @@ func (self *clientSignalReceiver) dequeue() *receivedSignalFrame {
 }
 
 func DefaultWebRtcSettings() *WebRtcSettings {
+	return defaultWebRtcSettingsWithMemoryTarget(MemoryBudget())
+}
+
+// The explicit client factory sizes peer admission from its own target.
+func defaultWebRtcSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *WebRtcSettings {
 	return &WebRtcSettings{
 		// FIXME
 		// SendBufferSize: mib(1),
@@ -851,7 +856,7 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// queues coexist within the client memory target — each new
 		// connection reserves this amount from the shared client budget
 		// (see MemoryBudget)
-		ReceiveBufferSize: MemoryScaledByteCount(kib(512), kib(256)),
+		ReceiveBufferSize: MemoryTargetScaledByteCount(memoryTargetByteCount, kib(512), kib(256)),
 		// Pion's receive MTU is a per-packet demux buffer, not the SCTP
 		// receive window. Its SCTP path MTU stays below Ethernet's 1500-byte
 		// packet size, so the former 4 KiB value only enlarged persistent and
@@ -866,7 +871,7 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// by the memory budget). At the cap new p2p setups are refused and
 		// those streams stay on the platform transport; the p2p transport
 		// retries with backoff, so capacity recovers as connections close.
-		MaxPeerConnectionCount: MemoryScaledCount(32, 8),
+		MaxPeerConnectionCount: memoryTargetScaledCount(memoryTargetByteCount, 32, 8),
 		DisconnectedTimeout:    30 * time.Second,
 		FailedTimeout:          30 * time.Second,
 		// Pion's two-second default halves idle STUN/radio wakeups versus the
@@ -904,7 +909,9 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// ICE/DTLS/SRTP association. Transfer frames sent on that lane avoid
 		// SCTP's duplicate reliability and head-of-line behavior; an older peer
 		// simply omits the codec and continues on the data channel.
-		EnableDatagramFastPath: true,
+		EnableDatagramFastPath:         true,
+		DatagramFastPathWarmupInterval: 25 * time.Millisecond,
+		DatagramFastPathWarmupTimeout:  5 * time.Second,
 		// At one gigabit, a 64-message queue covers only about 1.5 ms of
 		// ordinary two-packet Transfer messages. That made a normal scheduler
 		// turn or short GC pause look like network loss on the device receive
@@ -1013,6 +1020,13 @@ type WebRtcSettings struct {
 	// (net.core.rmem_max/wmem_max on Linux). Zero keeps the kernel default.
 	UdpSocketBufferByteCount          int
 	DatagramFastPathReceiveBufferSize int
+	// DatagramFastPathWarmupInterval spaces readiness probes; non-positive
+	// disables probes. The default tolerates brief setup loss without an idle
+	// data-plane heartbeat. Replies remain available until peer cancellation.
+	DatagramFastPathWarmupInterval time.Duration
+	// DatagramFastPathWarmupTimeout bounds periodic readiness probes; non-positive
+	// disables probes. The default gives ICE/DTLS/SRTP setup five seconds.
+	DatagramFastPathWarmupTimeout time.Duration
 	// DatagramFastPathWriteQueueSize bounds the native WebRTC socket's copied
 	// userspace send buffer. A full queue blocks the carrier writer, preserving
 	// backpressure instead of dropping before the kernel socket.
@@ -1058,6 +1072,13 @@ type WebRtcSettings struct {
 	// loopback-capable connect past the test deadline at STUN check pacing.
 	// Production callers leave it false.
 	UseLoopbackOnlyIceInterfaces bool
+	// IceIpVersion, 4 or 6, gathers candidates of that family alone, so every
+	// ICE pair is of it. The operator's webrtc probe of an extender
+	// activation pins the family the activation was posted for, since the
+	// extender's forward follows the family of the pair it was reached on
+	// (EXTENDER.md A7, S5, S8). 0, the default, and any other value gather
+	// both. Browser WebRTC ignores it.
+	IceIpVersion int
 
 	// Network, when set, supplies native Pion's socket network. Tests use it
 	// to put ICE, DTLS, SCTP, and SRTP below a userspace impairment model.
@@ -1661,7 +1682,28 @@ func (self *WebRtcManager) rememberNetworkPeerLocked(peerId Id, now time.Time) (
 		delete(self.networkPeers, oldestPeerId)
 	}
 	self.networkPeers[peerId] = now
+	// the peer's live associations may now apply any remote candidate
+	// (transport_p2p_webrtc_candidate.go)
+	for key, conn := range self.peerConns {
+		if key.PeerId == peerId {
+			conn.trustedNetworkPeer.Store(true)
+		}
+	}
 	return !exists
+}
+
+// Whether a peer is a remembered same-network peer, or has a live association
+// already trusted as one. Call with stateLock held.
+func (self *WebRtcManager) trustedNetworkPeerLocked(peerId Id) bool {
+	if _, trusted := self.networkPeers[peerId]; trusted {
+		return true
+	}
+	for key, conn := range self.peerConns {
+		if key.PeerId == peerId && conn.ctx.Err() == nil && conn.trustedNetworkPeer.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 func (self *WebRtcManager) hasLivePeerConnLocked(peerId Id) bool {
@@ -2773,6 +2815,7 @@ func (self *WebRtcManager) newP2pConn(
 	}
 	conn.priorityUntil = priorityUntil
 	conn.networkPeer = networkPeer
+	conn.trustedNetworkPeer.Store(self.trustedNetworkPeerLocked(key.PeerId))
 	conn.admissionBudget = reserveBudget
 	conn.admissionByteCount = reserveByteCount
 	conn.admissionOwner = admissionOwner
@@ -3001,6 +3044,11 @@ type peerConn struct {
 	// admission pool back this association so a late authenticated Network
 	// promotion can replace a public-window connection exactly once.
 	networkPeer bool
+	// trustedNetworkPeer is set once the peer is an authenticated
+	// same-network peer (ProvideMode_Network, the user's own device): its
+	// remote ICE candidates are applied as offered, while any other peer's
+	// are checked first (transport_p2p_webrtc_candidate.go). Never cleared.
+	trustedNetworkPeer atomic.Bool
 	// admissionBudget and admissionByteCount are immutable after manager
 	// admission. The pointer is the true resource-domain identity: SDK window
 	// clients intentionally share one budget between public fallback and
@@ -3812,6 +3860,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		}
 		// the answer built below accepts the delay header this batch offers
 		self.remoteTransportDelayVersion.Store(transportDelayVersion)
+		offer.SDP = filterRemoteSdpCandidates(offer.SDP, self.remoteCandidatesTrusted(), processProviderLocalNetworks)
 		if err = self.pc.SetRemoteDescription(offer); err != nil {
 			return
 		}
@@ -3860,6 +3909,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 			return
 		}
 		self.remoteTransportDelayVersion.Store(transportDelayVersion)
+		answer.SDP = filterRemoteSdpCandidates(answer.SDP, self.remoteCandidatesTrusted(), processProviderLocalNetworks)
 		if err = self.pc.SetRemoteDescription(answer); err != nil {
 			return
 		}
@@ -3961,8 +4011,22 @@ func (self *peerConn) bufferRemoteIceCandidateLocked(
 	self.remoteIceCandidateBufferBytes += byteCount
 }
 
+// Whether this association applies its peer's candidates as offered: the peer
+// is a same-network peer, or the caller owns the ICE topology (tests).
+func (self *peerConn) remoteCandidatesTrusted() bool {
+	return self.trustedNetworkPeer.Load() || self.settings.callerOwnsIceTopology()
+}
+
 // signalLock must be held.
 func (self *peerConn) addRemoteIceCandidateLocked(candidate webrtc.ICECandidateInit) {
+	// a peer that is not a same-network peer may not point this host's
+	// checks at itself or its lan (transport_p2p_webrtc_candidate.go)
+	if !remoteIceCandidateAllowed(candidate.Candidate, self.remoteCandidatesTrusted(), processProviderLocalNetworks) {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[peerconn]remote ICE candidate refused: not a public address of another host\n")
+		}
+		return
+	}
 	// A malformed individual candidate should not discard a valid SDP
 	// negotiation or other paths. Pion also treats several unsupported
 	// candidate forms as a deliberate no-op.

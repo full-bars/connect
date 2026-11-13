@@ -51,14 +51,27 @@ func synRetryReadyCapacity(parent *RemoteUserNatMultiClient, update *multiClient
 	}
 	if parent != nil && parent.settings != nil {
 		capacity = max(capacity, parent.settings.MultiRaceClientCount, parent.settings.MultiRaceDegradedClientCount, parent.settings.WindowSizeLimit)
+		field := 0
 		for _, settings := range parent.settings.WindowSizes {
-			capacity = max(capacity, settings.WindowSizeMin, settings.WindowSizeMax, settings.WindowSizeHardMax, settings.FixedWindowSize)
+			field = max(field, settings.WindowSizeMin, settings.WindowSizeMax, settings.WindowSizeHardMax, settings.FixedWindowSize)
 		}
+		// the limited window's exits join every selected window's field
+		// (server FP2-PROTOCOL.md §7.5), at the configured fraction
+		if _, limited := parent.windows[WindowTypeLimited]; limited {
+			field += limitedWindowSize(limitedSizing{
+				enabled:    true,
+				fraction:   parent.settings.LimitedWindowSizeFraction,
+				sizeMax:    parent.settings.LimitedWindowSizeMax,
+				targetSize: field,
+				hardMax:    field,
+			}).WindowSizeMax
+		}
+		capacity = max(capacity, field)
 	}
 	return capacity
 }
 
-func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientChannelUpdate, source *SendSequence, serial uint64, sequence uint32, capacity int) *tcpSynRetryReadiness {
+func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientChannelUpdate, source *SendSequence, serial uint64, sequence uint32, capacity int, noBudget ...bool) *tcpSynRetryReadiness {
 	if parent == nil || parent.flowReaperDone == nil {
 		return nil
 	}
@@ -67,7 +80,7 @@ func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientC
 		return nil
 	}
 	bytes := addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(unsafe.Sizeof(tcpSynRetryReadiness{}))), retainedMessageCapacity(ByteCount(capacity*slotBytes)))
-	credit, ok := source.reserveRetainedControlMemory(bytes)
+	credit, ok := source.reserveRetainedControlMemory(bytes, noBudget...)
 	if !ok {
 		return nil
 	}
@@ -105,6 +118,11 @@ func (ready *tcpSynRetryReadiness) release() {
 // Selection publishes the actual attempt field without changing its race.
 func (group *parsedPacketGroup) noteSynRetryReadinessWidth(width int) {
 	if !group.isSynRetry() {
+		if request := group.synRetry; request != nil && request.openingSerial != 0 {
+			request.update.stateLock.Lock()
+			request.openingWidth = max(request.openingWidth, width)
+			request.update.stateLock.Unlock()
+		}
 		return
 	}
 	update := group.synRetry.update
@@ -137,7 +155,7 @@ func (group *parsedPacketGroup) prepareSynRetryReadinessCapacity(source *SendSeq
 		return
 	}
 	parent := update.sequenceParent
-	fresh := newSynRetryReadiness(parent, update, source, owner.serial, owner.sequence, width)
+	fresh := newSynRetryReadiness(parent, update, source, owner.serial, owner.sequence, width, owner.credit != nil && owner.credit.noBudget)
 	if fresh == nil || old != nil && old.indexed.Load() {
 		owner.readinessOverflow = true
 		if parent != nil {
@@ -215,13 +233,15 @@ func (self *RemoteUserNatMultiClient) armSynRetryReadiness(owner *tcpSynRetry) {
 	if hook := self.beforeSynRetryReadinessArmForTest; hook != nil {
 		hook(owner.update)
 	}
+	defer owner.update.releaseSynRetryMemory()
 	self.stateLock.Lock()
 	update := owner.update
 	update.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	defer update.stateLock.Unlock()
-	if self.ctx.Err() != nil || ready.closed.Load() || self.affinityUpdateWithLock(update.ipPath) != update || self.affinityTransitions[update] != nil || !owner.validWithLock(update) || owner.queued || owner.readinessOverflow || update.client.Load() != nil || ready.attemptEpoch != update.sequenceAdmissionEpoch {
+	if self.ctx.Err() != nil || ready.closed.Load() || self.affinityUpdateWithLock(update.ipPath) != update || self.affinityTransitions[update] != nil || !owner.validWithLock(update) || owner.queued || owner.readinessOverflow || !owner.synRetrySelectionCurrentWithLock(update) || ready.attemptEpoch != update.sequenceAdmissionEpoch {
 		ready.clearSlotsWithLock()
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 		return
 	}
 	order := uint64(0)
@@ -256,6 +276,8 @@ func (self *RemoteUserNatMultiClient) armSynRetryReadiness(owner *tcpSynRetry) {
 	if watched {
 		ready.references.Add(1)
 		self.appendSynRetryReadinessWithLock(ready)
+	} else {
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 	}
 }
 
@@ -330,7 +352,7 @@ func (ready *tcpSynRetryReadiness) detach() {
 func (self *RemoteUserNatMultiClient) synRetryReadinessCurrentWithLock(ready *tcpSynRetryReadiness) (*tcpSynRetry, bool) {
 	update := ready.update
 	owner := update.synRetry
-	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && update.client.Load() == nil && update.sequenceAdmissionEpoch == ready.epoch
+	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && owner.synRetrySelectionCurrentWithLock(update) && update.sequenceAdmissionEpoch == ready.epoch
 	if ready.raceOrder == 0 {
 		valid = valid && update.sequenceSourceOrder == ready.sourceOrder
 	}
@@ -358,13 +380,14 @@ func (self *RemoteUserNatMultiClient) drainSynRetryReadiness() {
 }
 
 func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetryReadiness) {
+	update := ready.update
+	defer update.releaseSynRetryMemory()
 	keep := false
 	defer func() {
 		if !keep {
 			ready.release()
 		}
 	}()
-	update := ready.update
 	self.stateLock.Lock()
 	update.stateLock.Lock()
 	owner, current := self.synRetryReadinessCurrentWithLock(ready)
@@ -397,6 +420,9 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	}
 	if grantedSource != nil || !valid || !waiting {
 		ready.clearSlotsWithLock()
+		if grantedSource == nil {
+			update.retireUnwatchedSynOpeningWithLock(owner, ready)
+		}
 	} else {
 		self.appendSynRetryReadinessWithLock(ready)
 		keep = true
@@ -418,6 +444,8 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	}
 	if valid && grantedSource.ctx.Err() == nil {
 		self.queueSynRetryWithLock(owner, ready.raceOrder)
+	} else {
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 	}
 	update.stateLock.Unlock()
 	self.stateLock.Unlock()

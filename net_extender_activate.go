@@ -161,6 +161,14 @@ type ExtenderActivateResult struct {
 	// The refusal kind an extender can act on, when supplied by the operator.
 	// An operator that predates the field says it in Error alone.
 	Refusal string `json:"refusal,omitempty"`
+	// whether the operator keeps each address's ports (S10): it stores the
+	// ports a post offers with that family's address alone and signs them per
+	// address, so each family's post may offer its own
+	// (ExtenderActivatorSettings.FamilyOfferedPorts). On every answer of an
+	// operator that does. False from one that predates it, which keeps one port
+	// per carrier for every address of an extender, so a post there offers the
+	// same ports whatever its family.
+	AddressPorts bool `json:"address_ports,omitempty"`
 }
 
 // One optional carrier this extender was offered and did not answer, with the
@@ -381,6 +389,27 @@ type ExtenderActivatorSettings struct {
 	UdpPort int
 	DnsPort int
 	DnsTld  string
+	// OfferedPorts, when set, is read at each post and replaces TcpPort, UdpPort
+	// and DnsPort, each a zero of it leaving that one as it is: the ports a
+	// router's mapping forwards to this extender, which the router picks and may
+	// change while the role runs (S10, the port mapping, connect/portmap). DnsPorts
+	// answers the mapped dns ports beside it. It runs on the loop goroutine and
+	// must not block. FamilyOfferedPorts replaces it when set.
+	OfferedPorts func() (tcpPort int, udpPort int, dnsPort int)
+	// FamilyOfferedPorts, when set, is read at each post in place of OfferedPorts,
+	// with the family the post activates: a router's mapping forwards the carriers
+	// of the family behind it, ipv4, on the ports it picks, while the other
+	// family's address answers on the bound ports, and an operator that keeps
+	// each address's ports signs each address's own (S10; protocol.
+	// ExtenderAddress TcpPort, UdpPort, DnsPorts). It is asked for family 0 --
+	// the one set of ports every family offers -- for a post to the plain api
+	// url, whose family the operator derives from the caller address, and for
+	// every post until an answer says the operator keeps each address's ports
+	// (ExtenderActivateResult.AddressPorts): one that keeps one port per carrier
+	// for the extender would otherwise publish one family on the other's ports.
+	// A zero port leaves the configured one. FamilyDnsPorts answers the dns
+	// ports beside it. It runs on the loop goroutine and must not block.
+	FamilyOfferedPorts func(ipVersion int) (tcpPort int, udpPort int, dnsPort int)
 
 	// The carriers that are listening right now (G2). Only these are offered,
 	// so a carrier whose bind failed is never probed. Nil offers none, which
@@ -392,6 +421,12 @@ type ExtenderActivatorSettings struct {
 	// The dns ports that are listening right now (L2), which is what the
 	// operator probes and the record lists. Nil offers DnsPort alone.
 	DnsPorts func() []int
+	// FamilyDnsPorts, when set, is read in place of DnsPorts with the family a
+	// post activates, or whose standing post a carrier change is compared with,
+	// and asked for family 0 as FamilyOfferedPorts is: the dns ports that
+	// family's address is reached on. Nil or empty offers DnsPort alone. It runs
+	// on the loop goroutine and must not block.
+	FamilyDnsPorts func(ipVersion int) []int
 
 	// The directory the signed record and the bootstrap records are applied
 	// into (C2, E1). It is also where a revocation of this extender's own key
@@ -615,6 +650,11 @@ type ExtenderActivator struct {
 	// true when neither family api url is set, so one post per cycle goes to
 	// the plain api url and the answer names the family it activated
 	fallback bool
+	// set once the operator refused a list naming the webrtc carrier as an
+	// unknown carrier, which an operator that predates the carrier does before
+	// it probes anything (EXTENDER.md S8): every later post leaves the carrier
+	// off, so the socket carriers still activate there
+	webRtcUnknown atomic.Bool
 
 	stateLock sync.Mutex
 	version   uint64
@@ -639,6 +679,12 @@ type ExtenderActivator struct {
 	// other. Both are read and written by the loop goroutine alone.
 	extenderId          Id
 	measurementFollowUp bool
+
+	// whether the operator's last answer said it keeps each address's ports
+	// (ExtenderActivateResult.AddressPorts, S10), which is when a family's post
+	// offers the family's own (portsFamily). Read and written by the loop
+	// goroutine alone.
+	addressPorts bool
 
 	// The schedule of each family (G3), keyed by ip version, or by 0 for the
 	// one post a cycle of the fallback mode; and the address the caller address
@@ -1338,9 +1384,9 @@ func (self *ExtenderActivator) takeCarriersChanged() bool {
 // less than is serving now (CarriersChanged). A sooner post stands.
 func (self *ExtenderActivator) scheduleFamiliesMissingACarrier(now time.Time) {
 	carriers := self.carriers()
-	dnsPorts := self.dnsPorts()
-	for _, schedule := range self.schedules {
-		if !schedule.missesACarrier(carriers, dnsPorts) {
+	for key, schedule := range self.schedules {
+		// each family against the dns ports its own post offers (FamilyDnsPorts)
+		if !schedule.missesACarrier(carriers, self.dnsPorts(key)) {
 			continue
 		}
 		postTime := now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
@@ -1362,11 +1408,10 @@ func (self *ExtenderActivator) scheduleFamiliesMissingACarrier(now time.Time) {
 // indefinitely, where the tick is one a day.
 func (self *ExtenderActivator) skipCarrierPostsNotOwed(now time.Time) {
 	carriers := self.carriers()
-	dnsPorts := self.dnsPorts()
-	for _, schedule := range self.schedules {
+	for key, schedule := range self.schedules {
 		if schedule.owedOnlyForACarrier() &&
 			!now.Before(schedule.nextActivateTime) &&
-			!schedule.missesACarrier(carriers, dnsPorts) {
+			!schedule.missesACarrier(carriers, self.dnsPorts(key)) {
 			schedule.nextActivateTime = schedule.carrierTickTime
 			schedule.carrierPostTime = time.Time{}
 			schedule.carrierTickTime = time.Time{}
@@ -1560,23 +1605,89 @@ func (self *ExtenderActivator) byJwt() string {
 	return self.settings.ByJwt()
 }
 
-// The dns ports this extender is listening on, ascending (L2). Nil when the
-// caller offers none, which leaves the operator on DnsPort alone.
+// The carriers that are listening right now (G2), none when the caller offers
+// none.
 func (self *ExtenderActivator) carriers() []string {
 	if self.settings.Carriers == nil {
 		return []string{}
 	}
-	return self.settings.Carriers()
+	carriers := self.settings.Carriers()
+	if self.webRtcUnknown.Load() {
+		carriers = extenderActivateWithoutWebRtc(carriers)
+	}
+	return carriers
 }
 
-func (self *ExtenderActivator) dnsPorts() []int {
-	if self.settings.DnsPorts == nil {
+// The carriers less the webrtc carrier, a new list.
+func extenderActivateWithoutWebRtc(carriers []string) []string {
+	return slices.DeleteFunc(slices.Clone(carriers), func(carrier string) bool {
+		return carrier == ExtenderCarrierWebRtc
+	})
+}
+
+// The refusal of an operator that predates the webrtc carrier for a list that
+// names it (EXTENDER.md S8): its carrier check refuses any carrier it does not
+// know, by name, before it probes or spends anything.
+const extenderActivateUnknownWebRtcCarrierError = `unknown carrier "webrtc"`
+
+// The carrier ports a post offers: OfferedPorts' where it answers one, else the
+// configured port.
+//
+// FamilyOfferedPorts takes OfferedPorts' place when it is set, asked for the
+// family posted, 0 for the plain api url's (S10, portsFamily).
+func (self *ExtenderActivator) offeredPorts(ipVersion int) (tcpPort int, udpPort int, dnsPort int) {
+	tcpPort, udpPort, dnsPort = self.settings.TcpPort, self.settings.UdpPort, self.settings.DnsPort
+	var offeredTcpPort, offeredUdpPort, offeredDnsPort int
+	switch {
+	case self.settings.FamilyOfferedPorts != nil:
+		offeredTcpPort, offeredUdpPort, offeredDnsPort = self.settings.FamilyOfferedPorts(self.portsFamily(ipVersion))
+	case self.settings.OfferedPorts != nil:
+		offeredTcpPort, offeredUdpPort, offeredDnsPort = self.settings.OfferedPorts()
+	default:
+		return
+	}
+	if 0 < offeredTcpPort {
+		tcpPort = offeredTcpPort
+	}
+	if 0 < offeredUdpPort {
+		udpPort = offeredUdpPort
+	}
+	if 0 < offeredDnsPort {
+		dnsPort = offeredDnsPort
+	}
+	return
+}
+
+// The dns ports a post of the family offers, ascending (L2), 0 for the plain
+// api url's: FamilyDnsPorts' (portsFamily), else DnsPorts'. Nil when the caller
+// offers none, which leaves the operator on DnsPort alone.
+func (self *ExtenderActivator) dnsPorts(ipVersion int) []int {
+	var dnsPorts []int
+	switch {
+	case self.settings.FamilyDnsPorts != nil:
+		dnsPorts = self.settings.FamilyDnsPorts(self.portsFamily(ipVersion))
+	case self.settings.DnsPorts != nil:
+		dnsPorts = self.settings.DnsPorts()
+	default:
 		return nil
 	}
-	if dnsPorts := orderedDnsPorts(self.settings.DnsPorts()); 0 < len(dnsPorts) {
+	if dnsPorts = orderedDnsPorts(dnsPorts); 0 < len(dnsPorts) {
 		return dnsPorts
 	}
 	return nil
+}
+
+// The family whose ports a post of the family offers (S10): its own once the
+// operator's last answer said it keeps each address's ports, else 0, the one
+// set of ports every family offers. An operator that keeps one port per
+// carrier for the extender takes the latest post's for every address, so
+// families that offered their own would each publish the other on the wrong
+// port.
+func (self *ExtenderActivator) portsFamily(ipVersion int) int {
+	if self.addressPorts {
+		return ipVersion
+	}
+	return 0
 }
 
 // What one post, or one family's turn in a pass, came to.
@@ -1660,7 +1771,9 @@ type extenderActivateAnswer struct {
 // own on it when it can (OnRefused), and a trigger still posts at once.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	carriers := self.carriers()
-	dnsPorts := self.dnsPorts()
+	// the dns ports each family's post offered, which a router's mapping may
+	// make differ by family (FamilyDnsPorts)
+	keyDnsPorts := map[int][]int{}
 	// a pass forced to carry the measurement request is followed by no
 	// other, so a request that keeps missing cannot hold the loop (C4)
 	followUp := self.measurementFollowUp
@@ -1670,10 +1783,13 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	for i, key := range due {
+		// read at the post, after the answers before it, which say whether the
+		// operator keeps each address's ports (portsFamily)
+		keyDnsPorts[key] = self.dnsPorts(key)
 		if self.fallback {
-			answers[i] = self.activateFallback(carriers, dnsPorts, now)
+			answers[i] = self.activateFallback(carriers, keyDnsPorts[key], now)
 		} else {
-			answers[i] = self.activateFamily(key, carriers, dnsPorts, measurementCarried, now)
+			answers[i] = self.activateFamily(key, carriers, keyDnsPorts[key], measurementCarried, now)
 		}
 		measurementCarried = measurementCarried || answers[i].carried
 	}
@@ -1698,7 +1814,7 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		case outcome == extenderActivateActivated:
 			schedule.tick(now, self.settings, answer.renewal)
 			schedule.postedCarriers = carriers
-			schedule.postedDnsPorts = dnsPorts
+			schedule.postedDnsPorts = keyDnsPorts[key]
 			activated = append(activated, key)
 		case outcome == extenderActivateSkipped:
 			schedule.recheck(now, self.settings)
@@ -2006,11 +2122,13 @@ func (self *ExtenderActivator) activateUrl(
 	now time.Time,
 ) extenderActivateAnswer {
 	runStartTime := self.settings.Run.StartTime.UTC()
+	// the ports of the family posted, 0 for the plain api url's (S10)
+	tcpPort, udpPort, dnsPort := self.offeredPorts(ipVersion)
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
-		TcpPort:             self.settings.TcpPort,
-		UdpPort:             self.settings.UdpPort,
-		DnsPort:             self.settings.DnsPort,
+		TcpPort:             tcpPort,
+		UdpPort:             udpPort,
+		DnsPort:             dnsPort,
 		DnsPorts:            dnsPorts,
 		DnsTld:              self.settings.DnsTld,
 		Carriers:            carriers,
@@ -2067,9 +2185,26 @@ func (self *ExtenderActivator) activateUrl(
 		self.recordFailure(ipVersion, now, "the operator sent no activation result", false, duration)
 		return extenderActivateAnswer{outcome: extenderActivateFailed}
 	}
+	if !result.Activated && result.Error == extenderActivateUnknownWebRtcCarrierError &&
+		slices.Contains(carriers, ExtenderCarrierWebRtc) {
+		// an operator that predates the webrtc carrier (S8): it probed and
+		// spent nothing, so the same post goes again at once without the
+		// carrier, and no later post names it
+		self.webRtcUnknown.Store(true)
+		self.log.Infof("[extender]activate v%d: the operator predates the webrtc carrier, posting without it\n", ipVersion)
+		withoutWebRtc := extenderActivateWithoutWebRtc(carriers)
+		if message := extenderActivateCarrierFailure(withoutWebRtc); message != "" {
+			self.recordCarrierHeld(ipVersion, now, message)
+			return extenderActivateAnswer{outcome: extenderActivateCarrierHeld}
+		}
+		return self.activateUrl(ipVersion, apiUrl, withoutWebRtc, dnsPorts, measurementCsr, now)
+	}
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)
 	}
+	// every answer says whether the operator keeps each address's ports, which
+	// the next post's ports follow (portsFamily, S10)
+	self.addressPorts = result.AddressPorts
 	if !result.Activated {
 		message := activationLogText(result.Error, jwt, apiUrl)
 		if message == "" {
@@ -2085,6 +2220,9 @@ func (self *ExtenderActivator) activateUrl(
 		// timings are the only thing that tells them apart (connect#230).
 		// Silent from an operator that predates probe_steps.
 		self.logProbeSteps(ipVersion, result.ProbeSteps)
+		if 0 < len(result.ProbeSteps) {
+			self.log.Infof("[extender]activate v%d probe = %s\n", ipVersion, extenderActivateProbeStepsText(result.ProbeSteps))
+		}
 		self.recordFailure(ipVersion, now, message, true, duration)
 		if self.settings.OnRefused != nil {
 			self.settings.OnRefused(ipVersion, result)
@@ -2134,6 +2272,9 @@ func (self *ExtenderActivator) activateUrl(
 			}
 		}
 		self.log.Infof("🌉⚠️ [extender] %s is active, but the platform left out %s after its probes. Check the host firewall and any cloud security group; the next renewal will retry. Probe details: %s\n", extenderFamilyName(ipVersion), strings.Join(leftOut, ", "), activationLogText(text, jwt, apiUrl))
+		// an optional carrier the probe left out is not published, and the
+		// activation passing says nothing of it (C2a, connect#230)
+		self.log.Infof("[extender]activate v%d left out = %s\n", ipVersion, text)
 	}
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
