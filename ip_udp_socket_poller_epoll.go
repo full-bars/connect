@@ -4,21 +4,35 @@ package connect
 
 import (
 	"encoding/binary"
+	"errors"
+	"os"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
+// udpSocketEpollBackend waits for readiness through the Go runtime's network
+// poller. The epoll descriptor is nonblocking and wrapped in an os.File, so a
+// shard with nothing ready parks as a goroutine. A blocking epoll_wait would
+// hold one OS thread per shard for the life of the process, and a provider
+// runs a few shards for every proxy.
 type udpSocketEpollBackend struct {
 	mutex    sync.Mutex
 	fd       int
 	wakeFd   int
+	file     *os.File
+	rawConn  syscall.RawConn
 	osEvents [udpSocketPollEventCount]unix.EpollEvent
 }
 
 func newUdpSocketPollBackend() (udpSocketPollBackend, error) {
 	fd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
+		return nil, err
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
 		return nil, err
 	}
 	wakeFd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
@@ -31,7 +45,20 @@ func newUdpSocketPollBackend() (udpSocketPollBackend, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
-	return &udpSocketEpollBackend{fd: fd, wakeFd: wakeFd}, nil
+	// From here the file owns fd: closing the file closes the descriptor.
+	file := os.NewFile(uintptr(fd), "udp-socket-epoll")
+	if file == nil {
+		_ = unix.Close(wakeFd)
+		_ = unix.Close(fd)
+		return nil, errors.New("udp socket epoll: cannot wrap the epoll descriptor")
+	}
+	rawConn, err := file.SyscallConn()
+	if err != nil {
+		_ = unix.Close(wakeFd)
+		_ = file.Close()
+		return nil, err
+	}
+	return &udpSocketEpollBackend{fd: fd, wakeFd: wakeFd, file: file, rawConn: rawConn}, nil
 }
 
 func (self *udpSocketEpollBackend) add(fd int) error {
@@ -61,8 +88,25 @@ func (self *udpSocketEpollBackend) wake() {
 }
 
 func (self *udpSocketEpollBackend) wait(events []udpSocketPollEvent) (int, error) {
-	// no timeout: readiness or wake ends the wait
-	n, err := unix.EpollWait(self.fd, self.osEvents[:min(len(events), len(self.osEvents))], -1)
+	// The callback polls without blocking. When nothing is ready the runtime
+	// parks this goroutine until the epoll descriptor becomes readable, so the
+	// wait costs no OS thread. Readiness or a wake ends it.
+	var n int
+	var waitErr error
+	limit := self.osEvents[:min(len(events), len(self.osEvents))]
+	readErr := self.rawConn.Read(func(fd uintptr) bool {
+		n, waitErr = unix.EpollWait(int(fd), limit, 0)
+		if waitErr != nil {
+			return !errors.Is(waitErr, syscall.EINTR)
+		}
+		return 0 < n
+	})
+	if readErr != nil {
+		return 0, readErr
+	}
+	if waitErr != nil {
+		return 0, waitErr
+	}
 	for i := range n {
 		event := self.osEvents[i]
 		if int(event.Fd) == self.wakeFd {
@@ -76,7 +120,7 @@ func (self *udpSocketEpollBackend) wait(events []udpSocketPollEvent) (int, error
 			terminal: event.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0,
 		}
 	}
-	return n, err
+	return n, nil
 }
 
 func (self *udpSocketEpollBackend) close() error {
@@ -87,7 +131,8 @@ func (self *udpSocketEpollBackend) close() error {
 	}
 	_ = unix.Close(self.wakeFd)
 	self.wakeFd = -1
-	err := unix.Close(self.fd)
+	// Closing the file closes the epoll descriptor and ends a parked wait.
+	err := self.file.Close()
 	self.fd = -1
 	return err
 }
