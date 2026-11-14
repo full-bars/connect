@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -178,9 +178,19 @@ const (
 // provider from near-term discovery. Implementations own the retention policy;
 // the API generator uses a bounded oldest-evicted runtime history. Used by
 // RemoteUserNatMultiClient.RemoveProvider so a removed provider is not handed
-// straight back by the next discovery call.
+// straight back by the next discovery call, nor by a call already out, nor
+// through a window identity restored for it (PROXYDRAIN1.md §3.5), which the
+// API generator forgets.
 type MultiClientGeneratorExcluder interface {
 	ExcludeClientId(clientId Id)
+}
+
+// The companion of MultiClientGeneratorExcluder: whether the generator
+// excludes any hop of a destination now. The expansion refuses a candidate
+// listed before its provider was excluded (acceptDiscoveryDemandArgs). A
+// generator without it has its candidates evaluated as before.
+type multiClientGeneratorExclusions interface {
+	excludesDestination(destination MultiHopId) bool
 }
 
 // MultiClientGeneratorWithIpFamily is an optional generator capability:
@@ -213,11 +223,12 @@ type MultiClientGeneratorWithClientId interface {
 // `EncryptionModeRequired`, so a provider that cannot seal a session can never
 // carry its traffic; asking for modern providers keeps a provider without
 // evidence that it negotiates the session from being dialed and evaluated at
-// all. It narrows only the requests the generator makes: fixed `ClientId`
-// destinations and restored window identities bypass discovery and are not
-// filtered. The window clients' required gate still decides every send, and a
-// modern provider that fails to seal costs a failed dial, never plaintext. A
-// generator without the capability discovers as before.
+// all. Fixed `ClientId` destinations and restored window identities bypass
+// discovery, so the generator asks the platform to confirm them modern before
+// it returns them, and returns none it could not confirm. The window clients'
+// required gate still decides every send, and a modern provider that fails to
+// seal costs a failed dial, never plaintext. A generator without the
+// capability discovers as before.
 type MultiClientGeneratorWithPostQuantumEncryption interface {
 	SetPostQuantumEncryption(postQuantumEncryption bool)
 }
@@ -425,6 +436,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		EvaluationFailureCooloff: 5 * time.Minute,
 		// the egress-dial lines' cadence (controlDialLogInterval)
 		EvaluationFailureLogInterval: 5 * time.Second,
+		// a connect server restart's transport reconnect ends well inside it
+		WindowPlatformUnreachableHold: 30 * time.Second,
+		// the outcome watch's cap (outcomeWatchPollTimeout)
+		WindowPlatformUnreachablePollTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -1181,6 +1196,24 @@ type MultiClientSettings struct {
 	// continuously, and one line per shape per interval keeps the signal
 	// without the flood. Non-positive logs every line.
 	EvaluationFailureLogInterval time.Duration
+	// How long a window's diagnosis must stay platform-unreachable before the
+	// window publishes it (ip_remote_multi_client_outcome.go
+	// publishStallStatus). Every app offers its "Can't reach URnetwork"
+	// prompt when the published diagnosis turns to it (sdk CantReachOnStall),
+	// so a platform transport that reconnects inside the hold must not turn
+	// it. 30s covers a reconnect after a connect server restart
+	// (PlatformTransportSettings ReconnectTimeout 5s plus up to 5s
+	// ReconnectJitter, then the dial and auth) with room for a second attempt
+	// during a rolling restart, and stays inside the 45s
+	// WindowOutcomeDeadline. Non-positive publishes the diagnosis as soon as
+	// it turns.
+	WindowPlatformUnreachableHold time.Duration
+	// How often a window re-reads a platform-unreachable diagnosis, held or
+	// published, so a transport that came back ends the episode within it
+	// and a held turn lands when the hold ends. Non-positive turns the
+	// re-read off: the diagnosis is read again only when the window publishes
+	// for its own reasons (a failure, an install).
+	WindowPlatformUnreachablePollTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -1943,6 +1976,9 @@ type RemoteUserNatMultiClient struct {
 	// Redundant TCP packets are deliberately refused before admission. Count
 	// packets, not send calls, so singular and grouped sends reconcile alike.
 	tcpCollapseDropCount atomic.Uint64
+	// Native ready-only offers can refuse unavailable routes or admission
+	// without a policy block, duplicate, or terminal transport error.
+	nativeAdmissionRefusalCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
 	// maintenance paths; the fixed queue caps retained packets and memory.
@@ -7874,6 +7910,13 @@ func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
 	return self.tcpCollapseDropCount.Load()
 }
 
+// Counts original native packets refused for route, queue or encryption
+// readiness after policy and collapse checks. Internal recovery offers and
+// terminal errors are excluded. Safe to read concurrently with sends.
+func (self *RemoteUserNatMultiClient) NativeAdmissionRefusalCount() uint64 {
+	return self.nativeAdmissionRefusalCount.Load()
+}
+
 // AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
 // every window client's transports, passed through unchanged (DELAY.md §9).
 // Callbacks run on transport goroutines and must not block.
@@ -8086,11 +8129,19 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
 	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress || sendPacketGroup.isSynRetry()
+	nativeReadinessRefused := false
+	nativeTerminalError := false
+	var sentUpdate *multiClientChannelUpdate
 	if nativeIngress {
 		// This is a ready offer, not a shorter delivery or recovery deadline.
 		timeout = 0
 	}
 	defer func() {
+		if !success && nativeReadinessRefused && batchAdmission != nil && batchAdmission.nativeIngress &&
+			!sendPacketGroup.isSynRetry() && !nativeTerminalError && self.ctx.Err() == nil &&
+			sentUpdate != nil && sentUpdate.ctx.Err() == nil {
+			self.nativeAdmissionRefusalCount.Add(uint64(len(sendPacketGroup.packets)))
+		}
 		if !success {
 			sendPacketGroup.collapseAdmission.releaseTcpRecovery()
 		}
@@ -8108,7 +8159,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	}()
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
-	var sentUpdate *multiClientChannelUpdate
 	self.sendAffinityClientPath(sendPacketGroup, timeout, func(update *multiClientChannelUpdate, currentClient *multiClientChannel, affinityTimeout time.Duration) {
 		if batchAdmission != nil && batchAdmission.expectedUpdate != nil && batchAdmission.expectedUpdate != update {
 			return
@@ -8185,6 +8235,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			currentClient = gateSelection.client
 		}
 		if !canSend {
+			nativeReadinessRefused = false
 			if batchAdmission != nil {
 				batchAdmission.stop = true
 			}
@@ -8230,6 +8281,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return false
 			}
 			if !canSend {
+				nativeReadinessRefused = false
 				if batchAdmission != nil {
 					batchAdmission.stop = true
 				}
@@ -8241,6 +8293,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
+			if !success {
+				if err == nil || errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+					nativeReadinessRefused = true
+				} else {
+					nativeTerminalError = true
+				}
+			}
 			if !success && err == nil && nativeIngress {
 				self.retainNativeAckRetry(sendPacketGroup, sendPacketGroup.nativeAckRetry, source, provideMode)
 			}
@@ -8374,6 +8433,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				update.stateLock.Unlock()
 				orderedClients = freshClients
 				if collapsed && len(orderedClients) == 0 {
+					nativeReadinessRefused = false
 					collapseStopped = true
 					if batchAdmission != nil {
 						batchAdmission.stop = true
@@ -8452,6 +8512,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// attempt. Keep that first group reliable; once committed,
 				// sendBoundClient applies the ordinary NoAck UDP policy.
 				sent, sendErr := client.SendGroupDetailedWithAck(sendPacketGroup, sendTimeout, true, race.collapseOrder)
+				if sendErr != nil && !errors.Is(sendErr, ErrEncryptionRequiredNotEstablished) {
+					nativeTerminalError = true
+				}
 				sent = sent && sendErr == nil
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
@@ -8637,6 +8700,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 
 				var successCount atomic.Int32
+				var raceTerminalError atomic.Bool
 				for _, client := range raceOrderedClients {
 					sendPacketGroup.prepareAdmissionObservations(client)
 				}
@@ -8646,12 +8710,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					case <-update.ctx.Done():
 					default:
 						if update.client.Load() == nil {
-							sent = sendMultiClientGroupRaceAttempt(
+							var sendErr error
+							sent, sendErr = sendMultiClientGroupRaceAttempt(
 								client,
 								sendPacketGroup,
 								sendTimeout,
 								race.collapseOrder,
 							)
+							if sendErr != nil && !errors.Is(sendErr, ErrEncryptionRequiredNotEstablished) {
+								raceTerminalError.Store(true)
+							}
 						}
 					}
 					if sent {
@@ -8741,6 +8809,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 
 				wg.Wait()
+				nativeTerminalError = nativeTerminalError || raceTerminalError.Load()
 				// } else {
 				// 	for _, client := range raceOrderedClients {
 				// 		send(client)
@@ -8895,6 +8964,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 
 				if remainingTimeout <= 0 {
+					nativeReadinessRefused = nativeIngress
 					// drop
 					return
 				}
@@ -11108,7 +11178,9 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 // near-term discovery under the generator's retention policy. Both halves are
 // required: the resize loop wakes as soon as a client dies, so a removal
 // without the exclusion is immediately undone by re-discovering the same
-// provider. Reports whether a window client was actually removed.
+// provider. The exclusion also keeps it from coming back through a window
+// identity restored for it, and from a candidate listed before the removal.
+// Reports whether a window client was actually removed.
 //
 // A fixed-destination connection (every spec is an explicit client id, e.g. a
 // chosen network peer) is NOT excluded — there is nothing to replace it with,
@@ -12921,6 +12993,12 @@ type multiClientWindow struct {
 	// everAdded: a provider has been installed; permanently disarms the
 	// outcome watchdog for this window.
 	everAdded bool
+	// When the diagnosis turned to platform-unreachable in the episode now
+	// running, zero outside one; the turn is published only
+	// WindowPlatformUnreachableHold after it. The watch flag is held by the one
+	// watchPlatformUnreachable that re-reads the episode.
+	platformUnreachableSince time.Time
+	platformUnreachableWatch bool
 	// evalEpochCtx is the context evaluation channels are built under; the
 	// rebuild cancels and replaces it. See evalEpochContext.
 	evalEpochCtx    context.Context
@@ -13879,8 +13957,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
-		// destination set is listed locally without asking the platform, so
-		// it proves nothing about the platform either.
+		// destination set needs no discovery: it is listed locally, or under
+		// the modern requirement confirmed by a named request that says
+		// nothing of the pool, so its listing keeps the error backoff until a
+		// mint succeeds.
 		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
 			self.windowListingRetryReset()
 		}
@@ -16845,7 +16925,7 @@ func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
 	// randonly sample log statistics for weights
-	if mathrand.Intn(self.settings.StatsSampleWeightsCount) == 0 {
+	if mathrand.IntN(self.settings.StatsSampleWeightsCount) == 0 {
 		// sample the weights
 		weightValues := slices.Collect(maps.Values(weights))
 		slices.SortFunc(weightValues, func(a float32, b float32) int {
@@ -19460,7 +19540,7 @@ func sendMultiClientGroupRaceAttempt(
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
 	raceOrder uint64,
-) bool {
+) (bool, error) {
 	sharedGroup := &parsedPacketGroup{
 		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
 		retainedIpPathCount:   sendPacketGroup.retainedIpPathCount,
@@ -19481,16 +19561,17 @@ func sendMultiClientGroupRaceAttempt(
 			sendPacketGroup.packets[packetIndex].packet,
 		)
 	}
-	if accepted, err := client.SendGroupDetailedWithAck(sharedGroup, timeout, true, raceOrder); accepted && err == nil {
+	accepted, err := client.SendGroupDetailedWithAck(sharedGroup, timeout, true, raceOrder)
+	if accepted && err == nil {
 		if sharedGroup.completionFlags.Load()&groupCompletionTracked != 0 {
 			sendPacketGroup.completionFlags.Or(groupCompletionSourceControls)
 		}
-		return true
+		return true, nil
 	}
 	for packetIndex := range sharedGroup.packets {
 		MessagePoolReturn(sharedGroup.packets[packetIndex].packet)
 	}
-	return false
+	return false, err
 }
 
 func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {

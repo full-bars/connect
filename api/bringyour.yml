@@ -6238,7 +6238,8 @@ paths:
       tags: [Account]
       summary: Account Set Payout Wallet
       description: |
-        Set an existing account wallet as the wallet to receive network payments.
+        USDC provider payouts have ended. This endpoint remains for existing
+        apps and refuses every payout wallet selection with 400.
       operationId: accountSetPayoutWallet
       security:
         - BearerAuth: []
@@ -6250,13 +6251,15 @@ paths:
               $ref: "#/components/schemas/SetPayoutWalletArgs"
       responses:
         "200":
-          description: OK.
+          description: Legacy success response. Current servers refuse selections with 400.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
         "400":
-          description: The wallet is a Bittensor wallet, or not an active wallet of the network. Plain text body.
+          description: |
+            USDC payouts have ended, so a payout wallet is no longer used.
+            Every selection is refused. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
@@ -6318,8 +6321,8 @@ paths:
       tags: [Account]
       summary: Account Create Wallet
       description: |
-        Create a new wallet for your network. You can then use it as a payout wallet
-        by posting to /account/payout-wallet.
+        Create a new wallet for your network. Adding a wallet does not select
+        it for payouts; USDC provider payouts have ended.
       operationId: accountCreateWallet
       security:
         - BearerAuth: []
@@ -6339,7 +6342,8 @@ paths:
         "400":
           description: |
             An unsupported blockchain, an invalid wallet address or default
-            token type, or a wallet the payout cannot go to. Plain text body.
+            token type, or an address already recorded on another blockchain
+            for this network. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
@@ -6368,10 +6372,8 @@ paths:
       summary: Account Remove Wallet
       description: |
         Remove a wallet from your list of account wallets. Removing the
-        payout wallet makes another active Solana or Polygon wallet of the
-        network the payout wallet, when there is one, and names it in
-        `payout_wallet_id`; otherwise USDC payouts are held until a payout
-        wallet is set.
+        selected payout wallet clears that selection without promoting
+        another wallet. USDC provider payouts have ended.
       operationId: accountRemoveWallet
       security:
         - BearerAuth: []
@@ -10828,9 +10830,12 @@ paths:
         not matured reports 0: read `matured_days` (the cohort's age at
         `computed_at`) to tell "not yet" from "did not".
 
-        Volume floor: rows with fewer than `onboarding.results.min_exposures`
-        exposures (default 10) are suppressed, and no identifier of any kind
-        is returned. Ordered by the dimension tuple; keyset paged by
+        Volume floor: a variant whose rows total fewer than
+        `onboarding.results.min_exposures` exposures (default 10) over the
+        requested days and filters is suppressed whole, and no identifier of
+        any kind is returned. The floor holds on these totals, the sums the
+        readout compares, not on each row, and every page applies it to the
+        whole selection. Ordered by the dimension tuple; keyset paged by
         `cursor`.
 
         Auth: `Authorization: Bearer <token>` where the token is one of the
@@ -11143,8 +11148,9 @@ paths:
         fall anywhere in the day, a window of W days has closed for every
         episode of the day once `matured_days` is more than W.
 
-        Volume floor: rows with fewer than `onboarding.results.min_exposures`
-        exposures (default 10) are suppressed, as in
+        Volume floor: an experiment's variant whose rows total fewer than
+        `onboarding.results.min_exposures` exposures (default 10) over the
+        requested days and filters is suppressed whole, as in
         /admin/onboarding/results, and no identifier of any kind is
         returned. Ordered by the dimension tuple; keyset paged by `cursor`.
 
@@ -12309,6 +12315,24 @@ components:
             Report a refusal that has a code (`signature_mismatch`) in the
             result `error` with a 200, instead of a 401. New clients set this.
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthLoginResult:
       type: object
@@ -12383,6 +12407,24 @@ components:
           type: string
         verify_otp_numeric:
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthLoginWithPasswordResult:
       type: object
@@ -12428,6 +12470,24 @@ components:
           type: string
         verify_code:
           type: string
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthVerifyResult:
       type: object
@@ -12606,6 +12666,24 @@ components:
             result as the JSON body of its 401, instead of the plain text
             message. New clients set this.
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     NetworkCreateResult:
       type: object
@@ -12769,17 +12847,27 @@ components:
           type: string
         time_zone:
           description: |
-            Optional. The device's IANA time zone (e.g. America/Chicago), used
-            only to place the onboarding campaign's emails in the user's local
-            day (08:00-21:00 local); never stored on the client. Every app
-            sends it on each auth-client call; the latest wins.
+            Optional. The device's IANA time zone (e.g. America/Chicago). With
+            `locale` and `locales`, the campaign emails are placed in the
+            reader's day and written in their language; the server keeps only
+            the network's latest values, never on the client. Every app sends
+            it on each auth-client call; the latest wins. A zone of UTC is
+            ignored.
           type: string
         locale:
           description: |
-            Optional. The device's BCP 47 locale ("de-DE"). Selects the onboarding
-            campaign's template language, falling back to English. Same rules as
-            time_zone.
+            Optional. The device's BCP 47 locale ("de-DE"), the first of
+            `locales`. Same rules as time_zone.
           type: string
+        locales:
+          description: |
+            Optional. The device's languages, most preferred first, as BCP 47
+            tags; the campaign emails are written in the first one a template
+            serves. Leave out a language the device cannot name rather than
+            sending a default such as "en". Same rules as time_zone.
+          type: array
+          items:
+            type: string
         roles:
           description: Optional. |
             Identity roles assigned to the client at creation, immutable after. |
@@ -16735,7 +16823,7 @@ components:
           type: [string, "null"]
         min_exposures:
           type: integer
-          description: The volume floor applied to this page.
+          description: The volume floor applied to this page, to each variant's total exposures over the requested days and filters.
 
     ReengagementStream:
       type: string
@@ -16849,7 +16937,7 @@ components:
           type: [string, "null"]
         min_exposures:
           type: integer
-          description: The volume floor applied to this page.
+          description: The volume floor applied to this page, to each variant's total exposures over the requested days and filters.
 
     OnboardingExperiment:
       type: object
@@ -17879,16 +17967,6 @@ components:
         success:
           description: Wallet successfully removed
           type: boolean
-        payout_wallet_id:
-          description: |
-            udid. Set when the removed wallet was the network's payout wallet
-            and another of the network's active Solana or Polygon wallets
-            became the payout wallet in the same transaction (the newest,
-            preferring the removed wallet's chain; never a Bittensor wallet).
-            Absent when nothing was promoted, which leaves the network with no
-            payout wallet, and from older servers. Apps show where payouts go
-            now.
-          type: string
         error:
           type: object
           required:
@@ -19095,6 +19173,24 @@ components:
         explanation:
           description: what the number means and what raises it, in English
           type: string
+        reason:
+          description: |
+            English capability downgrade reason for `url_checks`, one sentence
+            per dropped capability with TCP first. `explanation` ends with the
+            same text. Omitted when there is no such downgrade.
+          type: string
+        reason_tcp_count:
+          description: |
+            Positive count used by the TCP-only sentence in `reason`, for
+            localization. Omitted when that sentence is absent.
+          type: integer
+          minimum: 1
+        reason_ipv4_count:
+          description: |
+            Positive count used by the IPv4-only sentence in `reason`, for
+            localization. Omitted when that sentence is absent.
+          type: integer
+          minimum: 1
 
     ProviderStatusCountry:
       type: object
@@ -19192,9 +19288,10 @@ components:
 
     ProviderRankingNumberCompact:
       description: |
-        A `ProviderRankingNumber` without its explanation. `value`, `minimum`
-        and `maximum` are present only when the number has one (`has_value`,
-        `has_minimum` and `has_maximum` in the full form). `count` and `total`
+        A `ProviderRankingNumber` without its English explanation or reason.
+        `value`, `minimum` and `maximum` are present only when the number has
+        one (`has_value`, `has_minimum` and `has_maximum` in the full form).
+        `count` and `total`
         are present only for a counted number with a value (`url_checks`).
       type: object
       required:
@@ -19222,6 +19319,16 @@ components:
           type: integer
         total:
           type: integer
+        reason_tcp_count:
+          description: |
+            As `ProviderRankingNumber.reason_tcp_count`, without the English reason.
+          type: integer
+          minimum: 1
+        reason_ipv4_count:
+          description: |
+            As `ProviderRankingNumber.reason_ipv4_count`, without the English reason.
+          type: integer
+          minimum: 1
 
     ProviderStatusCountryCompact:
       description: A `ProviderStatusCountry` without its explanation.
