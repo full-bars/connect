@@ -520,8 +520,17 @@ type ExtenderServer struct {
 
 	connectionCount        int
 	sourceConnectionCounts map[string]int
+	quicConnCarriers       map[*quic.Conn]string
 
-	served [4]atomic.Uint64
+	usage extenderUsage
+
+	// refusal and carrier summary logging state: a flood must not bury the log it writes to
+	refusalLogLock        sync.Mutex
+	carrierRefusalLog     [extenderCarrierPortCount][extenderRefusalStageCount]extenderRefusalLogState
+	otherRefusalLog       [extenderRefusalStageCount]extenderRefusalLogState
+	carrierSummaryLastLog time.Time
+	carrierSummaryServed  [extenderCarrierPortCount]uint64
+	carrierSummaryRefused [extenderCarrierPortCount]uint64
 
 	// the relayed traffic of O1, summed over every carrier and cumulative for
 	// the life of the server. They are taken at the relay copy of each
@@ -683,6 +692,7 @@ func NewExtenderServer(
 		connections:              map[*extenderOwnedConnection]bool{},
 		closers:                  map[*extenderOwnedCloser]bool{},
 		sourceConnectionCounts:   map[string]int{},
+		quicConnCarriers:         map[*quic.Conn]string{},
 		allowedSecrets:           allowedSecrets,
 		allowedHosts:             allowedHosts,
 		ports:                    ports,
@@ -755,10 +765,14 @@ func NewExtenderServer(
 		// along with the per-connection proxy budget (A3, A5)
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 			serverName := ""
+			carrier := extenderContextCarrier(ctx)
 			if requestConn, ok := conn.(*connWithInitialBytes); ok {
 				serverName = requestConn.serverName
+				if requestConn.carrier != "" {
+					carrier = requestConn.carrier
+				}
 			}
-			return newExtenderRequestContext(ctx, serverName)
+			return newExtenderRequestContextWithCarrier(ctx, serverName, carrier)
 		},
 	}
 	// h2 support is configured through the standard path even though the
@@ -772,14 +786,111 @@ func NewExtenderServer(
 		Handler:     handler,
 		IdleTimeout: settings.QuicIdleTimeout,
 		// the udp carriers take the sni from the request, which carries the
-		// terminated connection state, so only the proxy budget is per
-		// connection here
+		// terminated connection state, so only the proxy budget and carrier
+		// identity are per connection here
 		ConnContext: func(ctx context.Context, quicConn *quic.Conn) context.Context {
-			return newExtenderRequestContext(ctx, "")
+			return newExtenderRequestContextWithCarrier(ctx, "", self.quicConnCarrier(quicConn))
 		},
 	}
 
 	return self
+}
+
+const (
+	ExtenderCarrierTcp443  = "tcp-443"
+	ExtenderCarrierUdp443  = "udp-443"
+	ExtenderCarrierUdp4053 = "udp-4053"
+	ExtenderCarrierUdp53   = "udp-53"
+)
+
+const (
+	extenderCarrierTcp443Index = iota
+	extenderCarrierUdp443Index
+	extenderCarrierUdp4053Index
+	extenderCarrierUdp53Index
+	extenderCarrierPortCount
+)
+
+var extenderCarrierPortNames = [extenderCarrierPortCount]string{
+	extenderCarrierTcp443Index:  ExtenderCarrierTcp443,
+	extenderCarrierUdp443Index:  ExtenderCarrierUdp443,
+	extenderCarrierUdp4053Index: ExtenderCarrierUdp4053,
+	extenderCarrierUdp53Index:   ExtenderCarrierUdp53,
+}
+
+// ExtenderCarrierPorts returns the carrier port labels in canonical order.
+func ExtenderCarrierPorts() []string {
+	return []string{
+		ExtenderCarrierTcp443,
+		ExtenderCarrierUdp443,
+		ExtenderCarrierUdp4053,
+		ExtenderCarrierUdp53,
+	}
+}
+
+func extenderCarrierPortIndex(carrier string) (int, bool) {
+	switch carrier {
+	case ExtenderCarrierTcp443, connect.ExtenderCarrierTcp, "tcp 443", "tcp443":
+		return extenderCarrierTcp443Index, true
+	case ExtenderCarrierUdp443, connect.ExtenderCarrierQuic, "udp 443", "quic 443", "quic443", "udp443":
+		return extenderCarrierUdp443Index, true
+	case ExtenderCarrierUdp4053, connect.ExtenderCarrierDns, "dns 4053", "udp 4053", "dns4053", "udp4053":
+		return extenderCarrierUdp4053Index, true
+	case ExtenderCarrierUdp53, "dns 53", "udp 53", "dns53", "udp53":
+		return extenderCarrierUdp53Index, true
+	default:
+		return 0, false
+	}
+}
+
+func extenderCarrierPortLabel(connectMode connect.ExtenderConnectMode, port int) string {
+	switch connectMode {
+	case connect.ExtenderConnectModeTcpTls:
+		return ExtenderCarrierTcp443
+	case connect.ExtenderConnectModeQuic:
+		return ExtenderCarrierUdp443
+	case connect.ExtenderConnectModeDns:
+		if port == connect.DefaultDnsPort {
+			return ExtenderCarrierUdp53
+		}
+		return ExtenderCarrierUdp4053
+	default:
+		return ""
+	}
+}
+
+func (self *ExtenderServer) setQuicConnCarrier(quicConn *quic.Conn, carrier string) {
+	if quicConn == nil || carrier == "" {
+		return
+	}
+	self.stateLock.Lock()
+	if self.quicConnCarriers == nil {
+		self.quicConnCarriers = map[*quic.Conn]string{}
+	}
+	self.quicConnCarriers[quicConn] = carrier
+	self.stateLock.Unlock()
+}
+
+func (self *ExtenderServer) clearQuicConnCarrier(quicConn *quic.Conn) {
+	if quicConn == nil {
+		return
+	}
+	self.stateLock.Lock()
+	delete(self.quicConnCarriers, quicConn)
+	self.stateLock.Unlock()
+}
+
+func (self *ExtenderServer) quicConnCarrier(quicConn *quic.Conn) string {
+	if quicConn == nil {
+		return ExtenderCarrierUdp443
+	}
+	self.stateLock.Lock()
+	carrier := self.quicConnCarriers[quicConn]
+	self.stateLock.Unlock()
+	if carrier == "" {
+		return ExtenderCarrierUdp443
+	}
+	return carrier
 }
 
 // The carrier names in wire order, which is the order Carriers reports (A4).
@@ -913,6 +1024,10 @@ func connectionSourceAddress(address string) string {
 
 // Runs a connection handler whose socket is interrupted and joined at Close.
 func (self *ExtenderServer) startConnection(connection net.Conn) {
+	self.startConnectionWithCarrier(connection, ExtenderCarrierTcp443)
+}
+
+func (self *ExtenderServer) startConnectionWithCarrier(connection net.Conn, carrier string) {
 	if self.closedAtAccept(connection.RemoteAddr()) {
 		// a subnet past its refusals is not worth a handshake (A12)
 		connection.Close()
@@ -942,7 +1057,7 @@ func (self *ExtenderServer) startConnection(connection net.Conn) {
 			self.endConnection(connection.RemoteAddr())
 			self.workers.Done()
 		}()
-		self.HandleExtenderConnection(self.ctx, connection)
+		self.HandleExtenderConnection(withExtenderCarrier(self.ctx, carrier), connection)
 	}()
 }
 
@@ -1283,9 +1398,11 @@ func (self *ExtenderServer) reportListenError(carrier string, err error) {
 // Serves one udp carrier. The dns carrier is the same quic server over the
 // decode53 packet translation, so both carriers share this loop (A1).
 func (self *ExtenderServer) serveQuicCarrier(
+	port int,
 	connectMode connect.ExtenderConnectMode,
 	packetConn net.PacketConn,
 ) error {
+	carrier := extenderCarrierPortLabel(connectMode, port)
 	carrierPacketConn := packetConn
 	// what ended the carrier below its quic transport, which sees only a close
 	endError := func() error { return nil }
@@ -1396,8 +1513,10 @@ func (self *ExtenderServer) serveQuicCarrier(
 			self.endConnection(quicConn.RemoteAddr())
 			return self.ctx.Err()
 		}
+		self.setQuicConnCarrier(quicConn, carrier)
 		go func() {
 			defer func() {
+				self.clearQuicConnCarrier(quicConn)
 				quicConn.CloseWithError(0, "")
 				self.removeCloser(connCloser)
 				self.endConnection(quicConn.RemoteAddr())
@@ -1562,26 +1681,382 @@ func (self *ExtenderServer) ConnectionCount() int {
 	return self.connectionCount
 }
 
-// ServedCounts returns accepted requests handed over to a client stream by service.
-func (self *ExtenderServer) ServedCounts() map[string]uint64 {
+// The services a request can ask for, in the order the metrics report them.
+// Proxy is not an extender service: it is the camouflage answer an ordinary
+// request gets, counted so the two can be told apart.
+const (
+	extenderUsageProxy = iota
+	extenderUsageForward
+	extenderUsageGossip
+	extenderUsageFeed
+	extenderUsageProbe
+	extenderUsageOther
+	extenderUsageCount
+)
+
+var extenderUsageServiceNames = [extenderUsageCount]string{
+	extenderUsageProxy:   "proxy",
+	extenderUsageForward: "forward",
+	extenderUsageGossip:  "gossip",
+	extenderUsageFeed:    "feed",
+	extenderUsageProbe:   "probe",
+	extenderUsageOther:   "other",
+}
+
+func extenderUsageServiceIndex(service uint32) int {
+	switch service {
+	case connect.ExtenderServiceForward:
+		return extenderUsageForward
+	case connect.ExtenderServiceGossip:
+		return extenderUsageGossip
+	case connect.ExtenderServiceFeed:
+		return extenderUsageFeed
+	case connect.ExtenderServiceProbe:
+		return extenderUsageProbe
+	}
+	return extenderUsageOther
+}
+
+type extenderRefusalLogState struct {
+	count   int
+	lastLog time.Time
+}
+
+func formatCarrierRefusalLogLine(carrier string, stage string, count int, err error) string {
+	if carrier != "" {
+		if count == 1 {
+			return fmt.Sprintf("🌉 [extender] refused a request at %s on %s: %v", stage, carrier, err)
+		}
+		return fmt.Sprintf("🌉 [extender] refused %d requests at %s on %s in the last minute; latest: %v", count, stage, carrier, err)
+	}
+	if count == 1 {
+		return fmt.Sprintf("🌉 [extender] refused a request at %s: %v", stage, err)
+	}
+	return fmt.Sprintf("🌉 [extender] refused %d requests at %s in the last minute; latest: %v", count, stage, err)
+}
+
+func (self *ExtenderServer) refusalLogNow() time.Time {
+	if self.settings != nil && self.settings.AdmissionNow != nil {
+		return self.settings.AdmissionNow()
+	}
+	return time.Now()
+}
+
+// FlushCarrierSummaryLog returns the interval summary line for traffic since the
+// previous interval, or the empty string when the interval had no traffic.
+func (self *ExtenderServer) FlushCarrierSummaryLog(now time.Time) string {
+	self.refusalLogLock.Lock()
+	defer self.refusalLogLock.Unlock()
+	return self.flushCarrierSummaryLocked(now)
+}
+
+func (self *ExtenderServer) flushCarrierSummaryLocked(now time.Time) string {
+	self.carrierSummaryLastLog = now
+	var parts [extenderCarrierPortCount]string
+	var totalDelta uint64
+	for cIdx, carrier := range extenderCarrierPortNames {
+		served := self.usage.carrierServed[cIdx].Load()
+		var refused uint64
+		for sIdx := 0; sIdx < extenderRefusalStageCount; sIdx++ {
+			refused += self.usage.carrierRefusals[cIdx][sIdx].Load()
+		}
+		servedDelta := served - self.carrierSummaryServed[cIdx]
+		refusedDelta := refused - self.carrierSummaryRefused[cIdx]
+		self.carrierSummaryServed[cIdx] = served
+		self.carrierSummaryRefused[cIdx] = refused
+		totalDelta += servedDelta + refusedDelta
+		parts[cIdx] = fmt.Sprintf("%s served %d refused %d", carrier, servedDelta, refusedDelta)
+	}
+	if totalDelta == 0 {
+		return ""
+	}
+	return "🌉 [extender] last minute: " + strings.Join(parts[:], " | ")
+}
+
+func (self *ExtenderServer) noteCarrierServed(carrier string) {
+	now := self.refusalLogNow()
+	var summaryLine string
+	self.refusalLogLock.Lock()
+	if self.carrierSummaryLastLog.IsZero() {
+		self.carrierSummaryLastLog = now
+	} else if time.Minute <= now.Sub(self.carrierSummaryLastLog) {
+		summaryLine = self.flushCarrierSummaryLocked(now)
+	}
+	self.refusalLogLock.Unlock()
+	if summaryLine != "" {
+		log.Print(summaryLine)
+	}
+}
+
+// noteRefusal logs a refusal at most once a minute per stage, with the number
+// of refusals it stands for, so the operator sees why clients are being turned
+// away without the log filling up under a bad deploy.
+func (self *ExtenderServer) noteRefusal(stage string, err error) {
+	self.noteCarrierRefusal("", stage, err)
+}
+
+func (self *ExtenderServer) noteCarrierRefusal(carrier string, stage string, err error) {
+	now := self.refusalLogNow()
+	sIdx := extenderRefusalStageIndex(stage)
+	canonicalStage := extenderRefusalStageNames[sIdx]
+	canonicalCarrier := ""
+	cIdx, hasCarrier := extenderCarrierPortIndex(carrier)
+	if hasCarrier {
+		canonicalCarrier = extenderCarrierPortNames[cIdx]
+	}
+
+	var summaryLine string
+	self.refusalLogLock.Lock()
+	if self.carrierSummaryLastLog.IsZero() {
+		self.carrierSummaryLastLog = now
+	} else if time.Minute <= now.Sub(self.carrierSummaryLastLog) {
+		summaryLine = self.flushCarrierSummaryLocked(now)
+	}
+	var state *extenderRefusalLogState
+	if hasCarrier {
+		state = &self.carrierRefusalLog[cIdx][sIdx]
+	} else {
+		state = &self.otherRefusalLog[sIdx]
+	}
+	state.count++
+	emit := state.lastLog.IsZero() || time.Minute <= now.Sub(state.lastLog)
+	count := state.count
+	if emit {
+		state.count = 0
+		state.lastLog = now
+	}
+	self.refusalLogLock.Unlock()
+	if summaryLine != "" {
+		log.Print(summaryLine)
+	}
+	if !emit {
+		return
+	}
+	log.Print(formatCarrierRefusalLogLine(canonicalCarrier, canonicalStage, count, err))
+}
+
+// extenderUsage counts requests by service and refusals by stage. Both are
+// cumulative for the life of the server and safe to read while it serves.
+type extenderUsage struct {
+	services [extenderUsageCount]atomic.Uint64
+	// served counts a request once it has passed authorization and admission and
+	// the stream has been handed over. `services` cannot say that: it counts when
+	// a header decodes, before the request is authorized or admitted, and its
+	// `proxy` entry counts every ordinary non-extender http request.
+	served          [extenderUsageCount]atomic.Uint64
+	refusals        [extenderRefusalStageCount]atomic.Uint64
+	carrierServed   [extenderCarrierPortCount]atomic.Uint64
+	carrierRefusals [extenderCarrierPortCount][extenderRefusalStageCount]atomic.Uint64
+}
+
+var processCarrierUsage extenderUsage
+
+func (self *extenderUsage) recordServed(index int) {
+	if 0 <= index && index < extenderUsageCount {
+		self.served[index].Add(1)
+	}
+}
+
+func (self *extenderUsage) recordCarrierServed(carrier string) {
+	if index, ok := extenderCarrierPortIndex(carrier); ok {
+		self.carrierServed[index].Add(1)
+		if self != &processCarrierUsage {
+			processCarrierUsage.carrierServed[index].Add(1)
+		}
+	}
+}
+
+func (self *extenderUsage) recordService(index int) {
+	if 0 <= index && index < extenderUsageCount {
+		self.services[index].Add(1)
+	}
+}
+
+// Refusal stages are bounded so a request does not allocate a counter.
+var extenderRefusalStageNames = [...]string{
+	"request", "header decode", "header authorization", "admission subnets",
+	"admission source", "hop count", "destination authorization", "nlayer limited",
+	"probe", "service", "response", "proxy name", "proxy limit", "proxy request",
+	"proxy upstream", "other",
+}
+
+const extenderRefusalStageCount = 16
+
+func extenderRefusalStageIndex(stage string) int {
+	for i, name := range extenderRefusalStageNames {
+		if stage == name {
+			return i
+		}
+	}
+	return extenderRefusalStageCount - 1
+}
+
+func (self *extenderUsage) recordRefusal(stage string) {
+	self.refusals[extenderRefusalStageIndex(stage)].Add(1)
+}
+
+func (self *extenderUsage) recordCarrierRefusal(carrier string, stage string) {
+	if cIdx, ok := extenderCarrierPortIndex(carrier); ok {
+		sIdx := extenderRefusalStageIndex(stage)
+		self.carrierRefusals[cIdx][sIdx].Add(1)
+		if self != &processCarrierUsage {
+			processCarrierUsage.carrierRefusals[cIdx][sIdx].Add(1)
+		}
+	}
+}
+
+func (self *extenderUsage) carrierServedCounts() map[string]uint64 {
 	counts := map[string]uint64{}
-	for index, name := range servedServiceNames {
-		if count := self.served[index].Load(); count != 0 {
+	for index, name := range extenderCarrierPortNames {
+		if count := self.carrierServed[index].Load(); count > 0 {
 			counts[name] = count
 		}
 	}
 	return counts
 }
 
-var servedServiceNames = [...]string{"forward", "gossip", "feed", "other"}
+func (self *extenderUsage) carrierRefusalCounts() map[string]map[string]uint64 {
+	counts := map[string]map[string]uint64{}
+	for cIdx, carrier := range extenderCarrierPortNames {
+		var stageCounts map[string]uint64
+		for sIdx, stage := range extenderRefusalStageNames {
+			if count := self.carrierRefusals[cIdx][sIdx].Load(); count > 0 {
+				if stageCounts == nil {
+					stageCounts = map[string]uint64{}
+				}
+				stageCounts[stage] = count
+			}
+		}
+		if len(stageCounts) > 0 {
+			counts[carrier] = stageCounts
+		}
+	}
+	return counts
+}
+
+func (self *extenderUsage) carrierStats() map[string]ExtenderCarrierStats {
+	stats := map[string]ExtenderCarrierStats{}
+	for cIdx, carrier := range extenderCarrierPortNames {
+		served := self.carrierServed[cIdx].Load()
+		var refused uint64
+		var byStage map[string]uint64
+		for sIdx, stage := range extenderRefusalStageNames {
+			if count := self.carrierRefusals[cIdx][sIdx].Load(); count > 0 {
+				refused += count
+				if byStage == nil {
+					byStage = map[string]uint64{}
+				}
+				byStage[stage] = count
+			}
+		}
+		if served > 0 || refused > 0 {
+			stats[carrier] = ExtenderCarrierStats{
+				Served:          served,
+				Refused:         refused,
+				RefusalsByStage: byStage,
+			}
+		}
+	}
+	return stats
+}
+
+// ServiceCounts returns the per-service request counts by name.
+func (self *ExtenderServer) ServiceCounts() map[string]uint64 {
+	counts := map[string]uint64{}
+	for index, name := range extenderUsageServiceNames {
+		if count := self.usage.services[index].Load(); 0 < count {
+			counts[name] = count
+		}
+	}
+	return counts
+}
+
+// ServedCounts returns accepted requests handed over to a client stream by service.
+func (self *ExtenderServer) ServedCounts() map[string]uint64 {
+	counts := map[string]uint64{}
+	for index, name := range extenderUsageServiceNames {
+		if count := self.usage.served[index].Load(); 0 < count {
+			counts[name] = count
+		}
+	}
+	return counts
+}
 
 func (self *ExtenderServer) recordServed(service uint32) {
-	index := len(servedServiceNames) - 1
 	switch service {
 	case connect.ExtenderServiceForward, connect.ExtenderServiceGossip, connect.ExtenderServiceFeed:
-		index = int(service)
+		self.usage.recordServed(extenderUsageServiceIndex(service))
+	default:
+		self.usage.recordServed(extenderUsageOther)
 	}
-	self.served[index].Add(1)
+}
+
+// RefusalCounts returns the per-stage refusal counts by stage name.
+func (self *ExtenderServer) RefusalCounts() map[string]uint64 {
+	counts := map[string]uint64{}
+	for index, name := range extenderRefusalStageNames {
+		if count := self.usage.refusals[index].Load(); count > 0 {
+			counts[name] = count
+		}
+	}
+	return counts
+}
+
+// ExtenderCarrierStats holds cumulative served and refused request counts for one carrier.
+type ExtenderCarrierStats struct {
+	Served          uint64            `json:"served"`
+	Refused         uint64            `json:"refused"`
+	RefusalsByStage map[string]uint64 `json:"refusals_by_stage,omitempty"`
+}
+
+// CarrierServedCounts returns the cumulative served request counts by carrier name.
+func (self *ExtenderServer) CarrierServedCounts() map[string]uint64 {
+	return self.usage.carrierServedCounts()
+}
+
+// CarrierRefusalCounts returns the cumulative per-stage refusal counts by carrier name.
+func (self *ExtenderServer) CarrierRefusalCounts() map[string]map[string]uint64 {
+	return self.usage.carrierRefusalCounts()
+}
+
+// CarrierStats returns the cumulative served and refused counts by carrier name.
+func (self *ExtenderServer) CarrierStats() map[string]ExtenderCarrierStats {
+	return self.usage.carrierStats()
+}
+
+// ProcessCarrierServedCounts returns the cumulative process-wide served request counts by carrier name.
+func ProcessCarrierServedCounts() map[string]uint64 {
+	return processCarrierUsage.carrierServedCounts()
+}
+
+// ProcessCarrierRefusalCounts returns the cumulative process-wide per-stage refusal counts by carrier name.
+func ProcessCarrierRefusalCounts() map[string]map[string]uint64 {
+	return processCarrierUsage.carrierRefusalCounts()
+}
+
+// ProcessCarrierStats returns the cumulative process-wide served and refused counts by carrier name.
+func ProcessCarrierStats() map[string]ExtenderCarrierStats {
+	return processCarrierUsage.carrierStats()
+}
+
+// RecordProcessCarrierServed increments the process-wide served count for carrier.
+func RecordProcessCarrierServed(carrier string) {
+	processCarrierUsage.recordCarrierServed(carrier)
+}
+
+// RecordProcessCarrierRefusal increments the process-wide refusal count for carrier and stage.
+func RecordProcessCarrierRefusal(carrier string, stage string) {
+	processCarrierUsage.recordCarrierRefusal(carrier, stage)
+}
+
+// ResetProcessCarrierStats zeroes the process-wide carrier served and refusal counters.
+func ResetProcessCarrierStats() {
+	for cIdx := range processCarrierUsage.carrierServed {
+		processCarrierUsage.carrierServed[cIdx].Store(0)
+		for sIdx := range processCarrierUsage.carrierRefusals[cIdx] {
+			processCarrierUsage.carrierRefusals[cIdx][sIdx].Store(0)
+		}
+	}
 }
 
 // ExtenderStats is the traffic one extender has relayed, summed over every
@@ -1857,10 +2332,24 @@ func (self *ExtenderServer) RealityPublicKey() []byte {
 	return self.camouflage.StaticPublicKey()
 }
 
+func (self *ExtenderServer) refuseV1(ctx context.Context, stage string, err error) {
+	carrier := extenderContextCarrier(ctx)
+	if carrier == "" {
+		carrier = ExtenderCarrierTcp443
+	}
+	self.usage.recordRefusal(stage)
+	self.usage.recordCarrierRefusal(carrier, stage)
+	self.noteCarrierRefusal(carrier, stage, extenderErrorClass(err))
+	self.reportError(stage, err)
+}
+
 // HandleExtenderConnection terminates the outer tls of one tcp connection and
 // serves whatever is inside: the v1 framing, or an http request that carries
 // the extender header. The connection is closed when this returns.
 func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn net.Conn) {
+	if extenderContextCarrier(ctx) == "" {
+		ctx = withExtenderCarrier(ctx, ExtenderCarrierTcp443)
+	}
 	handleCtx, handleCancel := context.WithCancel(ctx)
 	defer handleCancel()
 
@@ -1997,7 +2486,7 @@ func (self *ExtenderServer) serveTerminatedConnection(
 		self.reportError("header length", err)
 		return
 	}
-	requestConn := newConnWithInitialBytes(clientConn, initialBytes, serverName)
+	requestConn := newConnWithInitialBytesAndCarrier(clientConn, initialBytes, serverName, extenderContextCarrier(ctx))
 	self.serveHttpConnection(ctx, requestConn, negotiatedProtocol)
 }
 
@@ -2013,7 +2502,7 @@ func (self *ExtenderServer) serveHttpConnection(
 		// h2 never reaches the ConnContext of the http server, so the request
 		// context is built here instead
 		self.http2Server.ServeConn(requestConn, &http2.ServeConnOpts{
-			Context:    newExtenderRequestContext(ctx, requestConn.serverName),
+			Context:    newExtenderRequestContextWithCarrier(ctx, requestConn.serverName, requestConn.carrier),
 			BaseConfig: self.httpServer,
 			Handler:    self.httpServer.Handler,
 		})
@@ -2055,33 +2544,39 @@ func (self *ExtenderServer) handleV1Connection(
 
 	header := &protocol.ExtenderHeader{}
 	if err := proto.Unmarshal(headerBytes, header); err != nil {
-		self.reportError("header decode", extenderFixedError("the extender header does not parse"))
+		self.refuseV1(ctx, "header decode", extenderFixedError("the extender header does not parse"))
 		return
 	}
 
 	if !self.IsAllowedSecret(header) {
-		self.reportError("header authorization", extenderFixedError("secret signature is not allowed"))
+		self.refuseV1(ctx, "header authorization", extenderFixedError("secret signature is not allowed"))
 		return
 	}
 	// a v1 header is an action like any other (A12), refused by the close
 	// since v1 has no status to answer with
 	if limit, _ := self.admitAction(remoteAddressString(clientConn.RemoteAddr()), 0 < len(self.allowedSecrets)); limit != extenderAdmitted {
-		self.reportError(extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
+		self.refuseV1(ctx, extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
 		return
 	}
 	// v1 has no refusal but the close, and a v1 header is always a forward
 	if err := self.checkNLayerDepth(header); err != nil {
-		self.reportError("hop count", err)
+		self.refuseV1(ctx, "hop count", err)
 		return
 	}
 	if !self.IsAllowedHost(header.DestinationHost) {
-		self.reportError("destination authorization", extenderFixedError("the destination host is not allowed"))
+		self.refuseV1(ctx, "destination authorization", extenderFixedError("the destination host is not allowed"))
 		return
 	}
 	if self.settings.HeaderHandler != nil {
 		self.settings.HeaderHandler(header)
 	}
 	self.recordServed(connect.ExtenderServiceForward)
+	carrier := extenderContextCarrier(ctx)
+	if carrier == "" {
+		carrier = ExtenderCarrierTcp443
+	}
+	self.usage.recordCarrierServed(carrier)
+	self.noteCarrierServed(carrier)
 
 	if 0 < len(self.nlayerHops) {
 		// an NLayer extender relays the inner stream to another extender,

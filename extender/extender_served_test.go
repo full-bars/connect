@@ -25,6 +25,16 @@ func TestExtenderServedCountsAcceptedForwards(t *testing.T) {
 			t.Fatalf("%s: served = %d, want %d", carrier, got, i+1)
 		}
 	}
+	carrierServed := fixture.server.CarrierServedCounts()
+	for _, carrierPort := range []string{
+		ExtenderCarrierTcp443,
+		ExtenderCarrierUdp443,
+		ExtenderCarrierUdp4053,
+	} {
+		if carrierServed[carrierPort] != 1 {
+			t.Fatalf("carrier %s served = %d, want 1 (%v)", carrierPort, carrierServed[carrierPort], carrierServed)
+		}
+	}
 }
 
 func TestExtenderServedIgnoresRefusalAndProbe(t *testing.T) {
@@ -45,6 +55,12 @@ func TestExtenderServedIgnoresRefusalAndProbe(t *testing.T) {
 	conn.Close()
 	if got := fixture.server.ServedCounts(); len(got) != 0 {
 		t.Fatalf("refusal or probe counted as served: %v", got)
+	}
+	if got := fixture.server.RefusalCounts()["destination authorization"]; got != 1 {
+		t.Fatalf("destination authorization refusals = %d, want 1", got)
+	}
+	if got := fixture.server.CarrierRefusalCounts()[ExtenderCarrierTcp443]["destination authorization"]; got != 1 {
+		t.Fatalf("tcp-443 destination authorization refusals = %d, want 1", got)
 	}
 }
 
@@ -68,5 +84,11 @@ func TestExtenderServedCountsV1Forwards(t *testing.T) {
 		if got := fixture.server.ServedCounts()["forward"]; got != want {
 			t.Fatalf("case %d: served = %d, want %d", i, got, want)
 		}
+	}
+	if got := fixture.server.CarrierServedCounts()[ExtenderCarrierTcp443]; got != 2 {
+		t.Fatalf("tcp-443 carrier served for v1 = %d, want 2", got)
+	}
+	if got := fixture.server.CarrierRefusalCounts()[ExtenderCarrierTcp443]["destination authorization"]; got != 1 {
+		t.Fatalf("tcp-443 carrier refused for v1 = %d, want 1", got)
 	}
 }
