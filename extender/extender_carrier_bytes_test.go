@@ -64,3 +64,42 @@ func TestExtenderRelayCountsBytesPerCarrier(t *testing.T) {
 		}
 	})
 }
+
+// The process wide figures follow every server's relays, give a rate from two
+// samples, and reset with the other process wide carrier counters.
+func TestExtenderProcessCarrierByteStats(t *testing.T) {
+	ResetProcessCarrierStats()
+	defer ResetProcessCarrierStats()
+	start := time.Unix(1_800_000_000, 0)
+	SampleProcessCarrierRates(start)
+	a := &ExtenderServer{}
+	b := &ExtenderServer{}
+	ctx := newExtenderRequestContextWithCarrier(context.Background(), "", ExtenderCarrierTcp443)
+	a.noteRelayedConnOpen(ctx)
+	b.noteRelayedConnOpen(ctx)
+	a.noteCarrierBytes(ctx, 6000, true)
+	b.noteCarrierBytes(ctx, 4000, true)
+	a.noteCarrierBytes(ctx, 3000, false)
+	SampleProcessCarrierRates(start.Add(10 * time.Second))
+	got := ProcessCarrierByteStats(start.Add(10 * time.Second))[ExtenderCarrierTcp443]
+	if got.IngressBytes != 10000 || got.EgressBytes != 3000 {
+		t.Fatalf("process bytes in %d out %d, want 10000 and 3000", got.IngressBytes, got.EgressBytes)
+	}
+	if got.RateInBps != 1000 || got.RateOutBps != 300 {
+		t.Fatalf("process rate in %d out %d, want 1000 and 300", got.RateInBps, got.RateOutBps)
+	}
+	if got.LiveConns != 2 || got.ConnsTotal != 2 {
+		t.Fatalf("process conns live %d total %d, want 2 and 2", got.LiveConns, got.ConnsTotal)
+	}
+	a.noteRelayedConnClose(ctx)
+	if live := ProcessCarrierByteStats(start.Add(11 * time.Second))[ExtenderCarrierTcp443].LiveConns; live != 1 {
+		t.Fatalf("live conns after one close = %d, want 1", live)
+	}
+	if other := ProcessCarrierByteStats(start)[ExtenderCarrierUdp443]; other.IngressBytes != 0 || other.EgressBytes != 0 {
+		t.Fatalf("another carrier counted bytes: %+v", other)
+	}
+	ResetProcessCarrierStats()
+	if after := ProcessCarrierByteStats(start)[ExtenderCarrierTcp443]; after.IngressBytes != 0 || after.ConnsTotal != 0 {
+		t.Fatalf("reset left %+v", after)
+	}
+}

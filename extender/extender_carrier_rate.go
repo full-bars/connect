@@ -167,8 +167,10 @@ func (self *ExtenderServer) noteCarrierBytes(ctx context.Context, n int, ingress
 	if ingress {
 		self.ingressByteCountByCarrier[cIdx].Add(uint64(n))
 		self.ingressReadCountByCarrier[cIdx].Add(1)
+		processCarrierTraffic.ingress[cIdx].Add(uint64(n))
 		return
 	}
 	self.egressByteCountByCarrier[cIdx].Add(uint64(n))
 	self.egressReadCountByCarrier[cIdx].Add(1)
+	processCarrierTraffic.egress[cIdx].Add(uint64(n))
 }

@@ -2071,6 +2071,7 @@ func RecordProcessCarrierRefusal(carrier string, stage string) {
 
 // ResetProcessCarrierStats zeroes the process-wide carrier served and refusal counters.
 func ResetProcessCarrierStats() {
+	ResetProcessCarrierByteStats()
 	for cIdx := range processCarrierUsage.carrierServed {
 		processCarrierUsage.carrierServed[cIdx].Store(0)
 		for sIdx := range processCarrierUsage.carrierRefusals[cIdx] {
@@ -2906,6 +2907,8 @@ func (self *ExtenderServer) noteRelayedConnOpen(ctx context.Context) {
 	if cIdx, ok := extenderCarrierPortIndex(carrier); ok {
 		self.liveConnsByCarrier[cIdx].Add(1)
 		self.connsTotalByCarrier[cIdx].Add(1)
+		processCarrierTraffic.liveConns[cIdx].Add(1)
+		processCarrierTraffic.connTotal[cIdx].Add(1)
 	}
 }
 
@@ -2917,6 +2920,7 @@ func (self *ExtenderServer) noteRelayedConnClose(ctx context.Context) {
 	}
 	if cIdx, ok := extenderCarrierPortIndex(carrier); ok {
 		self.liveConnsByCarrier[cIdx].Add(-1)
+		processCarrierTraffic.liveConns[cIdx].Add(-1)
 	}
 }
 
