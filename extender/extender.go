@@ -505,6 +505,10 @@ type ExtenderSettings struct {
 	// certificate, so the API never serves.
 	Measurement  ExtenderLagSettings
 	LagLifecycle *ExtenderLagLifecycleSettings
+
+	// RateNow, when set, is the only clock the carrier rate and minute history
+	// read. Tests drive the sample with it. Nil is time.Now.
+	RateNow func() time.Time
 }
 
 type ExtenderServer struct {
@@ -541,6 +545,22 @@ type ExtenderServer struct {
 	ingressReadCount atomic.Int64
 	egressByteCount  atomic.Int64
 	egressReadCount  atomic.Int64
+
+	// per-carrier relayed bytes and reads, counted at the same copy points as the
+	// totals. Indexed by extenderCarrierPortIndex. Atomic arrays for lock-free
+	// counting on the relay path.
+	ingressByteCountByCarrier [extenderCarrierPortCount]atomic.Uint64
+	ingressReadCountByCarrier [extenderCarrierPortCount]atomic.Uint64
+	egressByteCountByCarrier  [extenderCarrierPortCount]atomic.Uint64
+	egressReadCountByCarrier  [extenderCarrierPortCount]atomic.Uint64
+
+	// per-carrier live relayed connection count and total connections opened
+	liveConnsByCarrier  [extenderCarrierPortCount]atomic.Int64
+	connsTotalByCarrier [extenderCarrierPortCount]atomic.Uint64
+
+	// the per-carrier rate and minute history, derived from the counters above on
+	// the periodic sample rather than per byte.
+	carrierRate extenderCarrierRate
 
 	// the camouflage counts of P7, cumulative for the life of the server and
 	// surfaced beside the admission counts. A spliced byte is never added to the
@@ -2072,6 +2092,60 @@ type ExtenderStats struct {
 	EgressReadCount  int64
 }
 
+// ExtenderCarrierByteStats holds per-carrier relayed byte counters, rates and history.
+type ExtenderCarrierByteStats struct {
+	Carrier      string   `json:"carrier"`
+	IngressBytes uint64   `json:"ingress_bytes"`
+	EgressBytes  uint64   `json:"egress_bytes"`
+	RateInBps    uint64   `json:"rate_in_bps,omitempty"`
+	RateOutBps   uint64   `json:"rate_out_bps,omitempty"`
+	LiveConns    uint64   `json:"live_conns"`
+	ConnsTotal   uint64   `json:"conns_total"`
+	Minutes      []uint32 `json:"minutes"` // last 30 one-minute buckets, ingress+egress as KiB
+}
+
+// CarrierByteStats returns per-carrier byte stats for relayed traffic.
+func (self *ExtenderServer) CarrierByteStats(now time.Time) map[string]ExtenderCarrierByteStats {
+	stats := make(map[string]ExtenderCarrierByteStats)
+	for idx, carrier := range extenderCarrierPortNames {
+		ingressBytes := self.ingressByteCountByCarrier[idx].Load()
+		egressBytes := self.egressByteCountByCarrier[idx].Load()
+		liveConns := self.liveConnsByCarrier[idx].Load()
+		connsTotal := self.connsTotalByCarrier[idx].Load()
+		carrierStats := ExtenderCarrierByteStats{
+			Carrier:      carrier,
+			IngressBytes: ingressBytes,
+			EgressBytes:  egressBytes,
+			LiveConns:    uint64(liveConns),
+			ConnsTotal:   uint64(connsTotal),
+			Minutes:      self.carrierRate.minutes(idx, extenderRateMinuteCount, now),
+		}
+		// fill rates using the tracker
+		if self.carrierRate.haveSample {
+			carrierStats.RateInBps = self.carrierRate.rateIn[idx]
+			carrierStats.RateOutBps = self.carrierRate.rateOut[idx]
+		}
+		stats[carrier] = carrierStats
+	}
+	return stats
+}
+
+// SampleCarrierRates reads the cumulative per-carrier byte counters and folds
+// them into the rates and the minute history. Call it on the periodic tick.
+// now, when nil, is time.Now.
+func (self *ExtenderServer) SampleCarrierRates(now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var ingress [extenderCarrierPortCount]uint64
+	var egress [extenderCarrierPortCount]uint64
+	for i := 0; i < extenderCarrierPortCount; i++ {
+		ingress[i] = self.ingressByteCountByCarrier[i].Load()
+		egress[i] = self.egressByteCountByCarrier[i].Load()
+	}
+	self.carrierRate.sample(now, ingress, egress)
+}
+
 // A snapshot of the relayed traffic (O1). The four counters are read
 // independently, so a snapshot taken while a relay is running can hold a byte
 // count of one direction from just after a read whose count it missed; the
@@ -2694,6 +2768,9 @@ func (self *ExtenderServer) relay(
 	clientConn net.Conn,
 	forwardConn net.Conn,
 ) {
+	self.noteRelayedConnOpen(ctx)
+	defer self.noteRelayedConnClose(ctx)
+
 	var relayWorkers sync.WaitGroup
 	defer func() {
 		cancel()
@@ -2735,6 +2812,7 @@ func (self *ExtenderServer) relay(
 				// has seen the round trip has seen the count
 				self.ingressByteCount.Add(int64(n))
 				self.ingressReadCount.Add(1)
+				self.noteCarrierBytes(ctx, n, true)
 				if 0 < self.settings.WriteTimeout {
 					if err := forwardConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
 						return
@@ -2781,6 +2859,7 @@ func (self *ExtenderServer) relay(
 				// the egress of O1
 				self.egressByteCount.Add(int64(n))
 				self.egressReadCount.Add(1)
+				self.noteCarrierBytes(ctx, n, false)
 				if 0 < self.settings.WriteTimeout {
 					if err := clientConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
 						return
@@ -2816,6 +2895,29 @@ func guessOrganizationName(host string) string {
 
 	// FIXME
 	return host
+}
+
+// noteRelayedConnOpen marks one relayed connection as open on its carrier.
+func (self *ExtenderServer) noteRelayedConnOpen(ctx context.Context) {
+	carrier := extenderContextCarrier(ctx)
+	if carrier == "" {
+		carrier = ExtenderCarrierTcp443
+	}
+	if cIdx, ok := extenderCarrierPortIndex(carrier); ok {
+		self.liveConnsByCarrier[cIdx].Add(1)
+		self.connsTotalByCarrier[cIdx].Add(1)
+	}
+}
+
+// noteRelayedConnClose marks one relayed connection as closed on its carrier.
+func (self *ExtenderServer) noteRelayedConnClose(ctx context.Context) {
+	carrier := extenderContextCarrier(ctx)
+	if carrier == "" {
+		carrier = ExtenderCarrierTcp443
+	}
+	if cIdx, ok := extenderCarrierPortIndex(carrier); ok {
+		self.liveConnsByCarrier[cIdx].Add(-1)
+	}
 }
 
 // https://github.com/AGWA/tlshacks/blob/main/client_hello.go
