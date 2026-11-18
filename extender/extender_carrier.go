@@ -158,7 +158,7 @@ func (self *ExtenderServer) superviseUdpCarrier(
 				ownedCloser.close()
 				self.removeCloser(ownedCloser)
 			}()
-			return self.serveQuicCarrier(connectMode, packetConn)
+			return self.serveQuicCarrier(port, connectMode, packetConn)
 		}
 	}
 	self.superviseCarrier(carrierPort, serveOn(packetConn, ownedCloser), func() (func() error, error) {
@@ -372,7 +372,7 @@ func (self *ExtenderServer) serveTcpCarrier(
 			reportedLost = false
 			self.carrierPortServing(carrierPort)
 		}
-		self.startConnection(conn)
+		self.startConnectionWithCarrier(conn, extenderCarrierPortLabel(connect.ExtenderConnectModeTcpTls, carrierPort.port))
 	}
 }
 
