@@ -947,8 +947,8 @@ func TestReraceHarnessIgnoresEarlierBackendFailures(t *testing.T) {
 			}
 		})
 	})
-	if got, last := consecutiveBackendFails.Load(), lastBackendFailNano.Load(); got != 0 || last != 0 {
-		t.Errorf("the harness left %d backend failures behind, the last stamped %d", got, last)
+	if state := loadBackendFailureState(); state.count != 0 || state.stamp != 0 {
+		t.Errorf("the harness left %d backend failures behind, the last stamped %d", state.count, state.stamp)
 	}
 }
 

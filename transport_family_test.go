@@ -385,7 +385,7 @@ func TestFamilyPinnedTransportIdlesUnderContradictingForce(t *testing.T) {
 	if n := platform.connectCount.Load(); n != 0 {
 		t.Fatalf("an idled transport connected %d times", n)
 	}
-	if n := consecutiveBackendFails.Load(); n != 0 {
+	if n := loadBackendFailureState().count; n != 0 {
 		t.Fatalf("an idled transport recorded %d backend failures", n)
 	}
 
@@ -478,7 +478,7 @@ func TestFamilyPinnedTransportFailuresDoNotDegradeBackend(t *testing.T) {
 	if transport.IsConnected() {
 		t.Fatal("connected to a closed port")
 	}
-	if n := consecutiveBackendFails.Load(); n != 0 {
+	if n := loadBackendFailureState().count; n != 0 {
 		t.Fatalf("pinned dial failures recorded %d backend failures", n)
 	}
 	if isBackendDegraded() {

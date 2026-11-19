@@ -583,7 +583,7 @@ func TestHoldCanceledDialIsNoDialFailure(t *testing.T) {
 	if failures := testingDialFailureCount(transport.failBackoff); failures != 0 {
 		t.Fatalf("a hold-canceled dial counted %d dial failures", failures)
 	}
-	if n := consecutiveBackendFails.Load(); n != 0 {
+	if n := loadBackendFailureState().count; n != 0 {
 		t.Fatalf("a hold-canceled dial counted %d backend failures", n)
 	}
 }
