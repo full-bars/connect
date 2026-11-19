@@ -6,6 +6,28 @@ import (
 	"time"
 )
 
+func TestBackendDegraded_RepeatedTimestampKeepsSnapshotsSeparate(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	fresh := time.Now().UnixNano()
+	backendFailures.Store(&backendFailureState{count: 1, stamp: fresh})
+	first := loadBackendFailureState()
+	backendFailures.Store(&backendFailureState{count: backendDegradedFailThreshold + 5, stamp: fresh - int64(backendDegradedWindow) - 1})
+	stale := loadBackendFailureState()
+	backendFailures.Store(&backendFailureState{count: 1, stamp: fresh})
+	last := loadBackendFailureState()
+
+	for _, state := range []backendFailureState{first, stale, last} {
+		if state.count >= backendDegradedFailThreshold && backendFailRecent(fresh, state.stamp) {
+			t.Fatal("snapshot combined a stale count with a fresh timestamp")
+		}
+	}
+	if first != last || stale.count != backendDegradedFailThreshold+5 {
+		t.Fatal("published snapshots changed after a later update")
+	}
+}
+
 func TestBackendDegraded_ConcurrentReadersNeverSeeATornPair(t *testing.T) {
 	resetBackendDegraded()
 	defer resetBackendDegraded()
