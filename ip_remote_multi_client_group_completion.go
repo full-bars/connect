@@ -381,6 +381,9 @@ func (self *multiClientChannelUpdate) abandonCollapseClaimsWithLock() {
 // Successful channel handoff and source dequeue may race. Either proves
 // admission; exactly one records performance/hold time, before serialization.
 func (self *parsedPacketGroup) sendGroupAdmitted(source *SendSequence) {
+	if self.connectSynOffer != nil {
+		self.completionClient.observeConnectSynAdmission(self.connectSynOffer)
+	}
 	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
 		self.completionFlags.Or(groupCompletionAdmitted)
@@ -454,6 +457,9 @@ func (self *parsedPacketGroup) observeCollapseAdmissionWithLock(sourceOrdered bo
 // The sole source consumer supplies FIFO, including an unbuffered handoff.
 // An offer's eventual public return cannot change this order.
 func (self *parsedPacketGroup) sendGroupDequeued(source *SendSequence) {
+	if self.connectSynOffer != nil {
+		self.completionClient.observeConnectSynAdmission(self.connectSynOffer)
+	}
 	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
 		self.completionFlags.Or(groupCompletionAdmitted)
@@ -699,6 +705,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 				proof := &observations.synAdmission
 				if proof.update == update && proof.sequence == path.SequenceNumber && proof.responseClient == self.completionClient {
 					update.receivedInbound.Store(true)
+					update.deferredInboundHealth = !proof.responseHealthCredited
 					update.synGenerationAwaiting = false
 					update.observeTcpRecoveryAckWithLock(self.completionClient, proof.responseControl)
 				}
@@ -808,6 +815,31 @@ func (self *parsedPacketGroup) publishCollapseWithLock() {
 // Disposition precedes original pool return and follows successful retention.
 // An unfunded first chunk disposes the raw group before its source waits.
 func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized bool) {
+	if materialized && self.receiveAckOffer.use != nil && self.completionFlags.Load()&groupCompletionAck != 0 {
+		disposition := receiveAckSourceDispatched
+		offer := &self.receiveAckOffer
+		if offer.clockOffset != 0 && offer.disposition.Load()&receiveAckClockSecured == 0 {
+			// A retained reset-only prefix cannot supply the clock for a
+			// response-bearing suffix that the source later disposes.
+			for index := start; index < end; index++ {
+				if !terminalReceiveAckReset(self.packets[index].ipPath) {
+					disposition |= receiveAckClockSecured
+					break
+				}
+			}
+		}
+		offer.observeDisposition(disposition)
+	}
+	if offer := self.connectSynOffer; offer != nil && materialized {
+		// The group callback joins only errors. A later unwritten chunk
+		// cannot retract a SYN already taken by an earlier serializer.
+		for index := start; index < end; index++ {
+			if self.packets[index].ipPath.Syn {
+				offer.materialized.Store(true)
+				break
+			}
+		}
+	}
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
 		return
 	}

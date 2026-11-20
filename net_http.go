@@ -165,6 +165,19 @@ type ClientStrategySettings struct {
 	// it, and drops the dialers of addresses it retires. Nil disables
 	// discovery, which is what a direct or url-only strategy wants.
 	ExtenderDirectory *ExtenderDirectory
+	// ExtenderDirectoryReadOnly makes this strategy a reader of a directory
+	// that another owner fills and judges: the directory one process shares
+	// among strategies that each dial along a path of their own, such as the
+	// sn miner's slots, each through its own proxy (sdk
+	// NewNetworkSpaceWithUrlsOnExtenderHost). The strategy draws candidates
+	// from the directory and honors its holds and limits, but none of its own
+	// dial outcomes, failures, successes and limits alike, is written there,
+	// since a failure through this strategy's path says nothing about the
+	// owner's. It holds an address it failed to reach for itself instead, on
+	// the directory's hold schedule (net_extender_strategy_evidence.go). The
+	// live connections it carries still count as in use there, which is a
+	// fact of the process. False is a strategy whose directory is its own.
+	ExtenderDirectoryReadOnly bool
 	// How long a cold start waits for the network client's first feed sample
 	// before dialing without extenders (E4). The wait happens only while the
 	// directory has nothing usable and a network client is still on its first
@@ -354,6 +367,10 @@ type ClientStrategy struct {
 	// the country whose spoof list the outer names of the extender dialers
 	// were drawn from, "" for the global list (spoofDomainsForCountry)
 	extenderSpoofCountryCode string
+	// The outcomes of this strategy's extender dials, kept here instead of in
+	// a directory it only reads (`ExtenderDirectoryReadOnly`); nil for a
+	// strategy whose directory is its own. Set at construction.
+	extenderEvidence *clientStrategyExtenderEvidence
 
 	// the DoH settings in force: what the internal DoH cache was built from
 	// and what the extender bootstrap queries. `SetInternalDohSettings`
@@ -553,6 +570,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		if extenderConfig == nil || settings.DisableManualExtenders {
 			continue
 		}
+		// a carrier the space's egress cannot carry is never dialed
+		// (net_proxy_packet_path.go)
+		if !extenderConnectModeDialable(&settings.ConnectSettings, extenderConfig.Profile.ConnectMode) {
+			continue
+		}
 		copiedConfig := *extenderConfig
 		dialer := &clientDialer{
 			description:        "configured extender",
@@ -618,6 +640,9 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		dialers:             dialers,
 		extenderIpSecrets:   map[netip.Addr]string{},
 		dohSettings:         settings.DohSettings,
+	}
+	if settings.ExtenderDirectoryReadOnly && settings.ExtenderDirectory != nil {
+		clientStrategy.extenderEvidence = newClientStrategyExtenderEvidence(settings.ExtenderDirectory)
 	}
 	// the alt dialers need the strategy itself, for its resolver and its
 	// lifetime, so they join the same map after it is built and before
@@ -770,13 +795,15 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 //
 // Racing a direct h3 dial against an extender one, the way the stream dialers
 // race, would be the fuller answer and is not what this does. A strategy that
-// refuses extenders configured by hand (`DisableManualExtenders`) answers nil.
+// refuses extenders configured by hand (`DisableManualExtenders`) answers nil,
+// and a configured extender on a carrier the space's egress cannot carry is
+// passed over (net_proxy_packet_path.go).
 func (self *ClientStrategy) H3ExtenderConfig() *ExtenderConfig {
 	if self.settings.EnableNormal || self.settings.EnableResilient || self.settings.DisableManualExtenders {
 		return nil
 	}
 	for _, extenderConfig := range self.settings.ExtenderConfigs {
-		if extenderConfig != nil {
+		if extenderConfig != nil && extenderConnectModeDialable(&self.settings.ConnectSettings, extenderConfig.Profile.ConnectMode) {
 			return extenderConfig
 		}
 	}
@@ -2418,6 +2445,10 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 			// working connections drain (EXTENDER-UPDATE2 §1.1 rule 5)
 			if !directory.ConnectAddressUsable(dialer.extenderConfig.Ip) {
 				dropDialers = append(dropDialers, dialer)
+			} else if self.extenderEvidence != nil && self.extenderEvidence.held(dialer.extenderConfig.Ip) {
+				// held by this strategy's own failures, where it only reads
+				// the directory
+				dropDialers = append(dropDialers, dialer)
 			}
 		}
 	}
@@ -2544,6 +2575,11 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
+		// where the directory is only read, the addresses this strategy holds
+		// itself are no candidates either
+		if self.extenderEvidence != nil {
+			visitedExtenderIps = append(visitedExtenderIps, self.extenderEvidence.heldIps()...)
+		}
 		// the connection draw of each family the host has (E2), under the
 		// directory's gated preference (EXTENDER-UPDATE2 §1.1); with
 		// DisableManualExtenders never a manual address no signed record
@@ -2577,6 +2613,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 		}
 	}
+	// a carrier the space's egress cannot carry is never dialed, so it never
+	// counts against its extender (net_proxy_packet_path.go)
+	extenderConfigs = dialableExtenderConfigs(&self.settings.ConnectSettings, extenderConfigs)
 
 	func() {
 		self.mutex.Lock()
@@ -2602,6 +2641,13 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			if maxNewDialerCount <= len(expandedDialers) {
 				break
 			}
+			if self.extenderEvidence != nil && extenderConfig.Profile.ConnectMode == ExtenderConnectModeWebRtc &&
+				self.settings.ConnectSettings.WebRtcExtenderCarrier == nil {
+				// a strategy that only reads the directory has no carrier to
+				// dial it with: the carrier and its signaling belong to the
+				// owner that opened the directory's webrtc gate (S8)
+				continue
+			}
 			ipProfile := extenderIpProfile{
 				ip:      extenderConfig.Ip,
 				profile: extenderConfig.Profile,
@@ -2610,7 +2656,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 				continue
 			}
 			visitedExtenderIpProfiles[ipProfile] = true
-			dialer := newExtenderClientDialer(self.settings, extenderConfig)
+			dialer := newExtenderClientDialer(self.settings, extenderConfig, self.extenderEvidence)
 			expandedDialers = append(expandedDialers, dialer)
 			self.dialers[dialer] = true
 		}
@@ -2677,12 +2723,12 @@ func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*cl
 	if candidate == nil || !candidate.LimitedUntil.IsZero() {
 		return []*clientDialer{}
 	}
-	extenderConfigs := extenderConfigsForCandidate(
+	extenderConfigs := dialableExtenderConfigs(&self.settings.ConnectSettings, extenderConfigsForCandidate(
 		candidate,
 		secret,
 		spoofDomains,
 		directoryBorrowCountryCode(self.settings.ExtenderDirectory),
-	)
+	))
 
 	func() {
 		self.mutex.Lock()
@@ -2692,7 +2738,7 @@ func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*cl
 			return
 		}
 		for _, extenderConfig := range extenderConfigs {
-			dialer := newExtenderClientDialer(self.settings, extenderConfig)
+			dialer := newExtenderClientDialer(self.settings, extenderConfig, self.extenderEvidence)
 			expandedDialers = append(expandedDialers, dialer)
 			self.dialers[dialer] = true
 		}
@@ -2730,7 +2776,7 @@ func customExtenderCandidate(ip netip.Addr) *ExtenderCandidate {
 }
 
 // One dialer for one extender config, as discovery expands it (E2).
-func newExtenderClientDialer(settings *ClientStrategySettings, extenderConfig *ExtenderConfig) *clientDialer {
+func newExtenderClientDialer(settings *ClientStrategySettings, extenderConfig *ExtenderConfig, extenderEvidence *clientStrategyExtenderEvidence) *clientDialer {
 	return &clientDialer{
 		description:        fmt.Sprintf("extender %s", extenderConfig.Profile.ConnectMode),
 		createTime:         time.Now(),
@@ -2739,6 +2785,7 @@ func newExtenderClientDialer(settings *ClientStrategySettings, extenderConfig *E
 		dialTlsContext:     newExtenderDialTlsContext(&settings.ConnectSettings, extenderConfig, clientWebSocketNextProtos),
 		httpDialTlsContext: newExtenderDialTlsContext(&settings.ConnectSettings, extenderConfig, clientHttpNextProtos),
 		extenderConfig:     extenderConfig,
+		extenderEvidence:   extenderEvidence,
 		settings:           settings,
 	}
 }
@@ -2920,6 +2967,10 @@ type clientDialer struct {
 	httpClientFactory func() *http.Client
 
 	extenderConfig *ExtenderConfig
+	// where an extender dialer of a strategy that only reads its directory
+	// keeps its outcomes (`ExtenderDirectoryReadOnly`), nil when they go to
+	// the directory. Never changed after construction.
+	extenderEvidence *clientStrategyExtenderEvidence
 	// the server of a VLESS dialer, nil for every other dialer. Never changed
 	// after construction.
 	vlessConfig *VlessConfig
@@ -3231,6 +3282,15 @@ func (self *clientDialer) Update(handleCtx context.Context, err error) {
 	if !recorded || self.extenderConfig == nil || self.settings == nil {
 		return
 	}
+	if self.extenderEvidence != nil {
+		// a directory this strategy only reads hears nothing of its dials
+		if err == nil {
+			self.extenderEvidence.recordSuccess(self.extenderConfig.Ip)
+		} else {
+			self.extenderEvidence.recordFailure(self.extenderConfig.Ip, self.extenderConfig.Profile.ConnectMode)
+		}
+		return
+	}
 	directory := self.settings.ExtenderDirectory
 	if directory == nil {
 		return
@@ -3250,7 +3310,9 @@ func (self *clientDialer) limit(retryAfter time.Duration) {
 	directorySettings := DefaultExtenderDirectorySettings()
 	if self.settings != nil && self.settings.ExtenderDirectory != nil {
 		directory := self.settings.ExtenderDirectory
-		if !directory.RecordLimited(self.extenderConfig.Ip, retryAfter).IsZero() {
+		// a directory this strategy only reads keeps no limit of its: the
+		// extender limited this strategy's path, which the dialer keeps
+		if self.extenderEvidence == nil && !directory.RecordLimited(self.extenderConfig.Ip, retryAfter).IsZero() {
 			return
 		}
 		directorySettings = directory.settings

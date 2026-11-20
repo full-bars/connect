@@ -86,7 +86,7 @@ func TestDialRetryAfterBacksOffOnConsecutiveFailures(t *testing.T) {
 
 	fired := func() bool {
 		select {
-		case <-transport.dialRetryAfter(expired):
+		case <-transport.dialRetryAfter(expired, nil):
 			return true
 		case <-time.After(50 * time.Millisecond):
 			return false
@@ -135,7 +135,7 @@ func TestDialRetryAfterPinnedKeepsReconnectTimer(t *testing.T) {
 	transport.noteDialFailure(errDialTestFailure)
 	transport.noteDialFailure(errDialTestFailure)
 	select {
-	case <-transport.dialRetryAfter(NewReconnect(0)):
+	case <-transport.dialRetryAfter(NewReconnect(0), nil):
 	case <-time.After(time.Second):
 		t.Fatal("pinned transport did not keep the reconnect timer")
 	}
@@ -182,7 +182,8 @@ func TestPlatformTransportFailBackoffSettings(t *testing.T) {
 	}
 }
 
-// Both mode runners must wait on dialRetryAfter after a failed dial.
+// Both mode runners must wait on dialRetryAfter after a failed dial, with the
+// dial's error, so a refusal's wait holds the retry.
 func TestDialRetryAfterSourceAnchor(t *testing.T) {
 	source, err := readSource("transport.go")
 	if err != nil {
@@ -197,7 +198,7 @@ func TestDialRetryAfterSourceAnchor(t *testing.T) {
 			t.Fatalf("could not find %s", signature)
 		}
 		// the wait also ends on a kick or a hold (waitDial)
-		if !strings.Contains(body, "self.dialRetryAfter(reconnect)") {
+		if !strings.Contains(body, "self.dialRetryAfter(reconnect, err)") {
 			t.Errorf("%s does not back off after a failed dial", signature)
 		}
 	}

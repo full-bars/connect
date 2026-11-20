@@ -1149,8 +1149,12 @@ upgrader (noise and yamux) with the expected peer id, which is derived
 from the extender's ed25519 key. Listen exists only on
 extenders: a listener fed by the extender's gossip accept channel (A8),
 advertising `/ip4|ip6/<public ip>/tcp/443` per activated family. Apps have
-no listener. The operator is dialed at `/dns/gossip.<host>/tcp/443/wss/p2p/<id>` by
-the websocket transport (`/dns`, so a v6-only host resolves it too).
+no listener. The operator is dialed at `/dns/gossip.<host>/tcp/443/wss/p2p/<id>`
+(`/dns`, so a v6-only host resolves it too) through the space's own dial
+(`ConnectSettings.DialContext`), or through a dialer the node's owner supplies
+(`NodeSettings.DialContext`); libp2p's websocket transport only listens. See
+the design notes on the node's supplied dialer and on a space's egress
+(2026-11-17).
 
 D3. Peering. Every node keeps a connection to the operator and to up to N
 random active extenders from the directory, N 8 for members and 16 for
@@ -1457,7 +1461,10 @@ which decodes it over the defaults. Every other constructor keeps both on.
 The role's state is re-read after each hand-over to the provider until it
 stands, so a change racing another is never undone by the older one.
 
-G2. Lifecycle in `deviceLocalProvider`. When provide is on and the setting
+G2. Lifecycle in `deviceLocalProvider`. A device whose space's egress is a
+proxy never runs the role: it binds and forwards on this host, outside the
+proxy every other egress of the space takes (owner, 2026-11-18; the note on a
+space's egress). When provide is on and the setting
 is on: load or create the identity key, which belongs to the network space:
 local state's `.extender_key` when the space has storage, otherwise the
 seed an embedder passes through `DeviceLocalKeyMaterial`, otherwise one
@@ -1783,6 +1790,29 @@ with the contract. A contract need not carry its data over the extender:
 every active extender of an endpoint counts, which is fuzzy but averages
 to the right allocation.
 
+Only a tag that can be a relay is a party (owner, 2026-11-11: only real
+relays earn), since a connection is tagged by its caller address alone and
+a client on the extender's own address is tagged as if the extender
+carried it. Three tags carry nothing and make no party
+(`contractExtenderInsertSql` in the server):
+- the extender's own network's: its own provider client, and the clients of
+  its network behind its address;
+- a public provider's (J4);
+- that of an extender reached over the webrtc carrier alone, on an endpoint
+  that holds no connected connection elsewhere, nor does the client it is
+  derived from. Such an address is no first contact: the carrier signals
+  through the dialer's own connection to the platform (S8), and a window
+  client is derived from the client that signals, so a relayed endpoint
+  always arrives beside one. Without one the endpoint shares the extender's
+  address, a host behind the same nat (2026-11-16: one such extender was a
+  party to every contract of 84 clients of two other networks behind its
+  address).
+
+A client of another network behind the address of an extender that is a
+first contact -- tcp, quic or dns -- is still tagged as a relay: nothing on
+the connection tells the two apart until a client declares the extender it
+dialed.
+
 J3. Payout. Participant gathering unions the contract's extender rows into
 the participant set. Every hop has equal weight, intermediary, egress and
 extender alike, so the even split applies unchanged; an extender on the
@@ -1791,12 +1821,14 @@ extender whose provider client is already a participant is counted once,
 since the set is keyed by client id.
 
 J4. Public providers do not use extenders. A provider whose provide mode
-includes public dials the platform directly on every transport, the
-standby included, so the platform observes the provider's own address and
-location; a provider in network mode may keep using extenders, since
-network peers carry no location metadata. Destination extender parties are
-therefore expected to be empty for public providers. A change of provide
-mode that flips this rebuilds the provider transports.
+includes public dials the platform on its egress on every transport, the
+standby included: from this host, or through its proxy if it has one
+(owner, 2026-11-18; the note on a space's egress). So the platform observes
+the address the provider's exit leaves from, and places the provider there;
+a provider in network mode may keep using extenders, since network peers
+carry no location metadata. Destination extender parties are therefore
+expected to be empty for public providers. A change of provide mode that
+flips this rebuilds the provider transports.
 
 J5. The legacy extender columns of `audit_contract_event` stay unused; the
 join table is the record.
@@ -5943,3 +5975,307 @@ Two corrections to the block report note above, which this adds to.
   through `extenderErrorText`, which takes every ip literal out by parsing it, and the
   feed and probe lines no longer name the candidate. Lines behind a verbosity someone
   opted into still do. Tests: `net_extender_network_log_test.go`.
+
+## Design note: the node's supplied dialer and operator tls resumption (connect#227, 2026-11-17)
+
+A miner runs one network space per SOCKS5 proxy slot, and each space runs a gossip
+node. go-libp2p's websocket transport takes no dialer: it resolves `gossip.<host>`
+with the host's resolver and dials it with `net.DialTCP`. So every slot's operator
+link left from the host's own address, outside the slot's proxy, which 8395's
+constraint forbids. At 1000 slots those links were refused after tls and retried,
+and every retry was a full tls 1.3 handshake that verified the operator's P-384 chain.
+
+- **API** (`connect/gossip`, `NodeSettings`):
+  - `DialContext connect.DialContextFunction`. When set, every connection of the
+    node goes through it: the operator link's tcp, tls and websocket upgrade
+    (`transport_websocket.go`), and every extender carrier dial. The swarm hands the
+    operator's address over unresolved (`SkipResolve`), so the dialer gets
+    `tcp gossip.<host>:443` and a socks proxy resolves the name on its own side. The
+    carrier gets a copy of `ConnectSettings` with
+    `DialContextSettings{DialContext: dialer}`, which `ConnectSettings.DialContext`
+    takes ahead of its own proxy. Listening stays with libp2p's transport. Nil now
+    dials through `ConnectSettings.DialContext` (see the note on a space's egress
+    below); when this note was written, nil kept libp2p's own dialing.
+  - `TlsSessionCache tls.ClientSessionCache`: the operator link's session cache. Nil
+    takes the process's shared cache.
+  - The operator's tls verifies against `ConnectSettings.TlsConfig`:
+    the pinned roots, plus `URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE` where set. The
+    server name is the address's sni or dns name, and the alpn is http/1.1.
+- **Session cache** (`tls_session_cache.go`). One per process, by the owner's
+  decision, bounded at 16 servers and 64 sessions per server. Each session is handed
+  out once (RFC 8446 C.4). The slots leave through different proxies, and a ticket
+  presented twice would let anyone who sees both connections link those proxies. The
+  operator, which issued the ticket, can link them either way.
+- **Server side.** The warp lb's nginx terminates the operator's tls:
+  `ssl_session_cache shared:SSL:10m`, `ssl_session_timeout 10m`,
+  `ssl_session_tickets off`, tls 1.2 and 1.3, no early data. With tickets off, OpenSSL
+  issues tls 1.3 stateful tickets backed by that cache. A probe from a developer Mac
+  to `gossip.bringyour.com` on 2026-11-17 found:
+  - tls 1.3, with two tickets after a full handshake and one after a resumption;
+  - the second dial resumed, and a ticket presented twice resumed too, since a
+    session stays usable for the 10 minute timeout;
+  - the pinned roots verify the chain.
+
+  The cache is per lb host, so a dial that lands on another host does a full
+  handshake.
+- **Resumption by platform.** On linux, where the miners run, a resumption checks no
+  chain. On darwin, windows and ios, crypto/tls re-verifies the cached chain on
+  resumption, so there it saves the certificate exchange but not the verification.
+- **The sdk's part.** Superseded the same day: every space's node dials through its
+  own connect settings and the sdk passes no dialer (`spaceExtenderNodeSettings`;
+  the note on a space's egress below).
+- **Tests:** `gossip/node_dialer_test.go`, `gossip/tls_session_cache_test.go` and
+  `gossip/transport_websocket_test.go`.
+  - A canary listener stands at the address the node is told, and another stands on
+    `ConnectSettings`' own route; neither sees a connection, the dialer gets the name
+    unresolved, and every connection the operator accepts came from a socket the
+    dialer made, redials included.
+  - A tls front, standing in for the lb, sees a full handshake and then a resumption.
+  - A node with a dialer still listens.
+  - A node without one dials through the space's dial (the note on a space's egress).
+
+## Design note: one extender stack per miner process (connect#227, 2026-11-17)
+
+A miner ran one network space per proxy slot, and each space built a whole
+extender stack: a directory, a network client with its sample, hello, hint and
+probe loops, a gossip node, and the release, camouflage, block and seed parts. At
+1000 slots that was 54-62% of the process's CPU, and most of its 19-31% in GC. Every
+slot also read and wrote one `.provider.extender.key`, so every node presented one
+peer id. Owner's decision, 2026-11-17: one stack per miner process, and one key per
+gossip node.
+
+- **The stack.** The run's extender slot (sn `providerExtenderSlot`) hosts it: its
+  space is built as before (sdk `NewNetworkSpaceWithUrls`), through that slot's own
+  proxy, and the run owns it, so the stack serves every slot until all of them have
+  joined. Every other slot's space is built on it (sdk
+  `NewNetworkSpaceWithUrlsOnExtenderHost`). Such a space runs none of the stack:
+  - its strategy draws extenders from the host's directory;
+  - its device presents no extender identity, attests no probes and runs no role;
+  - it has no webrtc carrier, since the carrier and its signaling are the host's.
+
+  A space with no host, a closed one, or one for another network runs its own stack.
+  Nothing changes for apps and for every other embedder, which build no space on a
+  host. The stack's slot also asked for the provider extender role, whichever slot it
+  was; since 2026-11-18 only a direct slot does, and a run of proxy slots runs none
+  (the note on a space's egress below).
+- **Reading a shared directory** (`ClientStrategySettings.ExtenderDirectoryReadOnly`,
+  `net_extender_strategy_evidence.go`). The slots dial along different paths, each
+  through its own proxy. A slot whose proxy is down would report every extender it
+  tried as failed, and so hold it for every slot and for the host's own network
+  client and mesh. So a reading strategy writes none of its dial outcomes into the
+  directory:
+  - it honors the holds and limits the owner's dials set;
+  - it holds an address it failed to reach for itself, on the directory's doubling
+    hold schedule and clock, bounded by the directory's address cap and cleared by a
+    success;
+  - its 429 limits stay on its dialers;
+  - the live connections it carries still count as in use, which is a fact of the
+    process.
+- **The node's dial.** The host's node dials through the host slot's proxy, as the
+  node's supplied dialer note above describes (sdk `spaceExtenderNodeSettings`).
+- **Identity** (sn `providerExtenderKeyFileName`). Each gossip node keeps its key in
+  `.provider.extender.<client id>.key`. The first node that finds its own file missing
+  adopts an install's `.provider.extender.key` by renaming it to its own name:
+  - an install that ran one node keeps its peer id and its extender record;
+  - the rename is the claim, so no other node, in this process or another on the
+    same state directory, can take that key, and a node that finds neither file
+    starts on a new one;
+  - sn's legacy key adoption keeps counting either name as an extender side file.
+- **Not changed.** The sn swarm (`ProviderSwarm`) still runs a stack per member.
+  Its members each bind a source address of their own, and none runs the extender
+  role.
+- **Tests.**
+  - connect: `net_extender_strategy_read_only_test.go`.
+  - sdk: `network_space_extender_host_test.go` and `extender_node_dial_test.go`.
+  - sn: `miner/provider_extender_stack_test.go`, which counts the run's directory loops
+    and status watches; three slots ran three before.
+
+## Design note: a space's egress, every dial (connect#227, 2026-11-17)
+
+The owner's decision of 2026-11-17 ("fix all, focus on correctness") on four leaks
+found while fixing connect#227: what a space sends must leave the way the space is
+configured. For a space whose egress is a socks proxy (`ProxySettings`) -- the sn
+miner's proxy slots -- that means through the proxy; for an app, under its egress
+binding (R1) and DialControl.
+
+- **Every gossip node dials through the space's dial.** This is a behaviour change
+  for every app (`gossip/node.go`, `transport_websocket.go`). The operator link no
+  longer dials with libp2p's websocket transport, which used `net.DialTCP` from the
+  host, outside the space's proxy, egress binding and DialControl, after resolving
+  the name with the host's resolver. With no `NodeSettings.DialContext`, the link
+  dials through `ConnectSettings.DialContext`. For an app that means:
+  - the egress binding, DialControl, the space's resolver and family policy, and its
+    keepalive and connect timeouts;
+  - the space's roots (`ConnectSettings.TlsConfig`, the pinned ones plus
+    `URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE`) in place of the system's;
+  - alpn http/1.1;
+  - tls resumption from the process's session cache.
+
+  libp2p's websocket transport only listens. The sdk passes every space's connect
+  settings and no dialer of its own (`spaceExtenderNodeSettings`).
+- **A node dials only what its peering round chose** (`gossip/node_gater.go`). These
+  are the operator addresses it was given and the addresses the directory's records
+  name, each for its own peer. Before, a mesh peer could have the node dial an
+  address of its choosing, two ways:
+  - gossipsub peer exchange: with scoring off, a score of 0 is not below the
+    threshold of 0, so a prune's records of other peers were dialed;
+  - addresses a peer announced for itself over identify, which the swarm dials on
+    every redial.
+
+  Three layers now:
+  - every incoming rpc has its prunes' peer exchange taken out before gossipsub reads
+    it (`Node.inspectRpc`);
+  - gossipsub reads no peer exchange record (`PrunePeers` 0; its other parameters
+    are the defaults, so the mesh behaves as before);
+  - the swarm's gater refuses any dial to a peer or an address the current round did
+    not choose, before a transport sees it.
+
+  No node here sends peer exchange.
+- **A proxied space opens no udp socket of this host's**
+  (`net_proxy_packet_path.go`). A socks proxy carries streams only. SOCKS5 UDP
+  ASSOCIATE was not taken up: `x/net/proxy` has no client for it, and the proxies
+  miners use cannot be relied on to offer it. So the space fails closed for udp, and
+  its tcp carriers keep working through the proxy:
+  - The quic and dns extender carriers have a path only when the owner supplies one
+    (`DialContextSettings.PacketConnFactory`); they dial an ip literal, so nothing
+    is looked up.
+  - The alt api dialers are off, and the h3 platform transport modes are not
+    offered, endpoint or not: each resolves a platform name on this host before
+    it dials. h1 carries the transport, and an explicit h3 target falls back to h1.
+    An extender-only strategy keeps h3, since its extender resolves the name.
+  - The webrtc carrier is off, since ice gathers its own sockets.
+
+  These carriers are left out where they are chosen, so none is ever tried or held
+  against its extender:
+  - the strategy's extender and alt dialers, and its configured extenders;
+  - the network client's feed and probe walks, and the peer pinger;
+  - the platform transport's modes.
+
+  The sockets refuse too (`openExtenderPacketConn`, `dialExtenderWebRtc`,
+  `openH3PacketConn`), with `ErrExtenderPacketCarrierUnavailable`. A block attempt
+  treats that refusal like this host's memory budget: no evidence.
+
+  A space with a dialer of its own and no proxy keeps the `DialContextSettings`
+  contract: a nil packet factory is the platform's ordinary socket.
+- **A proxied space resolves no name on this host.**
+  - The client strategy installs no internal DoH resolver
+    (`clientStrategySettingsWithInternalDoh`). Before, its DoH dials, and its plain
+    dns fallback for the protected names, looked every platform name up from this
+    host before the dial went through the proxy. Names now go to the proxy
+    unresolved, and tls still verifies them against the platform's roots.
+  - The extender bootstrap's DoH queries go through the strategy's dial, the proxy,
+    with the default DoH servers when the space names none, and never fall back to
+    the system resolver (`ExtenderNetworkClient.bootstrapResolution`).
+  - The extender hint already refuses a proxied strategy. The gossip node passes
+    names unresolved, as above.
+- **Left to the owner on 2026-11-17.** These parts of a proxy slot's provider still
+  left from the host, by their designs:
+  - The provider's platform transports in a public provide mode were direct (J4,
+    sdk `standbyClientStrategy`, connect `NewDirectClientStrategy`), so the platform
+    saw the host's address, h3's udp included.
+  - The exit NAT's tcp and udp to destinations were the host's (sn passed no
+    `ProviderDialContextSettings`).
+  - P2P webrtc connections gathered the host's ice candidates.
+  - The extender role bound and forwarded on the host (G2).
+- **Decided 2026-11-18: route through the proxy.** The owner's decision ("Route
+  through the proxy"): every egress of a proxied space leaves through its proxy, so a
+  slot appears at its proxy's address and location and exits there.
+  - **Platform transports** (J4, amended). A public provider dials the platform on its
+    egress, which is its proxy if it has one. The pins and the public standby take
+    `NewEgressClientStrategy`: the space's settings without extenders or VLESS
+    servers, the proxy kept. A pin asks the proxy for its family name, which the
+    proxy resolves on its side, so the pin proves the proxy's family. The h3 modes stay
+    off for such a strategy, endpoint or not (above), so the transports carry h1. Only
+    a dial whose point is this host's own address drops the proxy:
+    `NewDirectClientStrategy`, which an extender's activation takes (C2).
+  - **Exit.** The sdk puts the exit nat on the space's egress
+    (`applyProviderExitEgress`): tcp through the proxy, udp only through the space's
+    packet endpoint, and no icmp echo. `ConnectSettings.DialContext` refuses a
+    datagram dial through a proxy that has no endpoint of the owner's
+    (`ErrExtenderPacketCarrierUnavailable`), whatever stream dial the host supplies,
+    and connects an owner's endpoint to the destination's ip literal
+    (`dialProxiedPacket`); a socks5 udp associate would come in as such an endpoint.
+    So no exit udp leaves from this host. A refused flow is answered with an
+    unreachable at once, so the source moves on. An echo socket is this host's, so the
+    nat marks its echo settings when its tcp or udp egress names a proxy, and an echo
+    flow opens none. sn passes the slot's settings in the space it builds for the
+    slot; the exit follows the space, with no `ProviderDialContextSettings`, so no
+    embedder can leave a proxied exit on the host by leaving that unset.
+  - **P2P.** Relay-only ice through the proxy is not supported (no TURN, and no socks
+    path for ice), so a proxied space opens no p2p stream: the sdk sets
+    `WebRtcSettings.DisablePeerConnections` for every client of the space, provider
+    and windows. Its stream manager takes no StreamOpen and its manager refuses a peer
+    connection (`ErrPeerConnectionsDisabled`), so the peers stay on the platform
+    transport. A client that asked for a stream keeps offering one that is never
+    answered, as for a stream a provider's policy refuses.
+  - **Extender role.** A proxied space never takes the role: the device does not ask
+    for it (`extenderProvideProviding`), the provider refuses it
+    (`setExtenderEnabledWithLock`), and sn asks for it on its direct slot alone. A run
+    of proxy slots still hosts the extender stack in its first slot, and runs no role.
+- **What a proxied space tells this host.** Three fixes beside the decision, since
+  more of a slot's dials now cross its proxy:
+  - The provider-local guard's observed addresses are process wide, and each
+    client's ObservedAddresses replaces them. A proxied slot's transports are now
+    seen at its proxy, so its message would replace this host's public address, which
+    a direct slot's exit and extender forward are guarded against (hairpin to the
+    router). The sdk sets `ClientSettings.SkipObservedAddresses` for every client of
+    a proxied space, which keeps them out.
+  - The control family ledger (`control_family.go`) is process wide, and a proxied
+    connection's family is the leg to the proxy. A dial of a space whose egress is a
+    proxy is dialed and handshaken once, and writes nothing to the ledger nor clears
+    anything from it (`dialControlTlsWithFamilyFallback`). Before, one slow proxy
+    could demote this host's family for every dial of the process, a miner's other
+    slots and its direct slot included.
+  - `ConnectSettings.ConnectTimeout` bounds a dial through a proxy end to end: the
+    connect to the proxy, its negotiation and the proxy's connect to the target. The
+    exit dials with a context that has no deadline, so a proxy that accepted and
+    never answered held the exit flow's dial for the flow's life.
+- **What changes for a proxied slot.**
+  - Its address and location are its proxy's: the platform places a connection by
+    its address, and the egress probe sees the proxy's exit. The address's
+    classification is the proxy's too: a hosting prefix keeps the slot out of
+    Quality, and a reviewed proxy or vpn address is a risk that excludes it.
+  - With no packet endpoint it carries no udp: every h3 leg of the quality probe
+    fails, so the slot never passes it, and the probe's evidence marks it tcp only.
+    Its pins prove only the families both this host and its proxy have.
+  - It earns nothing as an extender, since it runs no role.
+- **Tests (2026-11-18).**
+  - connect: `net_proxy_full_egress_test.go`.
+  - sdk: `device_local_proxied_space_test.go`.
+  - sn: `miner/provider_extender_slot_test.go`.
+
+  Each fails on the code before the decision:
+  - the group's pins and the public standby reach a canary platform on this host,
+    and the pins offer h3;
+  - the egress strategy drops the proxy;
+  - a proxied space's udp dial is handed to the host's own stream dial, a bare proxy
+    refuses it only in the socks client, and an endpoint with no stream dial panics
+    the dial;
+  - a socks proxy that never answers holds a dial past its connect timeout;
+  - a stalled handshake through a proxy demotes a family, and a refused one undoes a
+    demotion;
+  - a proxied client replaces this host's address in the guard with its proxy's;
+  - the exit's datagram reaches a canary on this host and its tcp reaches its
+    destination directly;
+  - an echo flow of a proxied exit asks for an echo socket;
+  - a client of a proxied space starts its stream opens, and a device's client
+    settings keep p2p and the observed addresses for a proxied space;
+  - a device and a provider in a proxied space ask for and try to start the role,
+    and sn's first proxy slot asks for it.
+- **Tests (2026-11-17).**
+  - connect: `net_proxy_packet_path_test.go` and
+    `net_proxy_name_resolution_test.go`.
+  - gossip: `node_dialer_test.go`, `node_peer_exchange_test.go`.
+  - sdk: `extender_node_dial_test.go`.
+
+  Each fails on the code before this note:
+  - a udp canary receives the quic dial;
+  - the strategy builds quic and dns dialers and the alt dialers;
+  - the probe walk tries all three carriers;
+  - the h3 target stays;
+  - the strategy resolves the platform's names itself;
+  - the bootstrap dials the DoH server from this host;
+  - the operator's name never reaches the space's dial, and DialControl sees no
+    socket;
+  - a prune's peer exchange is dialed;
+  - a stranger peer's address is dialed.

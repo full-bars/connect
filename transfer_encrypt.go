@@ -494,6 +494,11 @@ const (
 	// not the scaffolding that bootstraps and acknowledges it. The cost is
 	// availability — a peer that cannot establish a session carries no
 	// application traffic at all rather than falling back to plaintext.
+	//
+	// Required is the post-quantum setting's mode, so its sessions offer and
+	// accept only the post-quantum groups of their configs, in both TLS roles
+	// (sessionTlsConfigWithLock). A peer with no post-quantum group fails the
+	// handshake instead of sealing classically, and carries nothing.
 	EncryptionModeRequired
 )
 
@@ -558,6 +563,11 @@ type EncryptionEvent struct {
 	// Reason is the short human-readable cause for failure/blocked events
 	// (empty for `EncryptionEventSealed`).
 	Reason string
+	// CancellationSource is the first cancellation of the handshake epoch's
+	// context observed before failure cleanup. Set only on context-canceled
+	// establishment failures. It identifies a lifetime transition, not the
+	// caller's intent or the outcome of an application flow.
+	CancellationSource string `json:",omitempty"`
 }
 
 // PeerEncryptionState is the aggregated per-peer encryption status across the
@@ -752,6 +762,18 @@ type EncryptionSettings struct {
 	// to the default.
 	UnknownWrapNackRestartCooldown time.Duration
 
+	// UnknownWrapNackMaxSessionCount bounds the sessions an undecryptable wrap
+	// may create to carry its nack that are still live, for the whole client.
+	// The nack path creates a session only for an authenticated source, the
+	// one a peer's coming re-handshake will drive; at the bound it nacks
+	// through sessions that already exist and creates none, leaving recovery
+	// to the sealer's sequence lifecycle. A provider that restarts hears
+	// undecryptable wraps from every client that was sealing to it and needs
+	// one session for each of their nacks, so the default covers a busy
+	// provider's clients while bounding what the path can hold to that many
+	// idle sessions and their nack carriers. Zero or negative creates none.
+	UnknownWrapNackMaxSessionCount int
+
 	// EncryptionControlUseCompanion, when true (default), sends
 	// EncryptedControl handshake packs as companion-contract traffic.
 	// This is required for asymmetric contract setups where the TLS
@@ -820,6 +842,8 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		// other's pacing.
 		UnknownWrapNackMinInterval:     1 * time.Second,
 		UnknownWrapNackRestartCooldown: 5 * time.Second,
+		// one session per client of a busy provider that restarted
+		UnknownWrapNackMaxSessionCount: 1024,
 		// 0 reaps a standalone session immediately at refs==0 (<0 keeps it
 		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
 		// overrides this with max(send-sequence idle, receive-sequence idle) so
@@ -948,7 +972,11 @@ type tlsHandshakeEpoch struct {
 	// `peerIdentityVerified`). Held separately so identity-proof code
 	// can sign the exporter without exposing the cipher early.
 	derivedTlsCipher *sequenceCipher
-	certVerified     bool
+	// certVerified records that this epoch's own peer certificate matched the
+	// trusted set. It belongs to the epoch, not the session: a rekey epoch
+	// starts unverified and is marked only by a check of its own certificate
+	// (see `markCertVerifiedForEpoch`).
+	certVerified bool
 	// tlsExporter holds the 32-byte output of
 	// `ExportKeyingMaterial("urnetwork-sequence-identity-proof", ...)` from the
 	// completed TLS connection. Both peers sign it with their client identity
@@ -1006,9 +1034,9 @@ type tlsHandshakeEpoch struct {
 // ReceiveSequence that talks to the same peer/stream. The session lives
 // inside `EncryptionSessionManager`.
 type peerEncryptionSession struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers *lifecycleAdmission
+	ctx         context.Context
+	cancelCause context.CancelCauseFunc
+	workers     *lifecycleAdmission
 
 	manager *EncryptionSessionManager
 
@@ -1050,6 +1078,10 @@ type peerEncryptionSession struct {
 	// create the sequence before the application Pack that triggered it.
 	carrierNetworkPeer atomic.Bool
 	logTag             string
+	// true when an undecryptable wrap created this session for its nack, so the
+	// manager's unknownWrapNackSessionCount counts it until it exits. Guarded
+	// by the manager's stateLock, not this session's.
+	unknownWrapNackCreated bool
 
 	settings *EncryptionSettings
 
@@ -1160,6 +1192,11 @@ type peerEncryptionSession struct {
 	beforeWorkerWaitForTest func()
 	// Nil test observer borrows the constructed unknown-wrap nack before send.
 	unknownWrapNackForTest func(*protocol.EncryptedControl)
+	// Nil test barriers around certificate verification on send: after a send
+	// takes the epoch whose cipher seals its frame, and after a certificate
+	// matched but before that match is recorded.
+	afterSealingEpochForTest      func()
+	beforeCertVerifiedMarkForTest func()
 	// peerClientPublicKey is the peer's long-lived Ed25519 public identity key,
 	// set via `SetPeerClientPublicKey` (from the SendSequence after a contract
 	// for the peer arrives). nil until a contract has been seen; until then any
@@ -1203,7 +1240,7 @@ func newPeerEncryptionSession(
 	// companion is the session's identity companion (see the `companion` field).
 	companion bool,
 ) *peerEncryptionSession {
-	ctx, cancel := context.WithCancel(parentCtx)
+	ctx, cancel := context.WithCancelCause(parentCtx)
 	// Client carrier rides the identity bit; a server reply always rides
 	// EncryptionControlUseCompanion.
 	carrierCompanion := companion
@@ -1212,7 +1249,7 @@ func newPeerEncryptionSession(
 	}
 	s := &peerEncryptionSession{
 		ctx:              ctx,
-		cancel:           cancel,
+		cancelCause:      cancel,
 		workers:          newLifecycleAdmission(),
 		manager:          manager,
 		client:           client,
@@ -1268,7 +1305,7 @@ func (self *peerEncryptionSession) startWorker(
 // mirroring the SendBuffer / SendSequence pattern.
 func (self *peerEncryptionSession) Run() {
 	defer func() {
-		self.cancel()
+		self.cancelCause(tlsSessionRetired)
 		self.closeTls()
 		self.workers.close()
 		if self.beforeWorkerWaitForTest != nil {
@@ -1490,10 +1527,11 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	if self.epoch != nil && self.epoch != self.establishedEpoch {
 		self.epoch.cancel()
 	}
-	ctx, cancel := context.WithCancel(self.ctx)
+	ctx, cancel := context.WithCancelCause(self.ctx)
+	recoverWorker := func() { cancel(tlsWorkerRecovery) }
 	e := &tlsHandshakeEpoch{
 		ctx:               ctx,
-		cancel:            cancel,
+		cancel:            func() { cancel(tlsEpochRetired) },
 		transport:         newSequenceTlsTransport(ctx),
 		handshakeDone:     make(chan struct{}),
 		establishmentDone: make(chan struct{}),
@@ -1509,22 +1547,22 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	// taking the manager lock while holding the session lock, which would invert
 	// the manager→session lock order Release/CancelIfIdle rely on (ABBA deadlock).
 	tlsCfg := self.tlsConfig
+	if tlsCfg == nil {
+		// No usable config: no server cert, or a required session whose
+		// config has no post-quantum group. Fail the epoch closed so the
+		// cipher stays nil, matching a never-completed handshake.
+		e.handshakeErr = fmt.Errorf("%s tls config unavailable", self.role)
+		close(e.handshakeDone)
+		close(e.establishmentDone)
+		self.epoch = e
+		self.notifyRequiredCipherChangedWithLock()
+		self.notifyIdleStateChanged()
+		return
+	}
 	switch self.role {
 	case sequenceTlsRoleClient:
 		e.tlsConn = tls.Client(e.transport, tlsCfg)
 	case sequenceTlsRoleServer:
-		if tlsCfg == nil {
-			// Encryption misconfigured (no server cert): fail the epoch
-			// closed so the cipher stays nil and traffic flows in
-			// plaintext, matching a never-completed handshake.
-			e.handshakeErr = errors.New("server tls config unavailable")
-			close(e.handshakeDone)
-			close(e.establishmentDone)
-			self.epoch = e
-			self.notifyRequiredCipherChangedWithLock()
-			self.notifyIdleStateChanged()
-			return
-		}
 		if 0 < len(tlsCfg.Certificates) && tlsCfg.Certificates[0].Leaf != nil {
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof(
@@ -1539,9 +1577,9 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	self.notifyRequiredCipherChangedWithLock()
 
 	// drain TLS outbox → outbound EncryptedControl
-	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, e.cancel)
+	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, recoverWorker)
 	// drive the TLS handshake
-	self.startWorker("TLS handshake", func() { self.runHandshake(e) }, e.cancel)
+	self.startWorker("TLS handshake", func() { self.runHandshake(e) }, recoverWorker)
 	// Bound the complete TLS + identity-proof establishment. A TLS-only
 	// timeout leaves a successfully handshaken epoch waiting forever when the
 	// peer proof or contract key never arrives, which in turn pins the
@@ -1550,7 +1588,7 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 		self.startWorker(
 			"TLS establishment timeout",
 			func() { self.establishmentTimeoutWatcher(e) },
-			e.cancel,
+			recoverWorker,
 		)
 	}
 }
@@ -1785,9 +1823,9 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 				afterSent()
 			}
 		} else if e.ctx.Err() == nil && self.isCurrentEpoch(e) {
-			self.close()
+			self.closeWithCause(tlsControlEnqueueRejected)
 		}
-	}, self.cancel)
+	}, func() { self.cancelCause(tlsWorkerRecovery) })
 }
 
 // epochIdOf reads an epoch's wire identity under the state lock.
@@ -1807,6 +1845,7 @@ func (self *peerEncryptionSession) epochIdOf(e *tlsHandshakeEpoch) Id {
 // subsequent traffic flows in plaintext.
 func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err error) {
 	logFailure := false
+	var cancellationOwner *tlsCancellationOwner
 	// read under the lock for the capability evidence below
 	negotiatedCurveId := tls.CurveID(0)
 	done := func() bool {
@@ -1852,6 +1891,10 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		if err != nil && self.epoch == e {
 			self.recordInitialHandshakeFailureWithLock(time.Now())
 			logFailure = self.shouldLogEstablishmentFailureWithLock(err.Error())
+			if logFailure && err == context.Canceled {
+				// Read before failure cleanup cancels the epoch itself.
+				cancellationOwner = tlsHandshakeCancellationOwner(e.ctx)
+			}
 			self.lastEstablishFailureReason = err.Error()
 		}
 		return true
@@ -1889,7 +1932,7 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		return
 	}
 	if err == nil || logFailure {
-		logTlsHandshake(self.client.log, self.logTag, err)
+		logTlsHandshake(self.client.log, self.logTag, negotiatedCurveId, err)
 	}
 	if err == nil {
 		if self.client.log.V(1).Enabled() {
@@ -1913,11 +1956,17 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		self.client.log.Errorf("[tls]%s completeHandshake failed: %s\n", self.logTag, err)
 		// event cadence deliberately matches the log coalescing above, so a
 		// retry loop against a departed peer does not flood the callback
+		var source string
+		if cancellationOwner != nil {
+			cancellationOwner.record(self.role, self.companion)
+			source = cancellationOwner.name
+		}
 		if self.manager != nil {
 			self.manager.encryptionEvent(&EncryptionEvent{
-				PeerId: self.peerId,
-				Type:   EncryptionEventEstablishFailed,
-				Reason: err.Error(),
+				PeerId:             self.peerId,
+				Type:               EncryptionEventEstablishFailed,
+				Reason:             err.Error(),
+				CancellationSource: source,
 			})
 		}
 	}
@@ -3007,61 +3056,78 @@ func (self *peerEncryptionSession) closeTls() {
 	// starts a fresh handshake instead.
 }
 
-// PeerCertificates returns the peer's certificate chain observed during
-// the current epoch's TLS handshake. Returns nil if the handshake has not
-// completed.
-func (self *peerEncryptionSession) PeerCertificates() []*x509.Certificate {
-	return self.peerCertificatesOfEpoch(self.currentEpoch())
+// The epoch whose cipher seals one send: a single locked read of the
+// established epoch, its cipher, and that same epoch's certificate
+// verification. A send seals with exactly this cipher and checks exactly this
+// epoch's certificate, so a rekey promoted in between can neither borrow the
+// verification of the epoch it replaces nor lend its own to it. The zero value
+// has no cipher, the same as a nil `Cipher()`.
+type sealingEpochState struct {
+	// nil exactly when cipher is nil
+	epoch  *tlsHandshakeEpoch
+	cipher *sequenceCipher
+	// the epoch's own flag, read with its cipher
+	certVerified bool
+	// the trusted set is empty: verification skips without marking, so a later
+	// commitment still arms it
+	noCommitment bool
 }
 
-// establishedPeerCertificates returns the peer certificate chain from the
-// established epoch — the epoch whose cipher `Cipher()` hands out and which
-// therefore seals outbound frames. That is the identity a SendSequence must
-// verify against the contract commitment.
-//
-// Unlike `currentEpoch()` — which during a re-handshake is an in-flight epoch
-// whose `tls.Conn.ConnectionState()` blocks on the handshake mutex — the
-// established epoch's handshake is by definition complete (it is promoted only
-// after the handshake finished and the identity proof verified, see
-// markEstablishedWithLock), so reading its peer certificates never blocks.
-// Verifying the in-flight epoch here was the source of a deadlock: the
-// SendSequence Run loop parked on the in-flight handshake's mutex while that
-// same handshake's ClientHello waited to be packed onto the very same
-// (unbuffered) send sequence.
-//
-// Returns nil if no epoch has established yet; in practice verification is only
-// reached once `Cipher()` is non-nil, which implies an established epoch.
-func (self *peerEncryptionSession) establishedPeerCertificates() []*x509.Certificate {
+// Snapshots the sealing epoch for one send. The cipher is the one `Cipher()`
+// returns at the same instant.
+func (self *peerEncryptionSession) sealingState() sealingEpochState {
 	self.stateLock.Lock()
-	e := self.establishedEpoch
-	self.stateLock.Unlock()
-	return self.peerCertificatesOfEpoch(e)
+	defer self.stateLock.Unlock()
+	state := sealingEpochState{
+		cipher:       self.cipherWithLock(),
+		noCommitment: len(self.trustedPeerCertPems) == 0,
+	}
+	if state.cipher != nil {
+		state.epoch = self.establishedEpoch
+		state.certVerified = state.epoch.certVerified
+	}
+	return state
 }
 
-// CertVerificationState returns the cached certificate verification result.
-// `verified` is true once a peer cert was matched to the trusted set, and is
-// sticky for the session lifetime. `noCommitment` is true exactly when the
-// trusted set is empty, so callers can distinguish "no commitment held yet"
-// (verification should skip without latching) from "have a commitment not yet
-// checked" (verification should run). Not sticky: if an empty-chain contract is
-// later followed by one with a cert, noCommitment flips off and verification
-// runs against the new commitment.
+// CertVerificationState reports the established epoch's own certificate
+// verification: `verified` is true once that epoch's peer cert matched the
+// trusted set. A rekey epoch starts unverified, so after its promotion this
+// reads false until its own cert is checked. `noCommitment` is true exactly
+// when the trusted set is empty, so callers can distinguish "no commitment
+// held yet" (verification should skip without latching) from "have a
+// commitment not yet checked" (verification should run). Not sticky: if an
+// empty-chain contract is later followed by one with a cert, noCommitment
+// flips off and verification runs against the new commitment. A send does not
+// pair this with a separately read cipher; it uses `sealingState`.
 func (self *peerEncryptionSession) CertVerificationState() (verified bool, noCommitment bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	verified = self.epoch != nil && self.epoch.certVerified
+	verified = self.establishedEpoch != nil && self.establishedEpoch.certVerified
 	return verified, len(self.trustedPeerCertPems) == 0
 }
 
-// MarkCertVerified records that the peer's TLS-handshake cert was matched
-// against the trusted set. Sticky for the current epoch; a re-handshake
-// (new epoch) re-verifies against the peer's freshly presented cert.
+// MarkCertVerified records a cert match for the established epoch, never for
+// an in-flight rekey epoch. It marks whichever epoch is established when it
+// runs, so a caller that checked a cert before taking the lock marks that
+// exact epoch with `markCertVerifiedForEpoch` instead.
 func (self *peerEncryptionSession) MarkCertVerified() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.epoch != nil {
-		self.epoch.certVerified = true
+	if self.establishedEpoch != nil {
+		self.establishedEpoch.certVerified = true
 	}
+}
+
+// Records that e's own peer certificate matched the trusted set. Only e is
+// marked, whether or not it is still established: a rekey promoted after the
+// check stays unverified, so its certificate is checked before it seals.
+func (self *peerEncryptionSession) markCertVerifiedForEpoch(e *tlsHandshakeEpoch) {
+	if e == nil {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	e.certVerified = true
 }
 
 // AddTrustedPeerCertChain extends the session's trusted peer cert set with
@@ -3306,6 +3372,11 @@ func (self *peerEncryptionSession) retain() {
 // wire — there is no explicit TLS close. A later SendSequence that
 // re-acquires the peer starts a fresh session and handshake.
 func (self *peerEncryptionSession) close() {
+	self.closeWithCause(tlsSessionRetired)
+}
+
+// Set the owning cause before transport close wakes the TLS reader.
+func (self *peerEncryptionSession) closeWithCause(owner *tlsCancellationOwner) {
 	// Decrement the live counter exactly once per established session. close()
 	// is re-entrant (multiple call sites), so a once-guard keeps the tracker's
 	// active count from being under-counted on double-close.
@@ -3321,7 +3392,7 @@ func (self *peerEncryptionSession) close() {
 	if report && self.manager != nil {
 		self.manager.notePqeSessionClose(wasPQE)
 	}
-	self.cancel()
+	self.cancelCause(owner)
 	self.closeTls()
 }
 
@@ -3416,7 +3487,10 @@ type EncryptionSessionManager struct {
 	stateLock sync.Mutex
 	closed    bool
 	sessions  map[sessionKey]*peerEncryptionSession
-	workers   *lifecycleAdmission
+	// live sessions an undecryptable wrap created to carry its nack, bounded by
+	// UnknownWrapNackMaxSessionCount
+	unknownWrapNackSessionCount int
+	workers                     *lifecycleAdmission
 	// Nil test barrier pauses a publisher or session supervisor after cleanup
 	// and before joined completion.
 	beforeWorkerDoneForTest func(string)
@@ -3429,10 +3503,10 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 	if settings == nil {
 		settings = DefaultEncryptionSettings()
 	}
-	managerCtx, cancel := context.WithCancel(ctx)
+	managerCtx, cancel := context.WithCancelCause(ctx)
 	m := &EncryptionSessionManager{
 		ctx:              managerCtx,
-		cancel:           cancel,
+		cancel:           func() { cancel(tlsManagerRetired) },
 		client:           client,
 		clientKeyManager: clientKeyManager,
 		settings:         settings,
@@ -3622,19 +3696,45 @@ func (self *EncryptionSessionManager) ClientTlsConfig() *tls.Config {
 // is picked up by sessions created afterward; live sessions keep the identity
 // they were created with. Server role returns nil when no cert is configured —
 // the misconfigured case the epoch build fails closed on.
+//
+// Under EncryptionModeRequired the snapshot keeps only the post-quantum groups
+// of its curve preferences, in either role and whatever config the manager
+// holds (a caller's, a rotation's or the default), so crypto/tls neither offers
+// nor selects a classical group. A config left with no post-quantum group fails
+// every handshake, closed.
 func (self *EncryptionSessionManager) sessionTlsConfigWithLock(role sequenceTlsRole) *tls.Config {
+	var config *tls.Config
 	switch role {
 	case sequenceTlsRoleClient:
 		if self.clientTlsConfig != nil {
-			return self.clientTlsConfig.Clone()
+			config = self.clientTlsConfig.Clone()
+		} else {
+			config = resolveSendTlsConfig(self.settings.ClientTlsConfig)
 		}
-		return resolveSendTlsConfig(self.settings.ClientTlsConfig)
 	case sequenceTlsRoleServer:
 		if self.serverTlsConfig != nil {
-			return self.serverTlsConfig.Clone()
+			config = self.serverTlsConfig.Clone()
 		}
 	}
-	return nil
+	if config != nil && self.settings.Mode == EncryptionModeRequired {
+		curves := config.CurvePreferences
+		if len(curves) == 0 {
+			// crypto/tls reads an empty list as its own defaults
+			curves = DefaultSequencePostQuantumCurves
+		}
+		postQuantumCurves := []tls.CurveID{}
+		for _, curve := range curves {
+			if isPostQuantumKeyExchange(curve) {
+				postQuantumCurves = append(postQuantumCurves, curve)
+			}
+		}
+		if len(postQuantumCurves) == 0 {
+			// an empty list would read as the defaults again
+			return nil
+		}
+		config.CurvePreferences = postQuantumCurves
+	}
+	return config
 }
 
 // SetProvideTlsKeyMaterial replaces the local sequence-level TLS identity
@@ -3924,6 +4024,11 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 				defer self.stateLock.Unlock()
 				if self.sessions[key] == s {
 					delete(self.sessions, key)
+				}
+				// counted once, when the session ends, whoever removed it
+				// from the map
+				if s.unknownWrapNackCreated {
+					self.unknownWrapNackSessionCount -= 1
 				}
 			}()
 			// a removed session may shrink the established + verified peer set
@@ -4361,14 +4466,16 @@ func cloneByteSlices(in [][]byte) [][]byte {
 	return out
 }
 
-func logTlsHandshake(log Logger, tag string, err error) {
+// The completion line names the negotiated key-exchange group, so a session
+// can be read as post-quantum or classical from the log.
+func logTlsHandshake(log Logger, tag string, keyExchange tls.CurveID, err error) {
 	if err != nil {
 		if log.V(1).Enabled() {
 			log.Infof("[tls]%s handshake error = %s\n", tag, err)
 		}
 	} else {
 		if log.V(1).Enabled() {
-			log.Infof("[tls]%s handshake complete\n", tag)
+			log.Infof("[tls]%s handshake complete group=%s\n", tag, tlsKeyExchangeName(keyExchange))
 		}
 	}
 }
@@ -4510,18 +4617,54 @@ func (self *peerEncryptionSession) unknownWrapNackRestartCooldown() time.Duratio
 
 // NotifyUndecryptableWrap reports that a wrapped frame from `peerId`, pinned
 // by its wire hints to the (complement(senderRole), companion) local session,
-// could not be opened by any local cipher. The local session — created if
-// absent, exactly the session the peer's coming re-handshake will drive —
-// nacks the sealer, rate-limited per session.
+// could not be opened by any local cipher. The local session nacks the sealer,
+// rate-limited per session.
+//
+// A wrap no session opens proves nothing about who sent it, and the nack is
+// not free: its session, the send sequence that carries it, and the contract
+// that sequence asks the platform for are all state for `peerId`. So the
+// session is created when absent -- exactly the session the peer's coming
+// re-handshake will drive -- only when the caller vouches that `peerId` is
+// `authenticated`, and only while the sessions this path created number fewer
+// than UnknownWrapNackMaxSessionCount. Otherwise the wrap is nacked through a
+// session that already exists, or not at all, and the sealer recovers through
+// its sequence lifecycle. A client with encryption off never nacks: it can
+// neither open a wrap nor answer the handshake a nack asks for.
 func (self *EncryptionSessionManager) NotifyUndecryptableWrap(
 	peerId Id,
 	senderRole sequenceTlsRole,
 	companion bool,
+	authenticated bool,
 ) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	session := self.getOrCreate(peerId, senderRole.complement(), companion)
+	if self.settings.Mode == EncryptionModeOff {
+		return
+	}
+	role := senderRole.complement()
+	if self.beforeSessionAdmissionLockForTest != nil {
+		self.beforeSessionAdmissionLockForTest()
+	}
+	session := func() *peerEncryptionSession {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if session, ok := self.sessions[sessionKey{peerId: peerId, companion: companion, role: role}]; ok {
+			return session
+		}
+		if !authenticated {
+			return nil
+		}
+		if self.settings.UnknownWrapNackMaxSessionCount <= self.unknownWrapNackSessionCount {
+			return nil
+		}
+		session := self.getOrCreateWithLock(peerId, role, companion)
+		if session != nil {
+			session.unknownWrapNackCreated = true
+			self.unknownWrapNackSessionCount += 1
+		}
+		return session
+	}()
 	if session == nil {
 		return
 	}

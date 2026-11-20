@@ -666,6 +666,22 @@ type PlatformTransportSettings struct {
 	// PinnedReconnectMaxTimeout caps a pinned transport's own exponential
 	// dial backoff. Non-positive resolves to five minutes.
 	PinnedReconnectMaxTimeout time.Duration
+	// How long a pinned transport sleeps after a dial in which the routing
+	// refused every attempt with no route (EHOSTUNREACH, ENETUNREACH): a host
+	// with only ULA or link-local addresses of the family, or whose default
+	// route of the family is scoped to a vpn's tunnel, which the address probe
+	// counts as a path. Each such dial after a hold ran out doubles the next
+	// hold, up to PinnedNoRouteHoldMaxTimeout; a connection or a network
+	// change ends the hold and forgets the doubling (pinnedRouteHold). Five
+	// minutes, the first sentence of a demoted family (control_family.go).
+	// Non-positive holds nothing, and the pinned backoff alone paces such a
+	// transport.
+	PinnedNoRouteHoldTimeout time.Duration
+	// Caps the doubling of PinnedNoRouteHoldTimeout. One hour: a host that
+	// never reports a network change, such as a headless provider, still tries
+	// the family once an hour and finds a route that came back within the
+	// hour. At or below PinnedNoRouteHoldTimeout the hold does not grow.
+	PinnedNoRouteHoldMaxTimeout time.Duration
 	// ReconnectMaxTimeout caps a family-agnostic transport's exponential
 	// backoff after consecutive failed dials (see dialRetryAfter).
 	// Non-positive resolves to one minute.
@@ -886,6 +902,10 @@ type PlatformTransportSettings struct {
 	// its owner or its pinned family holds the transport, right before it
 	// waits.
 	heldParkForTest func()
+	// Nil outside package tests. Replaces time.After for the end of a pinned
+	// transport's no-route hold (runFamilyHoldWatcher), given the hold, so a
+	// test decides when the hold runs out.
+	routeHoldAfterForTest func(hold time.Duration) <-chan time.Time
 	// Nil outside package tests. Called each time a connection's watch
 	// (runConnectionWatch) has read the transport's hold and client limit and
 	// is about to wait for a change, with the transport, so a test can change
@@ -919,7 +939,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ModeInitialDelay:          2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
-		ReconnectMaxTimeout:       60 * time.Second,
+		// a family with no route sleeps 5, 10, 20, 40 minutes, then hourly,
+		// instead of a dial of every mode every few minutes
+		PinnedNoRouteHoldTimeout:    5 * time.Minute,
+		PinnedNoRouteHoldMaxTimeout: 1 * time.Hour,
+		ReconnectMaxTimeout:         60 * time.Second,
 		// A fleet-wide re-dial spreads over 5 s instead of 250 ms. A window
 		// whose k exits lost their connections together has its first one back
 		// after 5/(k+1) s on average, well inside the window's 20 s exit
@@ -1264,10 +1288,17 @@ type PlatformTransport struct {
 	// transport's own reason not to dial, a PlatformTransportState, with
 	// PlatformTransportStateConnecting meaning none. held derives from both
 	// and is what the mode runners wait on. See transport_family.go.
-	enabled       atomic.Bool
-	familyHold    atomic.Int32
-	held          *MonitorValue[bool]
-	pinnedBackoff *pinnedDialBackoff
+	enabled    atomic.Bool
+	familyHold atomic.Int32
+	// makes each evaluation of familyHold and its swap one step
+	// (refreshFamilyHold)
+	familyHoldLock sync.Mutex
+	held           *MonitorValue[bool]
+	pinnedBackoff  *pinnedDialBackoff
+	// a pinned transport's no-route hold, which puts it to sleep while the
+	// routing refuses its family. Nil for a family-agnostic transport, which
+	// holds nothing.
+	routeHold *pinnedRouteHold
 	// failBackoff paces a family-agnostic transport's retries after
 	// consecutive failed dials. See dialRetryAfter.
 	failBackoff *pinnedDialBackoff
@@ -1360,9 +1391,13 @@ func newPlatformQuicConfig(
 // Kick closes the transport's live connection (if any) and skips any pending
 // reconnect backoff so the run loop re-dials immediately over the new path.
 // An in-flight dial is canceled and retried at once: it was started on the
-// path that just changed. The transport itself stays up. Safe to call at any
-// time.
+// path that just changed. The transport itself stays up. A pinned
+// transport's no-route hold ends too: the refusals were the old path's. Safe
+// to call at any time.
 func (self *PlatformTransport) Kick() {
+	// before the notify, so the hold watcher's refresh reads the new path's
+	// evidence
+	self.routeHold.reset()
 	// generation before notify: a runner that fetched the notify channel
 	// first sees it close, and one that fetches it later sees the generation
 	self.lastKickNanos.Store(time.Now().UnixNano())
@@ -1869,6 +1904,9 @@ func NewPlatformTransportWithTargetMode(
 	}
 	transport.failBackoff = newDialFailureBackoff(settings.ReconnectTimeout, reconnectMaxTimeout)
 	transport.failBackoff.setLongTier(settings.ReconnectLongAfter, settings.ReconnectLongMaxTimeout)
+	if transport.pinned() {
+		transport.routeHold = newPinnedRouteHold(settings.PinnedNoRouteHoldTimeout, settings.PinnedNoRouteHoldMaxTimeout)
+	}
 	if transport.ipFamily == 6 {
 		// the dns pump host publishes no AAAA record: the mode cannot work
 		// over a v6 pin, so it is not offered rather than left to fail
@@ -1876,6 +1914,27 @@ func NewPlatformTransportWithTargetMode(
 		if targetMode == TransportModeH3DnsPump {
 			log.Infof("[t]h3dnspump is not available over ipv6; using h3dns\n")
 			targetMode = TransportModeH3Dns
+			transport.targetMode = targetMode
+		}
+	}
+	if clientStrategy != nil && clientStrategy.ConnectSettings().ProxySettings != nil &&
+		clientStrategy.H3ExtenderConfig() == nil {
+		// a socks proxy carries no udp: an h3 mode would resolve the platform
+		// host on this host and open a socket of this host's, or of an
+		// endpoint factory, after a lookup outside the proxy; so no h3 mode is
+		// offered, and h1 carries the transport through the proxy. An
+		// extender-only strategy keeps h3: the extender resolves the name
+		// (net_proxy_packet_path.go)
+		for _, h3Mode := range []TransportMode{TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
+			delete(transport.modePreferences, h3Mode)
+		}
+		if len(transport.modePreferences) == 0 {
+			transport.modePreferences[TransportModeH1] = DefaultTransportModePreferences()[TransportModeH1]
+		}
+		switch targetMode {
+		case TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump:
+			log.Infof("[t]%s is not available through a proxy; using h1\n", targetMode)
+			targetMode = TransportModeH1
 			transport.targetMode = targetMode
 		}
 	}
@@ -2463,6 +2522,29 @@ func (self *PlatformTransport) runInactiveDrain(
 	}
 }
 
+// Logs a failed dial of one of this transport's modes, throttled at INFO
+// across every transport (shouldLogAuthErr) and every attempt at V(1). The
+// line names the mode and a pinned transport's family, which a redacted
+// bundle cannot read off the dialed addresses, and the causes an exhausted
+// strategy retained (httpRequestErrorWithCauses), which its own message does
+// not: which leg failed, and why.
+func (self *PlatformTransport) logAuthError(clientId Id, mode TransportMode, err error) {
+	leg := string(mode)
+	if self.pinned() {
+		leg = fmt.Sprintf("%s ipv%d", mode, self.ipFamily)
+	}
+	if ok, suppressed := shouldLogAuthErr(); ok {
+		if suppressed > 0 {
+			self.log.Infof("[t]auth error %s (%s) = %s (%d suppressed)\n", clientId, leg, httpRequestErrorWithCauses(err), suppressed)
+		} else {
+			self.log.Infof("[t]auth error %s (%s) = %s\n", clientId, leg, httpRequestErrorWithCauses(err))
+		}
+	} else if v := self.log.V(1); v.Enabled() {
+		// throttled at INFO; -v=1 still shows every attempt
+		v.Infof("[t]auth error %s (%s) = %s\n", clientId, leg, httpRequestErrorWithCauses(err))
+	}
+}
+
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
@@ -2562,6 +2644,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					applyTransportDelayH1Offer(header)
 				}
 			}
+			// in either auth generation: the platform reads it from the
+			// handshake (transport_egress_proxy.go)
+			applyEgressProxyHeader(header, self.clientStrategy)
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
 				moveAttempt.withContext(self.dialContext(dialCtx)),
@@ -2724,19 +2809,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial {
 				self.noteDialFailure(err)
 			}
-			// err here is the strategy's flattened "Timeout."; a pinned
-			// transport classified each dialer attempt's typed error through
-			// the observer in dialContext (noteDialError)
-			if ok, suppressed := shouldLogAuthErr(); ok {
-				if suppressed > 0 {
-					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
-				} else {
-					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
-				}
-			} else if v := self.log.V(1); v.Enabled() {
-				// throttled at INFO; -v=1 still shows every attempt
-				v.Infof("[t]auth error %s = %s\n", clientId, err)
-			}
+			// err here is the strategy's exhaustion, whose own message names
+			// no cause; a pinned transport also classified each dialer
+			// attempt's typed error through the observer in dialContext
+			// (noteDialError)
+			self.logAuthError(clientId, TransportModeH1, err)
 			if kickedDuringDial {
 				// network changed during the dial: retry now over the new
 				// path on the reconnect fast path, without the backoff
@@ -2745,7 +2822,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:
@@ -3855,20 +3932,11 @@ func (self *PlatformTransport) runH3(
 				if !attemptCanceled {
 					self.noteDialFailure(err)
 					// the h3 resolve error reaches here typed, unlike the
-					// h1 strategy's flattened "Timeout."
+					// h1 strategy's exhaustion
 					self.noteDialError(err)
 				}
 			}
-			if ok, suppressed := shouldLogAuthErr(); ok {
-				if suppressed > 0 {
-					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
-				} else {
-					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
-				}
-			} else if v := self.log.V(1); v.Enabled() {
-				// throttled at INFO; -v=1 still shows every attempt
-				v.Infof("[t]auth error %s = %s\n", clientId, err)
-			}
+			self.logAuthError(clientId, ptMode, err)
 			if kickedDuringDial {
 				// network changed during the dial: retry now over the new
 				// path on the reconnect fast path, without the backoff
@@ -3877,7 +3945,7 @@ func (self *PlatformTransport) runH3(
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:

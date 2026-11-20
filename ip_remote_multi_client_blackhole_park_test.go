@@ -267,10 +267,17 @@ func TestDetectBlackholeJudgesSendsInItsWindow(t *testing.T) {
 
 		// acknowledged sends to two destinations over three stats buckets,
 		// so the oldest is past the two partial buckets the verdict skips
+		channel.sendTransferForTest = func(ackCallback AckFunction) (bool, error) {
+			ackCallback(nil)
+			return true, nil
+		}
 		sendTime := time.Now()
 		for i := range 3 {
-			channel.addSend(64, healthParkTestPath(byte(1+i%2), false))
-			channel.addSendAck(64)
+			path := healthParkTestPath(byte(1+i%2), false)
+			packet := &parsedPacket{packet: reraceSegment(path, 0, []byte("acknowledged")), ipPath: path}
+			if admitted, err := channel.SendDetailedWithAck(packet, 0, true); !admitted || err != nil {
+				t.Fatalf("health test transfer admission=%t err=%v", admitted, err)
+			}
 			time.Sleep(channel.settings.StatsWindowBucketDuration + time.Millisecond)
 		}
 		// every poll, whatever the alignment of a parked loop's polls
@@ -359,7 +366,10 @@ func TestDetectBlackholeJudgesUnansweredConnectPastItsWindow(t *testing.T) {
 		synctest.Wait()
 
 		synTime := time.Now()
-		channel.addSend(64, healthParkTestPath(1, true))
+		// This counter fixture models an admitted SYN, rather than an offer
+		// still waiting for its actual Transfer admission result.
+		channel.addSend(64, healthParkTestPath(1, false))
+		channel.addSendSyn(1)
 		channel.addSendAck(64)
 		// every poll after the syn left the window, whatever the alignment of
 		// a parked loop's polls

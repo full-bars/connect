@@ -625,6 +625,11 @@ type Peer struct {
 	// Private downstream-admission capability; public callbacks still borrow
 	// their frames only for the duration of the call.
 	delivery any
+	// Set when reliable immediate delivery hands this receive over ahead of
+	// an earlier ordinal of its sequence that is still undelivered. It proves
+	// the peer reachable, not that its ordered stream moved; exit health and
+	// readiness must not read it as progress (multiClientChannel.clientReceive).
+	aheadOfGap bool
 }
 
 // ReceiveFunction is invoked inline and must not block. A handoff uses a
@@ -948,6 +953,10 @@ func defaultSendBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteC
 		IdleTimeout:        300 * time.Second,
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
+		// A gap that recovery has not closed in two seconds is a stall, not
+		// one lost Pack (owner, 2026-11-14). A SYN-ACK written behind it waits
+		// in order, so a stalled peer's handshakes cannot outrun its DATA.
+		ImmediateHandshakeMaxGapAge: 2 * time.Second,
 		// Three distinct later deliveries are the conventional reordering-safe
 		// evidence for one missing Pack. Recovery is limited to one immediate
 		// retransmit per item; ordinary timeout/backoff owns any further loss.
@@ -1222,6 +1231,11 @@ type SendPack struct {
 	// takes them and the Pack's records at the call. The Pack then owns only
 	// itself, its admission slot and its prepared handoff.
 	serialized bool
+	// Cached before any logical-group prefix is serialized and returned.
+	// Pure feedback may be passed only while its own immediate custody is full.
+	pureTcpAck bool
+	// First pin selected the independent non-H1 policy; later narrowing keeps it.
+	groupPureTcpAckPolicy bool
 	// Logical-group chunk limits are pinned when the first chunk enters its
 	// SendSequence. H1 can safely carry a larger WebSocket message; pinning
 	// keeps completion accounting stable if carrier availability changes while
@@ -1694,6 +1708,14 @@ type ClientSettings struct {
 	// a short pause that lets a full queue drain is enough. Non-positive does
 	// not retry: they wait for the next quality change.
 	NetworkQualityNotificationRetryInterval time.Duration
+	// SkipNetworkQualityListener leaves this client out of the process-wide
+	// list that NetworkQualityChanged calls (AddNetworkQualityChangeListener).
+	// Only the clients of a device hear that device's network quality change,
+	// and every add and remove clones the whole list, so a process holding
+	// many clients that never hear one (a server's residents) skips it. The
+	// client still sends and receives its peers' quality notifications. False,
+	// the default, registers.
+	SkipNetworkQualityListener bool
 	// CloseSequencesMaxPendingCount bounds the contract and peer ids from the
 	// platform's CloseSequences that wait for the client's close worker. Ids
 	// past it are dropped and counted, and their contracts close as they did
@@ -1748,6 +1770,17 @@ type ClientSettings struct {
 	// Any of those outranks it: construction logs an error and publishes
 	// anyway. The zero value publishes.
 	SkipClientKeyPublication bool
+
+	// Keep the platform's ObservedAddresses out of the process's provider-local
+	// guard (transfer_observed_addresses.go): the address the platform sees
+	// this client's transports at is not this host's, as for a client whose
+	// egress is a proxy, whose transports the platform sees at the proxy. The
+	// guard is process wide and each client's message replaces it, so taking
+	// them would let a proxied client replace this host's own public address
+	// in the guard every provider policy of the process reads, a direct
+	// provider's exit and extender forward included. The sdk sets it for every
+	// client of a space whose egress is a proxy. The zero value takes them.
+	SkipObservedAddresses bool
 
 	ProtocolVersion int
 
@@ -1807,8 +1840,9 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 type ClientReceiveStatsSnapshot struct {
 	ReceiveDecodeReservedByteCount ByteCount
 	ReceiveDecodePressureDropCount uint64
-	// Frames a direct peer (P2P) route delivered that named the platform or
-	// this client as their source, dropped as forged.
+	// Frames a direct peer (P2P) route delivered that named the platform, this
+	// client, or a source other than the peer the route is bound to, dropped
+	// as forged.
 	ForgedSourceDropCount           uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
@@ -2348,6 +2382,11 @@ type Client struct {
 	signalDispatcher         *clientSignalDispatcher
 	networkQuality           *clientNetworkQualityState
 	sequenceCloser           *sequenceCloser
+
+	// The receive gaps this client holds open from its peers, and its owner's
+	// notice for one that times out (transfer_receive_gap.go).
+	receiveGaps               receiveGapRegistry
+	receiveGapTimeoutCallback atomic.Pointer[receiveGapTimeoutFunction]
 
 	// ready is closed by NewClientWithTag right before it returns, once every
 	// manager, buffer, callback, and the `run` loop are wired up. See
@@ -3669,7 +3708,8 @@ func (self *SendPack) pinGroupChunkLimits(policy transferFlightPolicySnapshot) {
 		return
 	}
 	settings := DefaultSendBufferChunkSettings()
-	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount = settings.logicalGroupLimits(policy, self.pureTcpAck)
+	self.groupPureTcpAckPolicy = self.pureTcpAck && !policy.h1Only && 0 < settings.PureTcpAckMaxFrames
 	self.groupH1Known = settings.knownH1Enabled(policy)
 }
 
@@ -3698,7 +3738,8 @@ func (self *SendSequence) pinLogicalGroupChunkLimits(
 		return
 	}
 	settings := self.chunkSettings()
-	sendPack.groupChunkMaxFrames, sendPack.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	sendPack.groupChunkMaxFrames, sendPack.groupChunkMaxMessageByteCount = settings.logicalGroupLimits(policy, sendPack.pureTcpAck)
+	sendPack.groupPureTcpAckPolicy = sendPack.pureTcpAck && !policy.h1Only && 0 < settings.PureTcpAckMaxFrames
 	sendPack.groupH1Known = settings.knownH1Enabled(policy)
 	if !policy.h1Only || sendPack.groupH1Known || len(sendPack.Frames) <= sendPack.groupFrameIndex {
 		return
@@ -4709,6 +4750,9 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var receiveWireLimit int
+		// the only source the delivering route vouches for, zero when it
+		// binds none (TransferCarrierProperties.boundSourceId)
+		var boundSourceId Id
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4720,6 +4764,7 @@ func (self *Client) run() {
 				transportType = disposition.transportType
 				receiveWireLimit = disposition.maxMessageByteCount
 				h1ReceiveCredit = disposition.h1Credit
+				boundSourceId = disposition.boundSourceId
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
@@ -4772,11 +4817,22 @@ func (self *Client) run() {
 		// either as its source is forged: taken as control-plane or self
 		// traffic it would skip contract and session checks and drive
 		// platform-only control (stream setup, sequence close, transport
-		// migration). Other peer ids cannot be checked here, because a
-		// multihop endpoint knows only its adjacent hop (see §2.3 of
-		// audit/EVIDENCE.md).
+		// migration).
+		//
+		// A production P2P association also binds its lanes to its adjacent
+		// peer, the one source the platform-relayed signaling authenticated,
+		// and a frame naming any other source is forged as well. It is dropped
+		// here, before decode, because everything after allocates state for the
+		// named source: a receive sequence and a session for a plaintext pack,
+		// and for an undecryptable wrap a session, an unknown-wrap nack, the
+		// send sequence that carries it and a contract request to the platform
+		// (partner security researchers' report 2026-11-16; §2.3 of
+		// audit/EVIDENCE.md). A route that binds no source, a custom carrier,
+		// is checked for the platform and this client only.
 		if transportType == TransportTypeP2p &&
-			(path.SourceId == ControlId || path.SourceId == self.clientId) {
+			(path.SourceId == ControlId ||
+				path.SourceId == self.clientId ||
+				(boundSourceId != (Id{}) && path.SourceId != boundSourceId)) {
 			self.receiveForgedSourceDropCount.Add(1)
 			if self.log.V(1).Enabled() {
 				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
@@ -4784,6 +4840,12 @@ func (self *Client) run() {
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
+		// The platform attributes the source of every frame it relays (it
+		// refuses a client's frame naming any source but that client), and a
+		// bound P2P route delivers its adjacent peer's frames only, so the
+		// source is authenticated unless an unbound P2P route delivered the
+		// frame, where it is the sender's word.
+		sourceAuthenticated := transportType != TransportTypeP2p || boundSourceId != (Id{})
 
 		source := path.SourceMask()
 
@@ -4862,14 +4924,16 @@ func (self *Client) run() {
 					// instead of resending into the void until its sequence
 					// lifecycle recovers (rate-limited; requires the role
 					// hint to pin the session — anonymous wraps keep the
-					// timeout path). See EncryptedControlUnknownWrapNack.
+					// timeout path). See EncryptedControlUnknownWrapNack. Only
+					// an authenticated source may have a session created for
+					// it; any other is nacked through a session it already has.
 					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && !errors.Is(err, errInboundKeyHistoryBlocked) {
 						nackCompanion := false
 						if transferFrame.SessionCompanion != nil {
 							nackCompanion = *transferFrame.SessionCompanion
 						}
 						self.encryptionSessionManager.NotifyUndecryptableWrap(
-							path.SourceId, senderRole, nackCompanion)
+							path.SourceId, senderRole, nackCompanion, sourceAuthenticated)
 					}
 					MessagePoolReturn(transferFrameBytes)
 					inboundDecodedTransferFrames.put(decodedFrame)
@@ -5497,12 +5561,19 @@ func (self *Client) Flush() {
 // an advertised complete-wire ceiling. The fixed callback storage bounds all
 // positive frame counts, including owner overrides.
 type SendBufferChunkSettings struct {
-	// SharedMaxFrames defaults to the two inline completion records for mixed,
-	// H3, P2P and untyped routes. Nonpositive uses the constructor default.
+	// SharedMaxFrames defaults to two for non-H1 groups. A positive
+	// PureTcpAckMaxFrames separately owns the validated pure-feedback limit.
+	// Nonpositive uses the constructor default.
 	SharedMaxFrames int
 	// SharedMaxMessageByteCount defaults to one tunnel MTU of message bytes.
 	// Nonpositive uses the constructor default; one indivisible owner advances.
 	SharedMaxMessageByteCount ByteCount
+	// PureTcpAckMaxFrames defaults to sixteen within one already-ready group
+	// on non-H1 routes. Only reliable NoBudget immediate pure TCP ACKs qualify;
+	// their message-byte cap stays shared. Positive values own this class limit
+	// independently from SharedMaxFrames and clamp to existing frame storage.
+	// Nonpositive retains the shared frame limit. H1 policy remains unchanged.
+	PureTcpAckMaxFrames int
 	// H1KnownMaxFrames defaults to eight for H1 routes whose complete-message
 	// ceilings are all known. Nonpositive disables this enlarged policy.
 	H1KnownMaxFrames int
@@ -5528,6 +5599,7 @@ func DefaultSendBufferChunkSettings() SendBufferChunkSettings {
 	return SendBufferChunkSettings{
 		SharedMaxFrames:                  sendPackBatchMaxFrames,
 		SharedMaxMessageByteCount:        DefaultMtu,
+		PureTcpAckMaxFrames:              sendPackH1GroupMaxFrames,
 		H1KnownMaxFrames:                 8,
 		H1KnownMaxMessageByteCount:       8 * DefaultMtu,
 		H1UnknownMaxFrames:               sendPackH1GroupMaxFrames,
@@ -5574,6 +5646,16 @@ func (self SendBufferChunkSettings) chunkLimits(policy transferFlightPolicySnaps
 	return min(frames, sendPackH1GroupMaxFrames), byteCount
 }
 
+// Only a validated whole-group cache can select this independent feedback
+// limit. It takes no future frame or extra owner and retains the message-byte cap.
+func (self SendBufferChunkSettings) logicalGroupLimits(policy transferFlightPolicySnapshot, pureTcpAck bool) (int, ByteCount) {
+	frames, byteCount := self.chunkLimits(policy)
+	if pureTcpAck && !policy.h1Only && 0 < self.PureTcpAckMaxFrames {
+		frames = min(self.PureTcpAckMaxFrames, sendPackH1GroupMaxFrames)
+	}
+	return frames, byteCount
+}
+
 // Resolves the legacy established byte cap without raising a positive lower value.
 func (self SendBufferChunkSettings) establishedByteLimit() ByteCount {
 	if self.H1EstablishedMaxMessageByteCount > 0 {
@@ -5583,8 +5665,8 @@ func (self SendBufferChunkSettings) establishedByteLimit() ByteCount {
 }
 
 type SendBufferSettings struct {
-	// ChunkSettings belongs to this sender; its defaults preserve shared and
-	// unknown-H1 policy while enabling the guarded known-H1 eight-frame path.
+	// ChunkSettings belongs to this sender; its defaults retain shared DATA
+	// and H1 policy while compacting validated, already-ready pure feedback.
 	ChunkSettings SendBufferChunkSettings
 
 	// Extra Transfer-level pacing is disabled for every transport by default.
@@ -5666,6 +5748,19 @@ type SendBufferSettings struct {
 	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
+	// Bounds how long a Pack carrying a SYN-ACK may still ask its receiver
+	// for immediate delivery ahead of a gap. The gap's age is that of the
+	// oldest outstanding Pack without a selective ACK, from its first write.
+	// Past the bound the Pack is written ordered, as every Pack was before
+	// immediate delivery: a gap that old is a stalled stream, and a new
+	// handshake completing across it would put a flow on a peer whose DATA
+	// waits for the gap timeout. Pure ACKs are not bounded: they carry the
+	// window updates and acknowledgements that let other flows, often the
+	// other direction's, move and release retained bytes while the gap is
+	// repaired. Non-positive never asks for a SYN-ACK's immediate delivery
+	// behind an outstanding predecessor. Resends keep the choice made at the
+	// first write.
+	ImmediateHandshakeMaxGapAge time.Duration
 	// The number of distinct later selectively acknowledged Packs required to
 	// recover the earliest missing Pack before its resend timeout. Zero disables
 	// gap recovery; each item can trigger it at most once.
@@ -8039,6 +8134,8 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		sendPack.Ack = true
 	}
 	sendPack.tcpOrderBarrier = sendPack.hasTcpOrderBarrier()
+	sendPack.pureTcpAck = sendPack.Ack && sendPack.NoBudget && sendPack.DeliverImmediately &&
+		!sendPack.tcpOrderBarrier && immediateIpAckFrames(sendPack.frameList())
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
 	sendPack.admissionFailure = sendAdmissionUnknown
@@ -8735,10 +8832,11 @@ func (self *SendSequence) processLogicalGroupChunk(
 			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeSynOpeningSuperseded))
 			return true, true, false
 		}
-		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay &&
-			(attempt.source != self || !attempt.current()) {
-			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeAckRetrySuperseded))
-			return true, true, false
+		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay {
+			if err := attempt.replayDisposition(self); err != nil {
+				sendPack.disposeUnsentGroup(err)
+				return true, true, false
+			}
 		}
 	}
 	// A new sequence has no writer when the scheduler takes its first Pack, so
@@ -8795,11 +8893,13 @@ func (self *SendSequence) processLogicalGroupChunk(
 	// Contract acquisition can wait through a carrier replacement. Only the
 	// current published ceiling may bound this still-unwritten chunk.
 	envelopePolicy := self.transferFlightPolicy()
-	// An unknown or mixed replacement cannot inherit permission to enlarge a
-	// still-unwritten chunk. Existing unknown-H1 partitions keep their policy.
+	// Repartition only the unwritten remainder before creating its next child.
+	// Newly compacted feedback narrows when a replacement selects a lower frame or
+	// byte limit; shrinkGroupLimits adjusts the live completion owner first.
+	// Initially unknown-H1 partitions keep their policy.
 	settings := self.chunkSettings()
-	currentFrames, currentBytes := settings.chunkLimits(envelopePolicy)
-	if sendPack.groupH1Known && !settings.knownH1Enabled(envelopePolicy) &&
+	currentFrames, currentBytes := settings.logicalGroupLimits(envelopePolicy, sendPack.pureTcpAck)
+	if (sendPack.groupPureTcpAckPolicy || sendPack.groupH1Known && !settings.knownH1Enabled(envelopePolicy)) &&
 		(currentFrames < maxFrames || currentBytes < maxMessageByteCount) {
 		sendPack.shrinkGroupLimits(min(maxFrames, currentFrames), min(maxMessageByteCount, currentBytes))
 		maxFrames, maxMessageByteCount = sendPack.groupChunkLimits()
@@ -9594,7 +9694,12 @@ func (self *SendSequence) writeNoAckFastPath(
 	}
 	var cipher *sequenceCipher
 	if self.session != nil {
-		cipher = self.session.Cipher()
+		// the cipher and its own epoch's verification come from one read
+		sealing := self.session.sealingState()
+		if hook := self.session.afterSealingEpochForTest; hook != nil {
+			hook()
+		}
+		cipher = sealing.cipher
 		if cipher == nil && self.session.RequireEncryption() {
 			snapshot.release(messageByteCount)
 			return false
@@ -9609,10 +9714,10 @@ func (self *SendSequence) writeNoAckFastPath(
 			}
 		}
 		if cipher != nil && !self.companionContract {
-			// the loop verifies the peer's certificate against the contract
-			// before it seals; here that has to be already settled
-			verified, noCommitment := self.session.CertVerificationState()
-			if !verified && !noCommitment {
+			// the loop verifies the sealing epoch's certificate against the
+			// contract before it seals; here that has to be already settled
+			// for the epoch whose cipher this write takes
+			if !sealing.certVerified && !sealing.noCommitment {
 				snapshot.release(messageByteCount)
 				return false
 			}
@@ -9966,22 +10071,32 @@ func newSequenceDeadlineTimer() *sequenceDeadlineTimer {
 
 // Makes the next wake come no later than deadline. Reports whether it moved
 // the timer.
+//
+// A pending timer is never moved. The runtime (Go 1.23+) marks a timer moved
+// while it is in a P's timer heap, and once the moved deadline arrives, the
+// next scheduler check walks that P's whole heap to re-sort it. A receive
+// sequence moves its idle deadline in to the 10 ms ack compression deadline
+// on most bursts, so in a server holding a million timers those walks were
+// 8-12% of its CPU (server LBALTOPT2 §3.4). A stopped timer only marks itself
+// deleted, and the runtime removes deleted timers in batches, so an earlier
+// deadline stops the pending timer and arms a new one. A timer that already
+// fired is in no heap, so Reset only adds it.
 func (self *sequenceDeadlineTimer) armBy(deadline time.Time) bool {
 	if !self.armedDeadline.IsZero() && !deadline.Before(self.armedDeadline) {
 		return false
 	}
 	self.armedDeadline = deadline
-	if self.timer == nil {
-		wake := self.wake
-		self.timer = time.AfterFunc(time.Until(deadline), func() {
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
-		})
-	} else {
+	if self.timer != nil && !self.timer.Stop() {
 		self.timer.Reset(time.Until(deadline))
+		return true
 	}
+	wake := self.wake
+	self.timer = time.AfterFunc(time.Until(deadline), func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	})
 	return true
 }
 
@@ -10573,6 +10688,11 @@ sendSequenceLoop:
 		// go first; it is taken once the introduction is acknowledged, or once
 		// its caller's budget has run out, for the deadline to drop.
 		held := func(candidate *SendPack) bool {
+			// Already-unordered pure TCP feedback owns no sequence-space
+			// dependency. Its separate receipt count cannot hold eligible DATA.
+			if candidate.pureTcpAck && !self.immediateSendAvailable(candidate) {
+				return true
+			}
 			if !self.noAckPackHeldAtContract(candidate, sendTime) {
 				return false
 			}
@@ -12672,14 +12792,14 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			allowed := func() bool {
 				attempt.update.stateLock.Lock()
 				defer attempt.update.stateLock.Unlock()
-				if attempt.source != self || !attempt.currentWithLock() {
+				if err := attempt.replayDispositionWithLock(self); err != nil {
+					disposeErr = err
 					return false
 				}
 				assign()
 				return true
 			}()
 			if !allowed {
-				disposeErr = newUnwrittenSendPackError(errNativeAckRetrySuperseded)
 				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
 				return false
 			}
@@ -12704,6 +12824,11 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			}
 		} else {
 			assign()
+		}
+		if item.deliverImmediately && immediateIpHandshakeFrames(sendFrames) && !self.immediateGapYoung(sendTime) {
+			// The gap ahead is older than the bound: this SYN-ACK waits in
+			// order behind it. Decided once, before the identity is derived.
+			item.deliverImmediately = false
 		}
 		if item.deliverImmediately {
 			messageId = immediateMessageId(self.client.ClientId(), self.sequenceId, sequenceNumber)
@@ -15023,10 +15148,17 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		item.forceUnwrapped = true
 		forceUnwrapped = true
 	}
-	var cipher *sequenceCipher
+	// One locked read pins the epoch whose cipher seals this frame. The
+	// certificate check below is of that same epoch, so a rekey promoted in
+	// between neither inherits this epoch's verification nor lends it its own.
+	var sealing sealingEpochState
 	if self.session != nil && !forceUnwrapped {
-		cipher = self.session.Cipher()
+		sealing = self.session.sealingState()
+		if hook := self.session.afterSealingEpochForTest; hook != nil {
+			hook()
+		}
 	}
+	cipher := sealing.cipher
 	if cipher == nil && self.session != nil && !forceUnwrapped && self.session.RequireEncryption() {
 		// Fail-closed backstop (EncryptionModeRequired): an application frame
 		// reached the writer without a cipher. The entry gate
@@ -15077,7 +15209,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		}
 		return disposition, err
 	}
-	if err := self.verifyPeerCertAgainstContract(); err != nil {
+	if err := self.verifyPeerCertAgainstContract(sealing); err != nil {
 		return transferWriteDisposition{}, err
 	}
 	wrapped, err := cipher.SealOuterFrame(
@@ -15235,8 +15367,12 @@ func writeMultiRouteWithCarrier(
 //     `ProvideTlsCertificate`): skip without latching, so a later contract with
 //     a cert re-arms verification.
 //
-// Once matched, the result is cached and not re-run for this session.
-func (self *SendSequence) verifyPeerCertAgainstContract() error {
+// The check is bound to `sealing.epoch`, the epoch whose cipher seals this
+// frame: that epoch's own flag decides whether to check, its own cert is
+// checked, and only it is marked. Once matched, the result is cached on that
+// epoch; a rekey epoch starts unverified, so its own cert is checked before
+// its cipher first seals.
+func (self *SendSequence) verifyPeerCertAgainstContract(sealing sealingEpochState) error {
 	if self.session == nil {
 		return nil
 	}
@@ -15251,18 +15387,15 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 		}
 		return nil
 	}
-	verified, noCommitment := self.session.CertVerificationState()
-	if verified || noCommitment {
+	if sealing.certVerified || sealing.noCommitment {
 		return nil
 	}
 	expected := self.session.trustedPeerCertSnapshot()
-	// V(2) diagnostic: verify against the established epoch (whose cipher seals
-	// this frame), not the in-flight currentEpoch() whose ConnectionState() blocks
-	// on the running handshake. Logged so reaching this path (trusted set armed) is
+	// V(2) diagnostic: logged so reaching this path (trusted set armed) is
 	// observable.
 	if self.log.V(2).Enabled() {
 		self.log.Infof(
-			"[s][cert-verify]%s->%s s(%s) verifying established-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
+			"[s][cert-verify]%s->%s s(%s) verifying sealing-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
 			self.client.ClientTag(),
 			self.destination,
 			self.contractMultiRouteWriterAlias.StreamId,
@@ -15270,7 +15403,11 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 			self.companionContract,
 		)
 	}
-	peerCerts := self.session.establishedPeerCertificates()
+	// The sealing epoch was promoted only after its handshake completed, so
+	// reading its certs never blocks. An in-flight epoch's ConnectionState()
+	// blocks on its running handshake, whose ClientHello can be waiting to be
+	// packed onto this same send sequence: verifying it here deadlocked.
+	peerCerts := self.session.peerCertificatesOfEpoch(sealing.epoch)
 	ok, err := verifyPeerCertificateAgainstContract(peerCerts, expected)
 	if err != nil {
 		self.log.Errorf(
@@ -15295,7 +15432,10 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 		)
 		return errors.New("sequence TLS cert verification failed")
 	}
-	self.session.MarkCertVerified()
+	if hook := self.session.beforeCertVerifiedMarkForTest; hook != nil {
+		hook()
+	}
+	self.session.markCertVerifiedForEpoch(sealing.epoch)
 	return nil
 }
 
@@ -16716,6 +16856,9 @@ type ReceiveSequence struct {
 
 	receiveQueue       *receiveQueue
 	nextSequenceNumber uint64
+	// When the earliest item past the open hole arrived, as last published to
+	// the client (publishReceiveGap); zero with no hole. Owned by Run.
+	publishedGapSince time.Time
 
 	idleCondition *IdleCondition
 
@@ -17401,6 +17544,8 @@ func (self *ReceiveSequence) Run() {
 		}
 	}()
 	defer func() {
+		// an ended sequence holds no hole open for its owner
+		self.publishReceiveGap(time.Time{})
 		// deliver-then-die: an exit path (error, idle, cancel) must not strand
 		// buffered head items — deliver their frames, send their acks, and
 		// return their pool buffers
@@ -18034,6 +18179,8 @@ func (self *ReceiveSequence) Run() {
 		var timeout time.Duration
 		// the earliest hole's absolute deadline; zero when none
 		var gapDeadline time.Time
+		// when the earliest item past that hole arrived; zero when none
+		var gapSince time.Time
 		var expiredGap *receiveItem
 		deliveryBlocked := false
 
@@ -18100,9 +18247,11 @@ func (self *ReceiveSequence) Run() {
 							}
 						}
 						expiredGap = item
+						gapSince = item.receiveTime
 						break
 					}
 					gapDeadline = itemGapDeadline
+					gapSince = item.receiveTime
 					if itemGapTimeout < timeout {
 						timeout = itemGapTimeout
 					}
@@ -18168,6 +18317,9 @@ func (self *ReceiveSequence) Run() {
 				self.commitHeldPrefix()
 			}
 		}
+		// the owner reads how long the peer's stream has been frozen behind
+		// this hole (transfer_receive_gap.go); stored only when it changes
+		self.publishReceiveGap(gapSince)
 
 		processPack := func(receivePack *ReceivePack, ok bool) bool {
 			if !ok {
@@ -18290,6 +18442,9 @@ func (self *ReceiveSequence) Run() {
 				return
 			}
 			self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, expiredGap.sequenceNumber, time.Since(gapHandoff.receivedAt), self.receiveBufferSettings.GapTimeout)
+			// the eviction notice: the peer's return stream on this sequence
+			// stays frozen, so its owner moves the flows instead of waiting
+			self.client.receiveGapTimedOut(self.source)
 			return
 		}
 
@@ -19172,6 +19327,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			Principal:     receiveContract.principal,
 			TransferKey:   self.transferKey,
 			TransportType: item.transportType,
+			aheadOfGap:    item.aheadOfGap,
 		}
 	} else {
 		// no contract peers are considered in network
@@ -19179,6 +19335,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			ProvideMode:   protocol.ProvideMode_Network,
 			TransferKey:   self.transferKey,
 			TransportType: item.transportType,
+			aheadOfGap:    item.aheadOfGap,
 		}
 	}
 	// EncryptedControl frames are routed into the per-peer session instead
@@ -19216,12 +19373,14 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	}
 
 	// buffer for a combined dispatch: a Peer identity change (contract
-	// rotation) is a batch boundary because one callback carries one peer
+	// rotation) is a batch boundary because one callback carries one peer,
+	// and so is a change between ordered and ahead-of-gap delivery
 	peerEqual := func(a Peer, b Peer) bool {
 		return a.ProvideMode == b.ProvideMode &&
 			a.Principal == b.Principal &&
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
+			a.aheadOfGap == b.aheadOfGap &&
 			slices.Equal(a.Roles, b.Roles)
 	}
 	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
@@ -19807,7 +19966,10 @@ type receiveItem struct {
 	contractAhead      bool
 	noBudget           bool
 	deliverImmediately bool
-	tagSet             bool
+	// Immediate delivery handed this item over ahead of an undelivered
+	// earlier ordinal; see Peer.aheadOfGap.
+	aheadOfGap bool
+	tagSet     bool
 	// Promoted through decodedPackOwner: alive through both item rebuilds.
 	inUse bool
 	// committed is set once this held item has been selectively acknowledged,

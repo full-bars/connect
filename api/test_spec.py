@@ -209,6 +209,31 @@ class SpecTest(unittest.TestCase):
         defaults = settings["get"]["responses"]["200"]["content"]["application/json"]["examples"]["defaults"]["value"]
         self.assertEqual([], defaults["charging"])
 
+    def test_sn_artifact_documents_the_final_404(self):
+        # server api/handlers/sn_handlers.go SnArtifact: a hash the store holds
+        # no payout artifact under is 404, not 502. The v1 carry sweep's root
+        # commits its sweep record's hash, a ledger object, and the sdk's
+        # claim reader takes the 404 as final for the hash
+        responses = self.spec["paths"]["/sn/artifact"]["get"]["responses"]
+        not_found = " ".join(responses["404"]["description"].split())
+        self.assertIn("No payout artifact is stored under this hash", not_found)
+        self.assertIn("final for the hash", not_found)
+        self.assertIn("`/sn/ledger/object`", not_found)
+        self.assertIn("failed to answer", responses["502"]["description"])
+        self.assertIn("404", self.spec["paths"]["/sn/ledger/object"]["get"]["responses"])
+
+    def test_auth_verify_takes_an_optional_bearer(self):
+        # server model.AuthVerify: a signed-in caller verifying a sign-in
+        # method of its own network renews its own session when it sends its
+        # network token, so the generated clients must send it when they
+        # have one; any other caller is served signed out
+        verify = self.spec["paths"]["/auth/verify"]["post"]
+        self.assertEqual([{}, {"BearerAuth": []}], verify["security"])
+        description = " ".join(verify["description"].split())
+        self.assertIn("renews the caller's own session", description)
+        self.assertIn("leaves the code unused", description)
+        self.assertIn("never refused here", description)
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

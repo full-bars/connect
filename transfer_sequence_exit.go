@@ -190,16 +190,70 @@ func resetSequenceExitAggregatorForTest() {
 	globalSequenceExitAggregator.reset()
 }
 
-// One bounded metadata-only diagnostic identifies the first terminal owner
-// decision. Generic callback errors intentionally retain their old contract.
-// No packet history, payload, timer or additional queue is retained. Only the
-// send owner calls this, including its synchronous pacing/route-write waits.
+// The first terminal owner decision of each send sequence is counted for the
+// process by reason (GetSendSequenceExitCounts), and described by one bounded
+// metadata-only diagnostic. Upstream moved the line to V(1) on 2026-11-15
+// because of its rate on the services edges. The fork keeps it at INFO with
+// routine exits aggregated per minute (see the aggregator above), and the
+// counts keep the rate by reason either way. An idle exit is the ordinary end of a quiet sequence: it is neither
+// logged nor counted.
+
+// The reasons recordSendSequenceExit's callers pass, other than idle. A reason
+// not listed is counted as sendSequenceExitReasonOther, so the counts stay a
+// fixed set.
+var sendSequenceExitReasons = [...]string{
+	"run_return",
+	"packs_closed",
+	"context",
+	"ack_worker_exit",
+	"ack_lifetime",
+	"retained_silence",
+	"contract_canceled",
+	"contract_creation",
+	"head_rewrite",
+}
+
+const sendSequenceExitReasonOther = "other"
+
+// one per sendSequenceExitReasons entry, then other
+var sendSequenceExitCounts [len(sendSequenceExitReasons) + 1]atomic.Uint64
+
+// GetSendSequenceExitCounts returns the process's send sequence exits since it
+// started, by the reason of each sequence's first terminal owner decision.
+// Every reason is present, zero or not, and other counts any reason not in the
+// fixed set. Idle exits are not counted.
+func GetSendSequenceExitCounts() map[string]uint64 {
+	counts := make(map[string]uint64, len(sendSequenceExitCounts))
+	for i, reason := range sendSequenceExitReasons {
+		counts[reason] = sendSequenceExitCounts[i].Load()
+	}
+	counts[sendSequenceExitReasonOther] = sendSequenceExitCounts[len(sendSequenceExitReasons)].Load()
+	return counts
+}
+
+// Generic callback errors intentionally retain their old contract. No packet
+// history, payload, timer or additional queue is retained. Only the send owner
+// calls this, including its synchronous pacing/route-write waits. The fork
+// keeps the INFO line (routine exits go to the aggregator, once a minute per
+// bucket) that upstream moved behind V(1), so providers still see why a
+// sequence ended. The exit is always counted first.
 func (self *SendSequence) recordSendSequenceExit(reason string, item *sendItem, deadline time.Time, cause error) {
 	if self.exitDiagnosticWritten {
 		return
 	}
 	self.exitDiagnosticWritten = true
-	if self.log == nil || self.client == nil || reason == "idle" {
+	if reason == "idle" {
+		return
+	}
+	reasonIndex := len(sendSequenceExitReasons)
+	for i, knownReason := range sendSequenceExitReasons {
+		if knownReason == reason {
+			reasonIndex = i
+			break
+		}
+	}
+	sendSequenceExitCounts[reasonIndex].Add(1)
+	if self.log == nil || self.client == nil {
 		return
 	}
 	now := time.Now()

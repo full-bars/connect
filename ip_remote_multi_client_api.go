@@ -841,6 +841,18 @@ func (self *ApiMultiClientGenerator) excludesDestination(destination MultiHopId)
 	return false
 }
 
+// Implements multiClientGeneratorIdentityRestore: a window keeps the identity
+// of an exit it judged held, warned, gapped or in an ack stall out of the
+// snapshot a restart restores, and puts it back once the exit recovers
+// (ip_remote_multi_client_exit_stall.go). Args without a credential name no
+// recorded identity.
+func (self *ApiMultiClientGenerator) setIdentityRestorable(args *MultiClientGeneratorClientArgs, restorable bool) {
+	if args == nil || args.ClientAuth == nil {
+		return
+	}
+	self.identityState.SetRestorable(args.ClientId, args.ClientAuth.InstanceId, restorable)
+}
+
 // NextDestinationsContext implements MultiClientGeneratorContext. Discovery is
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
@@ -1687,6 +1699,19 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	// window clients are the non-provider client connections that measure
 	// transport delay (DELAY.md D3)
 	clientSettings.TransportDelay = self.settings.TransportDelay
+	// A client whose sessions are required (a post-quantum window client)
+	// seals its traffic from the first application byte, and the provider can
+	// open it only with this client's identity key: from the contract the
+	// platform issues it or from its /key/<client_id> fetch, and both read the
+	// platform's processed registration. So setup waits for that registration
+	// below, as the capability probe's clients do (server
+	// qualityprobe/providertunnel). Without the wait the provider resolves no
+	// key for a client minted moments ago, drops every sealed frame unacked,
+	// and the window fails a healthy candidate (2026-11-15: post-quantum
+	// windows found peers and failed every one).
+	if clientSettings.EncryptionSettings != nil && clientSettings.EncryptionSettings.Mode == EncryptionModeRequired {
+		clientSettings.ClientKeyRegistrationRequired = true
+	}
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := self.newPlatformTransportSettings()
 	settings.TransportDelay = self.settings.TransportDelay
