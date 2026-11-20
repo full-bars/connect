@@ -655,6 +655,11 @@ type PlatformTransportSettings struct {
 	// dials only its family, declares it to the platform, and never counts
 	// its dial failures against the backend. See transport_family.go.
 	IpFamily int
+	// DialsThroughProxy marks a pinned transport whose dial leaves through a
+	// proxy (an injected DialContext). The proxy supplies the exit, so this
+	// host's own address of the family is not needed and the local family check
+	// does not hold the transport. The control family policy still does.
+	DialsThroughProxy bool
 	// StartDisabled constructs the transport held (see SetEnabled): it dials
 	// nothing until its owner enables it. The provider group's standby uses it.
 	StartDisabled bool
@@ -1252,6 +1257,9 @@ type PlatformTransport struct {
 
 	// ipFamily is the pin: 4, 6, or 0. Immutable after construction.
 	ipFamily int
+	// dialsThroughProxy exempts a pin from the local family check. Immutable
+	// after construction (PlatformTransportSettings.DialsThroughProxy).
+	dialsThroughProxy bool
 	// enabled is the owner's switch (SetEnabled). familyHold is a pinned
 	// transport's own reason not to dial, a PlatformTransportState, with
 	// PlatformTransportStateConnecting meaning none. held derives from both
@@ -1847,6 +1855,7 @@ func NewPlatformTransportWithTargetMode(
 	}
 	transport.residentMoveDial = settings.ResidentMoveDial
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
+	transport.dialsThroughProxy = settings.DialsThroughProxy
 	transport.enabled.Store(!settings.StartDisabled)
 	transport.held = NewMonitorValue(settings.StartDisabled)
 	pinnedReconnectMaxTimeout := settings.PinnedReconnectMaxTimeout

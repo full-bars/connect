@@ -574,7 +574,10 @@ func (self *PlatformTransport) refreshFamilyHold() {
 	hold := PlatformTransportStateConnecting
 	if pinnedFamilyPolicyConflict(self.ipFamily) {
 		hold = PlatformTransportStateIdlePolicy
-	} else if !pinnedFamilySupported(self.ipFamily) {
+	} else if !self.dialsThroughProxy && !pinnedFamilySupported(self.ipFamily) {
+		// a pin that dials through a proxy does not use this host's address of
+		// the family, so the local probe and the interface bind say nothing
+		// about whether it can connect
 		hold = PlatformTransportStateSleeping
 	}
 	previous := PlatformTransportState(self.familyHold.Swap(int32(hold)))
