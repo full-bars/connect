@@ -538,6 +538,13 @@ func noteBackendNetworkChanged() {
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
 type PlatformTransportSettings struct {
+	// OwnClientStrategy hands this transport the client strategy it was built
+	// with: Close releases it. It is OFF by default because most transports
+	// share their strategy with the caller (the smart dialer probes, a family
+	// group's other transports), and closing a shared strategy would break
+	// those users. Only a caller that builds one strategy per transport sets
+	// it, as the proxied IPv6 builder in the provider does.
+	OwnClientStrategy bool
 	// Nonblocking notification. Only a subsequent confirmed API rejection logs out.
 	AuthorizationClosed func(AuthorizationCloseCause)
 	// Log, when set, is used by the platform transport and its framer
@@ -4750,6 +4757,11 @@ func (self *PlatformTransport) Close() {
 	// transport whose owner already considers it dead.
 	if self.unsubNetworkChange != nil {
 		self.unsubNetworkChange()
+	}
+	// a strategy that only this transport built dies with it; a shared one is
+	// left to its owner
+	if self.settings != nil && self.settings.OwnClientStrategy && self.clientStrategy != nil {
+		self.clientStrategy.Close()
 	}
 }
 

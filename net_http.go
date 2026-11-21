@@ -704,6 +704,13 @@ func (self *ClientStrategy) shedMemory() {
 	}
 }
 
+// Closed reports whether Close has already released the strategy.
+func (self *ClientStrategy) Closed() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.closed
+}
+
 // Ends discovery and releases pooled HTTP connections. APIs and transports
 // sharing the strategy must be closed first; repeated calls are safe.
 func (self *ClientStrategy) Close() {
