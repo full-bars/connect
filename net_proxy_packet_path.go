@@ -102,6 +102,9 @@ func isDatagramDialNetwork(network string) bool {
 // this host's is opened, so nothing leaves outside the proxy. `addr` must be an
 // ip literal of the network's family: a name would be looked up on this host.
 func (self *ConnectSettings) dialProxiedPacket(ctx context.Context, network string, addr string) (net.Conn, error) {
+	if self.DialContextSettings != nil && self.DialContextSettings.PacketDial != nil {
+		return self.DialContextSettings.PacketDial(ctx, network, addr)
+	}
 	if self.DialContextSettings == nil || self.DialContextSettings.PacketConnFactory == nil {
 		return nil, ErrExtenderPacketCarrierUnavailable
 	}

@@ -334,3 +334,59 @@ func TestExtenderBlockAttemptProxyRefusalIsNoEvidence(t *testing.T) {
 	}
 	harness.requireSuspectCount("after an attempt the space could not dial", 1)
 }
+
+// The owner may dial a proxied space's datagram itself. Its conn is what the
+// dial returns, the factory is not called, and a refusal opens nothing. With no
+// owner dial the packet endpoint is used as before.
+func TestProxiedPacketDialIsTheOwnersWhenSet(t *testing.T) {
+	refusal := errors.New("the owner refuses this destination")
+	var dialed []string
+	factoryCount := 0
+	settings := DefaultConnectSettings()
+	settings.ProxySettings = testProxySettings()
+	settings.DialContextSettings = &DialContextSettings{
+		PacketConnFactory: func(ctx context.Context) (net.PacketConn, error) {
+			factoryCount += 1
+			return net.ListenPacket("udp4", "127.0.0.1:0")
+		},
+		PacketDial: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			dialed = append(dialed, network+" "+addr)
+			if addr == "127.0.0.1:9" {
+				return nil, refusal
+			}
+			client, server := net.Pipe()
+			server.Close()
+			return client, nil
+		},
+	}
+
+	conn, err := settings.DialContext(context.Background(), "udp", "127.0.0.1:9")
+	if conn != nil {
+		conn.Close()
+	}
+	if !errors.Is(err, refusal) {
+		t.Fatalf("the refused dial failed with %v, expected the owner's refusal", err)
+	}
+	conn, err = settings.DialContext(context.Background(), "udp", "127.0.0.1:10")
+	if err != nil {
+		t.Fatalf("an allowed dial failed: %v", err)
+	}
+	conn.Close()
+	if factoryCount != 0 {
+		t.Fatalf("the owner's dial opened %d factory endpoints, expected none", factoryCount)
+	}
+	if len(dialed) != 2 || dialed[0] != "udp 127.0.0.1:9" || dialed[1] != "udp 127.0.0.1:10" {
+		t.Fatalf("the owner dialed %v, expected both destinations as given", dialed)
+	}
+
+	// no owner dial: the factory endpoint, as before
+	settings.DialContextSettings.PacketDial = nil
+	conn, err = settings.DialContext(context.Background(), "udp", "127.0.0.1:9")
+	if err != nil {
+		t.Fatalf("a dial with no owner dial failed: %v", err)
+	}
+	conn.Close()
+	if factoryCount != 1 {
+		t.Fatalf("a dial with no owner dial opened %d endpoints, expected one", factoryCount)
+	}
+}

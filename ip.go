@@ -3123,8 +3123,12 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		}
 		sequence.socketReadPoller = self.socketReadPoller
 		sequence.kernelReceiveDropCount = self.kernelReceiveDropCount
+		// a flow of a space whose egress is a proxy is not a socket of this host
+		// to poll: it would open (and dial the proxy) once for the shared socket,
+		// fail to register, close it and dial again
 		sequence.sharedSocketLifecycle =
-			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle
+			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle &&
+				self.udpBufferSettings.ProxySettings == nil
 		sequence.sharedLifecycleWake = self.sharedLifecycleWake
 		sequence.memoryIndexed.Store(true)
 		self.sequences[bufferId] = sequence

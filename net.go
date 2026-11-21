@@ -231,6 +231,14 @@ type DialContextSettings struct {
 	// The caller owns and closes every non-nil endpoint, including one returned
 	// alongside an error. Nil retains the platform's ordinary wildcard socket.
 	PacketConnFactory func(context.Context) (net.PacketConn, error)
+	// PacketDial, when set, dials each datagram of a space whose egress is a
+	// proxy (ConnectSettings.DialContext with ProxySettings) in place of the
+	// packet endpoint: the owner returns the connected conn, so it can refuse a
+	// destination its proxy cannot carry, wait for a check or count a refusal
+	// before the proxy is contacted. It gets the dial's network and address as
+	// given. A carrier that reads PacketConnFactory directly does not use it.
+	// Nil keeps the packet endpoint path.
+	PacketDial func(ctx context.Context, network string, addr string) (net.Conn, error)
 	// UdpIdleTimeout, when positive, caps the NAT idle and read timeouts of
 	// the UDP flows of a LocalUserNat whose UdpBufferSettings carry these
 	// settings (NewLocalUserNat applies it to its own copy). It never
