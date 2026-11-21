@@ -337,6 +337,7 @@ func TestSealingCipherBelongsToVerifiedEpoch(t *testing.T) {
 // let the promoted epoch's verification admit the older epoch's cipher. Once
 // the promoted epoch seals, the fast path writes again.
 func TestNoAckFastPathSealsOnlyWithVerifiedEpoch(t *testing.T) {
+	restoreCertEpochBackendFailures(t)
 	assertMessagePoolOwnership(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -386,4 +387,14 @@ func TestNoAckFastPathSealsOnlyWithVerifiedEpoch(t *testing.T) {
 	if sealer := write(); sealer != e2 {
 		t.Fatal("fast path did not resume under the verified promoted epoch")
 	}
+}
+
+// Restore the backend failure state after the fixture client is cancelled.
+func restoreCertEpochBackendFailures(t *testing.T) {
+	t.Helper()
+	count, last := consecutiveBackendFails.Load(), lastBackendFailNano.Load()
+	t.Cleanup(func() {
+		consecutiveBackendFails.Store(count)
+		lastBackendFailNano.Store(last)
+	})
 }

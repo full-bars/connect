@@ -170,6 +170,7 @@ func TestContractOpenDuringRekeyCompanion(t *testing.T) {
 // Drives a sequence synchronously so rekey can start between exact writes.
 func newContractRekeyWriteFixture(t *testing.T) (*SendSequence, *peerEncryptionSession, chan []byte) {
 	t.Helper()
+	restoreCertEpochBackendFailures(t)
 	client, sequence, destinationId, contract := newSendNoContractHarness(t, t.Context())
 	sequence.sendBuffer = client.sendBuffer
 	contract.contract = &protocol.Contract{StoredContractBytes: NewId().Bytes()}
