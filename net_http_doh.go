@@ -1931,6 +1931,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	// a DoH miss carried a filtering block's extended dns error
 	blockedMiss := false
 	minCacheTtl := self.settings.MinCacheTtl
+	var bootstrapHardExpiration time.Time
 
 	// a doh server name can not resolve through doh (circular). it resolves
 	// over remote plain dns through the tunnel instead — permitted even when
@@ -2053,7 +2054,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 		// every encrypted resolver failed: the bootstrap plain dns fallback.
 		// Its answer is used but a miss is not taken as authoritative, so the
 		// next lookup asks DoH again.
-		resolvedIps, err := self.bootstrapLookupIP(ctx, lookupNetwork, q.Domain)
+		resolvedIps, err := self.bootstrapLookupIP(ctx, lookupNetwork, normalizeInternalDohName(q.Domain))
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			bootstrapExpiration := self.settings.LocalExpiration
@@ -2063,6 +2064,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 			for _, ip := range resolvedIps {
 				if addr, ok := netIPAddr(ip); ok {
 					addrExpirations[addr] = now.Add(bootstrapExpiration)
+					bootstrapHardExpiration = now.Add(bootstrapExpiration)
 				}
 			}
 			if 0 < len(addrExpirations) {
@@ -2093,6 +2095,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 			AddrExpirations: addrExpirations,
 			Miss:            cacheMiss && len(addrExpirations) == 0,
 			Blocked:         blocked,
+			HardExpiration:  bootstrapHardExpiration,
 		}
 		if r.Miss && loneMiss {
 			r.MissExpiration = self.settings.LoneMissExpiration
@@ -4114,6 +4117,8 @@ func NewDohKey(recordType string, domain string) DohKey {
 }
 
 type DohResult struct {
+	// HardExpiration caps serving bootstrap fallback answers, including stale answers.
+	HardExpiration  time.Time
 	Time            time.Time
 	AddrExpirations map[netip.Addr]time.Time
 	Miss            bool
@@ -4135,6 +4140,9 @@ type DohResult struct {
 }
 
 func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
+	if !self.HardExpiration.IsZero() && !self.HardExpiration.After(now) {
+		return false
+	}
 	if self.Response != nil && !self.Miss {
 		return !self.Expiration.Before(now)
 	}
@@ -4162,6 +4170,9 @@ func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
 // keeping known-good addresses reachable, and an expired miss carries none. A raw response with
 // answers is stale-usable on the same bound past its Expiration.
 func (self *DohResult) staleUsable(now time.Time) bool {
+	if !self.HardExpiration.IsZero() && !self.HardExpiration.After(now) {
+		return false
+	}
 	if self.Response != nil {
 		return !self.Miss && now.Before(self.Expiration.Add(dohStaleServeBound))
 	}

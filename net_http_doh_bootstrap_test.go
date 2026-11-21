@@ -481,3 +481,41 @@ func TestBootstrapLookupAsksForTheRootedName(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapLookupGetsTheAsciiNameOfAnInternationalName(t *testing.T) {
+	plain := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.81")}
+	cache := newBootstrapTestCache(t, "", &bootstrapDohTransport{}, plain)
+	cache.QueryResult(t.Context(), "A", "bücher.example.test")
+	if got := plain.queried(); !slices.Equal(got, []string{"xn--bcher-kva.example.test"}) {
+		t.Fatalf("fallback asked for %v", got)
+	}
+}
+
+func TestBootstrapAnswerIsNotServedStalePastItsCap(t *testing.T) {
+	now := time.Now()
+	addr := netip.MustParseAddr("192.0.2.81")
+	ordinary := &DohResult{Time: now, AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(time.Minute)}}
+	bootstrap := &DohResult{Time: now, AddrExpirations: ordinary.AddrExpirations, HardExpiration: now.Add(time.Minute)}
+	if !bootstrap.staleUsable(now.Add(30*time.Second)) || !ordinary.staleUsable(now.Add(90*time.Second)) {
+		t.Fatal("an answer inside its cap and an ordinary stale answer must stay usable")
+	}
+	if bootstrap.Valid(now.Add(time.Minute), time.Minute) || bootstrap.staleUsable(now.Add(time.Minute)) || bootstrap.staleUsable(now.Add(90*time.Second)) {
+		t.Fatal("a bootstrap answer at or past its cap was served stale")
+	}
+}
+
+func TestBootstrapResolveRecordsTheHardExpiration(t *testing.T) {
+	plain := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.81")}
+	cache := newBootstrapTestCache(t, "", &bootstrapDohTransport{}, plain)
+	cache.QueryResult(t.Context(), "A", "connect.example.test")
+	cache.stateLock.Lock()
+	defer cache.stateLock.Unlock()
+	if len(cache.queryResultExpiration) != 1 {
+		t.Fatalf("cached results = %d", len(cache.queryResultExpiration))
+	}
+	for _, r := range cache.queryResultExpiration {
+		if r.HardExpiration.IsZero() || r.HardExpiration.After(r.Time.Add(cache.settings.LocalExpiration)) {
+			t.Fatalf("hard expiration %v for a result at %v", r.HardExpiration, r.Time)
+		}
+	}
+}
