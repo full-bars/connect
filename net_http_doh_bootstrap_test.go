@@ -462,3 +462,22 @@ func TestIngressDohVerifiesCertificates(t *testing.T) {
 		cache.Close()
 	}
 }
+
+func TestBootstrapLookupAsksForTheRootedName(t *testing.T) {
+	var got []string
+	lookup := rootedBootstrapLookup(func(ctx context.Context, network, host string) ([]net.IP, error) {
+		got = append(got, host)
+		return nil, nil
+	})
+	for _, name := range []string{"connect.example", "connect.example.", ""} {
+		if _, err := lookup(context.Background(), "ip", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"connect.example.", "connect.example.", ""}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("lookup %d asked for %q, want %q", i, got[i], want[i])
+		}
+	}
+}

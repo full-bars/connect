@@ -89,5 +89,15 @@ func newBootstrapPlainDnsLookup(
 			return conn, err
 		}),
 	}
-	return resolver.LookupIP
+	return rootedBootstrapLookup(resolver.LookupIP)
+}
+
+// rootedBootstrapLookup asks for the exact name, bypassing resolver search domains.
+func rootedBootstrapLookup(lookup func(context.Context, string, string) ([]net.IP, error)) func(context.Context, string, string) ([]net.IP, error) {
+	return func(ctx context.Context, network, host string) ([]net.IP, error) {
+		if host != "" && !strings.HasSuffix(host, ".") {
+			host += "."
+		}
+		return lookup(ctx, network, host)
+	}
 }
