@@ -58,8 +58,9 @@ func TestControlDirectHandshakeStillDemotesAndRetries(t *testing.T) {
 	controlFamilyClear()
 	defer controlFamilyClear()
 	settings := DefaultConnectSettings()
-	// An injected dial overrides ProxySettings, so this path is direct.
-	settings.ProxySettings = &ProxySettings{Network: "tcp", Address: "127.0.0.1:1080"}
+	// No ProxySettings, so this path is direct. With ProxySettings the dial is
+	// a proxy dial, whatever dial is injected, and neither demotes nor retries
+	// (the proxied tests above).
 	settings.DialContextSettings = &DialContextSettings{}
 	var networks []string
 	dial := func(_ context.Context, network, _ string) (net.Conn, error) {
