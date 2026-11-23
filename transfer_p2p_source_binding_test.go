@@ -342,7 +342,7 @@ func TestP2pRouteForgedSourceWrapsAllocateNoPeerState(t *testing.T) {
 			contractRequestCount,
 		)
 	}
-	AssertEqual(t, uint64(forgedSourceFrameCount), fixture.client.ReceiveStats().ForgedSourceDropCount)
+	AssertEqual(t, uint64(forgedSourceFrameCount), fixture.client.ReceiveStats().SourceMismatchDroppedCount)
 }
 
 // Plaintext packs naming forged sources on a P2P association allocate
@@ -366,7 +366,7 @@ func TestP2pRouteForgedSourcePacksAllocateNoPeerState(t *testing.T) {
 			state.sessionCount,
 		)
 	}
-	AssertEqual(t, uint64(forgedSourceFrameCount), fixture.client.ReceiveStats().ForgedSourceDropCount)
+	AssertEqual(t, uint64(forgedSourceFrameCount), fixture.client.ReceiveStats().SourceMismatchDroppedCount)
 }
 
 // A client with encryption off can neither open a wrap nor answer a handshake,

@@ -1840,10 +1840,16 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 type ClientReceiveStatsSnapshot struct {
 	ReceiveDecodeReservedByteCount ByteCount
 	ReceiveDecodePressureDropCount uint64
-	// Frames a direct peer (P2P) route delivered that named the platform, this
-	// client, or a source other than the peer the route is bound to, dropped
-	// as forged.
+	// Frames a direct peer (P2P) route dropped because they named the platform
+	// or this client. Frames that named a source other than the lane's bound
+	// peer are counted in SourceMismatchCount instead.
 	ForgedSourceDropCount           uint64
+	ForgedSourcePlatformDropCount   uint64
+	ForgedSourceSelfDropCount       uint64
+	SourceMismatchCount             uint64
+	SourceMismatchDecodedCount      uint64
+	SourceMismatchRejectedCount     uint64
+	SourceMismatchDroppedCount      uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
 	PackHandoffWaitCount            uint64
@@ -2253,7 +2259,12 @@ type Client struct {
 	// The shared receive pump remains nonblocking for H3/unknown. H1 may spend a
 	// separately configured bounded wait after a queue fills; primitive counters
 	// expose those rare waits and drops without a metrics handoff or hot log.
-	receiveForgedSourceDropCount           atomic.Uint64
+	//
+	// p2pSources holds this client's source policy counters: forged drops by
+	// kind, and bound lane mismatches by the mode in force and the outcome.
+	// They mirror into the process aggregate that a provider's metrics
+	// endpoint reads.
+	p2pSources                             p2pSourceCounters
 	receivePackHandoffDropCount            atomic.Uint64
 	receivePackHandoffDropByteCount        atomic.Uint64
 	receivePackHandoffWaitCount            atomic.Uint64
@@ -2680,10 +2691,17 @@ func (self *Client) ClientTag() string {
 // A snapshot taken during traffic may straddle one Pack update, so byte and
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
+	platformDrops, selfDrops := self.p2pSources.forged()
 	snapshot := ClientReceiveStatsSnapshot{
 		ReceiveDecodeReservedByteCount:         self.receiveDecodeReservedByteCount.Load(),
 		ReceiveDecodePressureDropCount:         self.receiveDecodePressureDropCount.Load(),
-		ForgedSourceDropCount:                  self.receiveForgedSourceDropCount.Load(),
+		ForgedSourceDropCount:                  platformDrops + selfDrops,
+		ForgedSourcePlatformDropCount:          platformDrops,
+		ForgedSourceSelfDropCount:              selfDrops,
+		SourceMismatchCount:                    self.p2pSources.mismatchTotal(),
+		SourceMismatchDecodedCount:             self.p2pSources.mismatchAt(p2pSourceModeCount, p2pSourceOutcomeDecoded),
+		SourceMismatchRejectedCount:            self.p2pSources.mismatchAt(p2pSourceModeCount, p2pSourceOutcomeRejected),
+		SourceMismatchDroppedCount:             self.p2pSources.mismatchAt(p2pSourceModeCount, p2pSourceOutcomeDropped) + self.p2pSources.mismatchAt(p2pSourceModeDrop, p2pSourceOutcomeDropped),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
@@ -4579,9 +4597,12 @@ func (self *Client) recordReceiveAckRouteWriteDisposition(
 // ForwardFunction
 // forward dispatches to the forward callbacks. It is itself a `ForwardFunction`:
 // the bytes are valid only for the duration of the call, and the caller returns
-// them after (mirrors `receive`).
-func (self *Client) forward(path TransferPath, transferFrameBytes []byte) {
+// them after (mirrors `receive`). It reports how many callbacks took the frame,
+// so a caller can tell a frame that left the client from one no callback wanted.
+func (self *Client) forward(path TransferPath, transferFrameBytes []byte) int {
+	forwardCount := 0
 	for _, forwardCallback := range self.forwardCallbacks.Get() {
+		forwardCount += 1
 		c := func() any {
 			return HandleError(func() {
 				forwardCallback(path, transferFrameBytes)
@@ -4596,6 +4617,7 @@ func (self *Client) forward(path TransferPath, transferFrameBytes []byte) {
 			c()
 		}
 	}
+	return forwardCount
 }
 
 // AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
@@ -4617,6 +4639,30 @@ func (self *Client) AddForwardCallback(forwardCallback ForwardFunction) func() {
 	return func() {
 		self.forwardCallbacks.Remove(callbackId)
 	}
+}
+
+// packHasApplicationFrames reports whether the pack carries any frame that is
+// not an encrypted control frame. The receive gate routes control frames into
+// the session and discards only the application frames that remain.
+func packHasApplicationFrames(pack *protocol.Pack) bool {
+	for _, frame := range pack.GetFrames() {
+		if frame != nil && frame.GetMessageType() != protocol.MessageType_TransferEncryptedControl {
+			return true
+		}
+	}
+	return false
+}
+
+// plaintextReceiveDiscarded reports whether the receive sequence for sourceId
+// will discard a plaintext application frame. It mirrors the fail-closed gate
+// in the sequence drain: a session is expected for the source (so the source is
+// not the platform and this client holds an identity of its own) and the
+// session runs in EncryptionModeRequired. Such a frame is acked to keep the
+// sequence moving and then thrown away, so the receive path must not report it
+// as decoded.
+func (self *Client) plaintextReceiveDiscarded(sourceId Id) bool {
+	manager := self.encryptionSessionManager
+	return manager != nil && manager.RequireEncryption() && !manager.ReceiveNoSession(sourceId)
 }
 
 func (self *Client) run() {
@@ -4805,37 +4851,54 @@ func (self *Client) run() {
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
-		if path.IsStream() {
+		// The delivery lane's type and binding, as the source rules read them.
+		// Both come from the same read as the frame, so a lane removed while
+		// the frame was in flight is still judged with the identity it arrived
+		// on (TransferCarrierProperties.boundSourceId).
+		disposition := transferReceiveDisposition{
+			transportType: transportType,
+			boundSourceId: boundSourceId,
+		}
+		// The enforced half: on a direct peer-to-peer lane a frame naming the
+		// platform, which only the platform may do, or naming this client, which
+		// only its own traffic does, is forged. A relayed frame can never
+		// legitimately name either, so it is dropped before decode: everything
+		// after allocates state for the named source, a receive sequence and a
+		// session for a plaintext pack, and for an undecryptable wrap a session,
+		// an unknown-wrap nack, the send sequence that carries it and a contract
+		// request to the platform. A carrier that binds no source, a custom
+		// transport, is checked for these two names only.
+		if kind := forgedSourceKind(disposition, self.clientId, path.SourceId); kind != "" && P2PForgedSourceDropEnabled() {
+			self.recordForgedSourceDrop(kind)
 			if self.log.V(1).Enabled() {
-				self.log.Infof("[cr] %s cannot route message with stream\n", self.clientTag)
+				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
 			}
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
-		// A direct peer (P2P) route carries a stream peer's frames, never the
-		// platform's and never this client's own. A frame on one that names
-		// either as its source is forged: taken as control-plane or self
-		// traffic it would skip contract and session checks and drive
-		// platform-only control (stream setup, sequence close, transport
-		// migration).
-		//
-		// A production P2P association also binds its lanes to its adjacent
-		// peer, the one source the platform-relayed signaling authenticated,
-		// and a frame naming any other source is forged as well. It is dropped
-		// here, before decode, because everything after allocates state for the
-		// named source: a receive sequence and a session for a plaintext pack,
-		// and for an undecryptable wrap a session, an unknown-wrap nack, the
-		// send sequence that carries it and a contract request to the platform
-		// (partner security researchers' report 2026-11-16; §2.3 of
-		// audit/EVIDENCE.md). A route that binds no source, a custom carrier,
-		// is checked for the platform and this client only.
-		if transportType == TransportTypeP2p &&
-			(path.SourceId == ControlId ||
-				path.SourceId == self.clientId ||
-				(boundSourceId != (Id{}) && path.SourceId != boundSourceId)) {
-			self.receiveForgedSourceDropCount.Add(1)
+		// The measured half: a frame on a lane bound to its adjacent peer that
+		// names a different source. Drop mode discards it before decode, which
+		// is this fork's default because a bound lane carries only its peer's
+		// frames. Count mode delivers it and counts the outcome, which is what
+		// a line measures before it enforces.
+		var mismatch p2pSourceMismatch
+		if boundSourceMismatch(disposition, path.SourceId) {
+			if mode := p2pSourceBindingMode(); mode == p2pSourceModeDrop {
+				mismatch = newP2PSourceMismatch(self, mode, true)
+				mismatch.dropped()
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
+				}
+				MessagePoolReturn(transferFrameBytes)
+				continue
+			} else if mode == p2pSourceModeCount {
+				mismatch = newP2PSourceMismatch(self, mode, true)
+			}
+		}
+		if path.IsStream() {
+			mismatch.dropped()
 			if self.log.V(1).Enabled() {
-				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
+				self.log.Infof("[cr] %s cannot route message with stream\n", self.clientTag)
 			}
 			MessagePoolReturn(transferFrameBytes)
 			continue
@@ -4857,6 +4920,7 @@ func (self *Client) run() {
 			// The exact selected carrier bound is paid before any decrypt or
 			// copied decode. Unknown carriers acquire only observed capacity.
 			if !self.prepareReceiveDecodeMemory(transferFrameBytes, receiveWireLimit) {
+				mismatch.dropped()
 				self.receiveDecodePressureDropCount.Add(1)
 				MessagePoolReturn(transferFrameBytes)
 				continue
@@ -4869,7 +4933,10 @@ func (self *Client) run() {
 			// transfer_path (routing already parsed it via FilteredTransferPath)
 			// and the deprecated message_type. See frame_protobuf.go.
 			if decoded, pressure := self.unmarshalReceiveMemoryFrame(transferFrameBytes, decodedFrame, false, path, false, sequenceTlsRoleServer, false); !decoded {
-				if !pressure {
+				if pressure {
+					mismatch.dropped()
+				} else {
+					mismatch.rejected()
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
@@ -4916,6 +4983,7 @@ func (self *Client) run() {
 				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, err := self.unwrapFrame(
 					path.SourceId, transferFrame.GetSessionRole(), transferFrame.SessionCompanion, transferFrame.EncryptedTransferFrame)
 				if err != nil {
+					mismatch.rejected()
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[cr]unwrap err = %s\n", err)
 					}
@@ -4945,7 +5013,10 @@ func (self *Client) run() {
 				// the routing path below.
 				innerDecodedFrame := inboundDecodedTransferFrames.take()
 				if decoded, pressure := self.unmarshalReceiveMemoryFrame(unwrappedTransferFrameBytes, innerDecodedFrame, true, path, true, decryptRole, decryptCompanion); !decoded {
-					if !pressure {
+					if pressure {
+						mismatch.dropped()
+					} else {
+						mismatch.rejected()
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
@@ -4962,6 +5033,7 @@ func (self *Client) run() {
 				// in flight or a routing/sender bug. Drop and audit.
 				unwrappedPath, err := TransferPathFromProtobuf(unwrappedTransferFrame.TransferPath)
 				if err != nil || unwrappedPath != path {
+					mismatch.rejected()
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[cr] %s outer/inner TransferPath mismatch from %s\n", self.clientTag, path.SourceId)
 					}
@@ -5009,6 +5081,7 @@ func (self *Client) run() {
 					ack = &protocol.Ack{}
 					if err := ProtoUnmarshal(frame.GetMessageBytes(), ack); err != nil {
 						// bad protobuf
+						mismatch.rejected()
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
@@ -5021,6 +5094,7 @@ func (self *Client) run() {
 					pack = &protocol.Pack{}
 					if err := ProtoUnmarshal(frame.GetMessageBytes(), pack); err != nil {
 						// bad protobuf
+						mismatch.rejected()
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
@@ -5030,6 +5104,7 @@ func (self *Client) run() {
 					}
 
 				default:
+					mismatch.rejected()
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
@@ -5048,6 +5123,7 @@ func (self *Client) run() {
 			// absent closes a buffer leak on malformed input; rejecting both
 			// present avoids handing the same owned wire buffer to two consumers.
 			if (ack == nil) == (pack == nil) {
+				mismatch.rejected()
 				updatePeerAudit(source, func(a *PeerAudit) {
 					a.badMessage(ByteCount(len(transferFrameBytes)))
 				})
@@ -5092,13 +5168,20 @@ func (self *Client) run() {
 					return result == receiveAckHandoffAccepted ||
 						result == receiveAckHandoffAcceptedAfterWait
 				}
+				var accepted bool
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					accepted = TraceWithReturn(
 						fmt.Sprintf("[cr]ack %s %s<-%s s(%s)", self.clientTag, path.DestinationId, path.SourceId, path.SourceId),
 						c,
 					)
 				} else {
-					c()
+					accepted = c()
+				}
+				// Only an ack the buffer matched to a pending send was accepted
+				if accepted {
+					mismatch.decoded()
+				} else {
+					mismatch.rejected()
 				}
 				inboundDecodedTransferFrames.put(decodedFrame)
 				continue
@@ -5107,6 +5190,7 @@ func (self *Client) run() {
 				sequenceId, err := IdFromBytes(pack.SequenceId)
 				if err != nil {
 					// bad protobuf
+					mismatch.rejected()
 					if decodedFrame.packOwner == nil {
 						returnDecodedPackMessageBytes(pack)
 					}
@@ -5277,36 +5361,61 @@ func (self *Client) run() {
 					}
 					return success && err == nil
 				}
+				var accepted bool
 				if self.log.V(2).Enabled() {
-					TraceWithReturn(
+					accepted = TraceWithReturn(
 						fmt.Sprintf("[cr]pack %s %s<-%s s(%s)", self.clientTag, path.DestinationId, path.SourceId, path.StreamId),
 						c,
 					)
 				} else {
-					c()
+					accepted = c()
+				}
+				// A pack is decoded only when the receive path kept it. The
+				// handoff can refuse it, and a plaintext pack this client
+				// requires encryption for is acked and then thrown away by the
+				// sequence gate below, so neither was accepted. The zero-value
+				// recorder is inactive for every frame whose source matched its
+				// lane, and skips the scan below.
+				if mismatch.active {
+					switch {
+					case !accepted:
+						mismatch.rejected()
+					case unwrapped && packHasApplicationFrames(pack) && self.plaintextReceiveDiscarded(path.SourceId):
+						mismatch.rejected()
+					default:
+						mismatch.decoded()
+					}
 				}
 				inboundDecodedTransferFrames.put(decodedFrame)
 			}
 		} else {
-			c := func() {
+			// A frame for another destination. A forward callback takes it and
+			// leaves this client, which neither decoded nor dropped it, so no
+			// mismatch outcome is recorded. A frame no callback takes is
+			// discarded here and counted as dropped.
+			c := func() int {
 				// forward is a callback: the bytes are valid only for its duration
 				// and are returned here. Without the return, a client with no
 				// forwarder leaks one pool buffer for every frame that arrives
 				// addressed to another destination (e.g. control-addressed frames
 				// accepted by a gateway transport).
 				defer MessagePoolReturn(transferFrameBytes)
-				self.forward(
+				return self.forward(
 					path,
 					transferFrameBytes,
 				)
 			}
+			var forwardCount int
 			if self.log.V(1).Enabled() {
-				Trace(
+				forwardCount = TraceWithReturn(
 					fmt.Sprintf("[cr]forward %s %s<-%s s(%s)", self.clientTag, path.DestinationId, path.SourceId, path.StreamId),
 					c,
 				)
 			} else {
-				c()
+				forwardCount = c()
+			}
+			if forwardCount == 0 {
+				mismatch.dropped()
 			}
 		}
 	}
