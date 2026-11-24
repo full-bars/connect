@@ -5276,6 +5276,8 @@ func (self *Client) run() {
 					}
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
+				// Compute before Pack hands pack/decodedOwner to ReceiveSequence.
+				plaintextAppFrames := mismatch.active && unwrapped && packHasApplicationFrames(pack)
 				decodedOwner := decodedFrame.detachPackOwner()
 				c := func() bool {
 					var receivePack *ReceivePack
@@ -5347,7 +5349,7 @@ func (self *Client) run() {
 					// Refuse without ACK and return this decoded owner so the
 					// shared reader can reach ACKs; reliable originals retain
 					// their sender retry owner. Dedicated Pack callers may wait.
-					success, err := self.receiveBuffer.Pack(receivePack, 0)
+					success, admitted, err := self.receiveBuffer.pack(receivePack, 0)
 					endTransferProgress(progressObserver, packProgress, "receive_pack_end", success && err == nil, err)
 					if !success {
 						receivePack.sequenceQueueByteCount = 0
@@ -5359,7 +5361,7 @@ func (self *Client) run() {
 						}
 						receivePack.messagePoolReturn()
 					}
-					return success && err == nil
+					return admitted && err == nil
 				}
 				var accepted bool
 				if self.log.V(2).Enabled() {
@@ -5380,7 +5382,7 @@ func (self *Client) run() {
 					switch {
 					case !accepted:
 						mismatch.rejected()
-					case unwrapped && packHasApplicationFrames(pack) && self.plaintextReceiveDiscarded(path.SourceId):
+					case plaintextAppFrames && self.plaintextReceiveDiscarded(path.SourceId):
 						mismatch.rejected()
 					default:
 						mismatch.decoded()
@@ -16420,16 +16422,24 @@ func (self *ReceiveBuffer) removeReceiveSequenceWithLock(
 }
 
 func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
+	owned, _, err := self.pack(receivePack, timeout)
+	return owned, err
+}
+
+// pack reports buffer ownership separately from sequence admission. A pack
+// discarded before handoff (an older sequence or a superseded head) has already
+// returned its frame bytes to the pool, so owned is true while admitted is false.
+func (self *ReceiveBuffer) pack(receivePack *ReceivePack, timeout time.Duration) (owned bool, admitted bool, err error) {
 	select {
 	case <-receivePack.carrierDone:
-		return false, errors.New("receive carrier closed")
+		return false, false, errors.New("receive carrier closed")
 	default:
 	}
 	logicalLane := uint32(0)
 	if receivePack.Pack != nil {
 		logicalLane = receivePack.Pack.LogicalLane
 		if maxLogicalDataLaneCount < logicalLane {
-			return false, fmt.Errorf("logical lane %d exceeds maximum %d", logicalLane, maxLogicalDataLaneCount)
+			return false, false, fmt.Errorf("logical lane %d exceeds maximum %d", logicalLane, maxLogicalDataLaneCount)
 		}
 	}
 	receiveSequenceId := receiveSequenceId{
@@ -16656,26 +16666,25 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 
 	var receiveSequence *ReceiveSequence
 	var success bool
-	var err error
 	for i := 0; i < 2; i += 1 {
 		select {
 		case <-receivePack.carrierDone:
-			return false, errors.New("receive carrier closed")
+			return false, false, errors.New("receive carrier closed")
 		case <-self.ctx.Done():
-			return false, errors.New("Done.")
+			return false, false, errors.New("Done.")
 		default:
 		}
 		receiveSequence = initReceiveSequence(receiveSequence)
 		if receiveSequence == nil {
-			// drop
-			return true, nil
+			// drop: initReceiveSequence already returned the frame bytes
+			return true, false, nil
 		}
 		if success, err = receiveSequence.Pack(receivePack, timeout); err == nil {
-			return success, nil
+			return success, success, nil
 		}
 		// sequence closed
 	}
-	return success, err
+	return success, false, err
 }
 
 // runReceiveSequence owns one admitted worker through index removal and the

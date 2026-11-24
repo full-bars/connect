@@ -359,7 +359,7 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 		name := formatAstExpr(t, parsed.fileSet, call.Fun)
 		argumentIndex := -1
 		switch name {
-		case "self.receiveBuffer.Pack":
+		case "self.receiveBuffer.pack":
 			argumentIndex = 1
 		case "self.sendBuffer.ackMessageDetailed":
 			argumentIndex = 2
@@ -379,7 +379,7 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 		}
 		return true
 	})
-	for _, name := range []string{"self.receiveBuffer.Pack", "self.sendBuffer.ackMessageDetailed"} {
+	for _, name := range []string{"self.receiveBuffer.pack", "self.sendBuffer.ackMessageDetailed"} {
 		if counts[name] != 1 {
 			t.Errorf("%s call count = %d, want 1", name, counts[name])
 		}
