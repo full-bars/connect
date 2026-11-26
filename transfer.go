@@ -1430,6 +1430,7 @@ type ReceivePack struct {
 	SequenceId         Id
 	Pack               *protocol.Pack
 	decodedOwner       *decodedPackOwner
+	sourceMismatch     *p2pSourceMismatch
 	ReceiveCallback    ReceiveFunction
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
@@ -1532,6 +1533,8 @@ func (self *ReceivePack) messagePoolReturn() {
 	if self == nil {
 		return
 	}
+	// Every pack returned without reaching a receive item was discarded.
+	self.sourceMismatch.rejected()
 	// Capture and clear the outer frame before releasing decodedOwner. In the
 	// owned hot path this ReceivePack is embedded in that owner, which can be
 	// taken and reset by another decoder as soon as release returns.
@@ -4641,30 +4644,6 @@ func (self *Client) AddForwardCallback(forwardCallback ForwardFunction) func() {
 	}
 }
 
-// packHasApplicationFrames reports whether the pack carries any frame that is
-// not an encrypted control frame. The receive gate routes control frames into
-// the session and discards only the application frames that remain.
-func packHasApplicationFrames(pack *protocol.Pack) bool {
-	for _, frame := range pack.GetFrames() {
-		if frame != nil && frame.GetMessageType() != protocol.MessageType_TransferEncryptedControl {
-			return true
-		}
-	}
-	return false
-}
-
-// plaintextReceiveDiscarded reports whether the receive sequence for sourceId
-// will discard a plaintext application frame. It mirrors the fail-closed gate
-// in the sequence drain: a session is expected for the source (so the source is
-// not the platform and this client holds an identity of its own) and the
-// session runs in EncryptionModeRequired. Such a frame is acked to keep the
-// sequence moving and then thrown away, so the receive path must not report it
-// as decoded.
-func (self *Client) plaintextReceiveDiscarded(sourceId Id) bool {
-	manager := self.encryptionSessionManager
-	return manager != nil && manager.RequireEncryption() && !manager.ReceiveNoSession(sourceId)
-}
-
 func (self *Client) run() {
 	defer self.releaseReceiveDecodeMemory()
 	var workerWaitGroup sync.WaitGroup
@@ -4881,10 +4860,10 @@ func (self *Client) run() {
 		// is this fork's default because a bound lane carries only its peer's
 		// frames. Count mode delivers it and counts the outcome, which is what
 		// a line measures before it enforces.
-		var mismatch p2pSourceMismatch
+		var mismatch *p2pSourceMismatch
 		if boundSourceMismatch(disposition, path.SourceId) {
 			if mode := p2pSourceBindingMode(); mode == p2pSourceModeDrop {
-				mismatch = newP2PSourceMismatch(self, mode, true)
+				mismatch = newP2PSourceMismatch(self, mode)
 				mismatch.dropped()
 				if self.log.V(1).Enabled() {
 					self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
@@ -4892,7 +4871,7 @@ func (self *Client) run() {
 				MessagePoolReturn(transferFrameBytes)
 				continue
 			} else if mode == p2pSourceModeCount {
-				mismatch = newP2PSourceMismatch(self, mode, true)
+				mismatch = newP2PSourceMismatch(self, mode)
 			}
 		}
 		if path.IsStream() {
@@ -5276,8 +5255,6 @@ func (self *Client) run() {
 					}
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
-				// Compute before Pack hands pack/decodedOwner to ReceiveSequence.
-				plaintextAppFrames := mismatch.active && unwrapped && packHasApplicationFrames(pack)
 				decodedOwner := decodedFrame.detachPackOwner()
 				c := func() bool {
 					var receivePack *ReceivePack
@@ -5322,6 +5299,7 @@ func (self *Client) run() {
 						SequenceId:               sequenceId,
 						Pack:                     pack,
 						decodedOwner:             decodedOwner,
+						sourceMismatch:           mismatch,
 						receiveConsumerData:      receiveHeadRecoveryPack(pack),
 						receivePublishedReliable: !pack.Nack,
 						ReceiveCallback:          self.receiveCallback,
@@ -5372,21 +5350,9 @@ func (self *Client) run() {
 				} else {
 					accepted = c()
 				}
-				// A pack is decoded only when the receive path kept it. The
-				// handoff can refuse it, and a plaintext pack this client
-				// requires encryption for is acked and then thrown away by the
-				// sequence gate below, so neither was accepted. The zero-value
-				// recorder is inactive for every frame whose source matched its
-				// lane, and skips the scan below.
-				if mismatch.active {
-					switch {
-					case !accepted:
-						mismatch.rejected()
-					case plaintextAppFrames && self.plaintextReceiveDiscarded(path.SourceId):
-						mismatch.rejected()
-					default:
-						mismatch.decoded()
-					}
+				// Once admitted, the sequence decides the outcome at delivery or discard.
+				if !accepted {
+					mismatch.rejected()
 				}
 				inboundDecodedTransferFrames.put(decodedFrame)
 			}
@@ -18807,6 +18773,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		tagSet:             receivePack.Pack.Tag != nil,
 		inUse:              receivePack.decodedOwner != nil,
 		decodedOwner:       receivePack.decodedOwner,
+		sourceMismatch:     receivePack.sourceMismatch,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
@@ -19349,6 +19316,7 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		tagSet:             receivePack.Pack.Tag != nil,
 		inUse:              receivePack.decodedOwner != nil,
 		decodedOwner:       receivePack.decodedOwner,
+		sourceMismatch:     receivePack.sourceMismatch,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		// nack items send no ack, so `unwrapped` was historically unused here;
@@ -19487,8 +19455,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 				"plaintext application frames discarded",
 			)
 			appFrames = nil
+			item.sourceMismatch.rejected()
 		}
 	}
+	item.sourceMismatch.decoded()
 
 	// buffer for a combined dispatch: a Peer identity change (contract
 	// rotation) is a batch boundary because one callback carries one peer,
@@ -20069,6 +20039,7 @@ type receiveItem struct {
 	receiveCallback    ReceiveFunction
 	tagSendTime        uint64
 	decodedOwner       *decodedPackOwner
+	sourceMismatch     *p2pSourceMismatch
 	transferFrameBytes []byte
 	transportType      TransportType
 	immediateReceipt   *receiveDeliveryReceipt
@@ -20111,6 +20082,9 @@ func (self *receiveItem) receiveTag() sequenceTag {
 }
 
 func (self *receiveItem) messagePoolReturn() {
+	// Any unresolved item returned to the pool was discarded, including hold
+	// evictions and teardown. Delivered items already recorded their outcome.
+	self.sourceMismatch.rejected()
 	if receipt := self.immediateReceipt; receipt != nil {
 		receipt.immediateHistory.complete(receipt.immediateRange, receipt.immediateToken, false)
 	}
