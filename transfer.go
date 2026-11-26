@@ -20004,6 +20004,7 @@ func (self *ReceiveSequence) Close() {
 				if !ok {
 					return
 				}
+				receivePack.sourceMismatch.rejected()
 				self.releasePackQueue(receivePack)
 				receivePack.messagePoolReturn()
 			default:
