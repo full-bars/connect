@@ -3,6 +3,7 @@ package connect
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -207,10 +208,48 @@ func P2PSourceStatsSnapshot() P2PSourceStats {
 // p2pSourceMismatch records the outcome of one frame whose source did not
 // match the peer its lane is bound to. The record travels with the pack until
 // delivery or discard. A nil record is silent and the first outcome wins.
+// Entries exist only while an outcome is pending. Both identities are removed
+// before an embedded owner can return to its pool and be reused.
+var p2pSourceMismatchTable sync.Map
+
 type p2pSourceMismatch struct {
 	client *Client
 	mode   uint32
 	active atomic.Bool
+	mu     sync.Mutex
+	pack   *ReceivePack
+	item   *receiveItem
+}
+
+func (self *p2pSourceMismatch) bindPack(pack *ReceivePack) {
+	if self == nil {
+		return
+	}
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	if self.active.Load() {
+		self.pack = pack
+		p2pSourceMismatchTable.Store(pack, self)
+	}
+}
+
+func (self *p2pSourceMismatch) bindItem(item *receiveItem) {
+	if self == nil {
+		return
+	}
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	if self.active.Load() {
+		self.item = item
+		p2pSourceMismatchTable.Store(item, self)
+	}
+}
+
+func p2pMismatchFor(key any) *p2pSourceMismatch {
+	if value, ok := p2pSourceMismatchTable.Load(key); ok {
+		return value.(*p2pSourceMismatch)
+	}
+	return nil
 }
 
 func newP2PSourceMismatch(client *Client, mode uint32) *p2pSourceMismatch {
@@ -220,7 +259,20 @@ func newP2PSourceMismatch(client *Client, mode uint32) *p2pSourceMismatch {
 }
 
 func (self *p2pSourceMismatch) record(outcome int) {
-	if self != nil && self.active.CompareAndSwap(true, false) {
+	if self == nil {
+		return
+	}
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	if self.active.CompareAndSwap(true, false) {
+		if self.pack != nil {
+			p2pSourceMismatchTable.Delete(self.pack)
+			self.pack = nil
+		}
+		if self.item != nil {
+			p2pSourceMismatchTable.Delete(self.item)
+			self.item = nil
+		}
 		self.client.recordSourceMismatch(self.mode, outcome)
 	}
 }

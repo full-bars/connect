@@ -773,6 +773,9 @@ func (owner *decodedPackOwner) release() {
 	if owner == nil || !owner.inUse {
 		return
 	}
+	// Decode rollback can release the owner without either envelope return.
+	p2pMismatchFor(&owner.receivePack).rejected()
+	p2pMismatchFor(&owner.receiveItem).rejected()
 	if pack := owner.receivePack.Pack; pack != nil && pack != &owner.pack {
 		// Legacy protobuf merge/unknown-field semantics use one funded external
 		// Pack; the existing owner still owns its complete terminal return.

@@ -11,11 +11,15 @@ func TestP2PSourceMismatchCloseDrainsRejected(t *testing.T) {
 	client := &Client{}
 	sequence := &ReceiveSequence{cancel: func() {}, packs: make(chan *ReceivePack, 4)}
 	for i := 0; i < 2; i++ {
-		sequence.packs <- &ReceivePack{sourceMismatch: newP2PSourceMismatch(client, p2pSourceModeCount)}
+		pack := &ReceivePack{}
+		newP2PSourceMismatch(client, p2pSourceModeCount).bindPack(pack)
+		sequence.packs <- pack
 	}
 	decoded := newP2PSourceMismatch(client, p2pSourceModeCount)
+	pack := &ReceivePack{}
+	decoded.bindPack(pack)
 	decoded.decoded()
-	sequence.packs <- &ReceivePack{sourceMismatch: decoded}
+	sequence.packs <- pack
 	sequence.packs <- &ReceivePack{}
 
 	sequence.Close()

@@ -1430,7 +1430,6 @@ type ReceivePack struct {
 	SequenceId         Id
 	Pack               *protocol.Pack
 	decodedOwner       *decodedPackOwner
-	sourceMismatch     *p2pSourceMismatch
 	ReceiveCallback    ReceiveFunction
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
@@ -1534,7 +1533,7 @@ func (self *ReceivePack) messagePoolReturn() {
 		return
 	}
 	// Every pack returned without reaching a receive item was discarded.
-	self.sourceMismatch.rejected()
+	p2pMismatchFor(self).rejected()
 	// Capture and clear the outer frame before releasing decodedOwner. In the
 	// owned hot path this ReceivePack is embedded in that owner, which can be
 	// taken and reset by another decoder as soon as release returns.
@@ -5299,7 +5298,6 @@ func (self *Client) run() {
 						SequenceId:               sequenceId,
 						Pack:                     pack,
 						decodedOwner:             decodedOwner,
-						sourceMismatch:           mismatch,
 						receiveConsumerData:      receiveHeadRecoveryPack(pack),
 						receivePublishedReliable: !pack.Nack,
 						ReceiveCallback:          self.receiveCallback,
@@ -5310,6 +5308,7 @@ func (self *Client) run() {
 						EncryptionRole:           receiveRole,
 						EncryptionCompanion:      receiveCompanion,
 					}
+					mismatch.bindPack(receivePack)
 					if paidRoot != nil {
 						paidRoot.admissionLock.Unlock()
 					}
@@ -18773,11 +18772,11 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		tagSet:             receivePack.Pack.Tag != nil,
 		inUse:              receivePack.decodedOwner != nil,
 		decodedOwner:       receivePack.decodedOwner,
-		sourceMismatch:     receivePack.sourceMismatch,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
 	}
+	p2pMismatchFor(receivePack).bindItem(item)
 	if paidBudget != nil {
 		paidBudget.admissionRoot().admissionLock.Unlock()
 	}
@@ -19316,7 +19315,6 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		tagSet:             receivePack.Pack.Tag != nil,
 		inUse:              receivePack.decodedOwner != nil,
 		decodedOwner:       receivePack.decodedOwner,
-		sourceMismatch:     receivePack.sourceMismatch,
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		// nack items send no ack, so `unwrapped` was historically unused here;
@@ -19325,6 +19323,7 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		unwrapped: receivePack.Unwrapped,
 	}
 
+	p2pMismatchFor(receivePack).bindItem(item)
 	if paidBudget != nil {
 		paidBudget.admissionRoot().admissionLock.Unlock()
 	}
@@ -19455,10 +19454,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 				"plaintext application frames discarded",
 			)
 			appFrames = nil
-			item.sourceMismatch.rejected()
+			p2pMismatchFor(item).rejected()
 		}
 	}
-	item.sourceMismatch.decoded()
+	p2pMismatchFor(item).decoded()
 
 	// buffer for a combined dispatch: a Peer identity change (contract
 	// rotation) is a batch boundary because one callback carries one peer,
@@ -20004,7 +20003,7 @@ func (self *ReceiveSequence) Close() {
 				if !ok {
 					return
 				}
-				receivePack.sourceMismatch.rejected()
+				p2pMismatchFor(receivePack).rejected()
 				self.releasePackQueue(receivePack)
 				receivePack.messagePoolReturn()
 			default:
@@ -20040,7 +20039,6 @@ type receiveItem struct {
 	receiveCallback    ReceiveFunction
 	tagSendTime        uint64
 	decodedOwner       *decodedPackOwner
-	sourceMismatch     *p2pSourceMismatch
 	transferFrameBytes []byte
 	transportType      TransportType
 	immediateReceipt   *receiveDeliveryReceipt
@@ -20085,7 +20083,7 @@ func (self *receiveItem) receiveTag() sequenceTag {
 func (self *receiveItem) messagePoolReturn() {
 	// Any unresolved item returned to the pool was discarded, including hold
 	// evictions and teardown. Delivered items already recorded their outcome.
-	self.sourceMismatch.rejected()
+	p2pMismatchFor(self).rejected()
 	if receipt := self.immediateReceipt; receipt != nil {
 		receipt.immediateHistory.complete(receipt.immediateRange, receipt.immediateToken, false)
 	}
