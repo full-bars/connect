@@ -4883,10 +4883,9 @@ func (self *Client) run() {
 		}
 		// The platform attributes the source of every frame it relays (it
 		// refuses a client's frame naming any source but that client), and a
-		// bound P2P route delivers its adjacent peer's frames only, so the
-		// source is authenticated unless an unbound P2P route delivered the
-		// frame, where it is the sender's word.
-		sourceAuthenticated := transportType != TransportTypeP2p || boundSourceId != (Id{})
+		// bound P2P route authenticates only its adjacent peer, not a
+		// different source named by a frame in count or off mode.
+		sourceAuthenticated := transportType != TransportTypeP2p || (boundSourceId != (Id{}) && boundSourceId == path.SourceId)
 
 		source := path.SourceMask()
 

@@ -369,6 +369,34 @@ func TestP2pRouteForgedSourcePacksAllocateNoPeerState(t *testing.T) {
 	AssertEqual(t, uint64(forgedSourceFrameCount), fixture.client.ReceiveStats().SourceMismatchDroppedCount)
 }
 
+// A mismatched wrap admitted by count or off mode cannot create a session for
+// the claimed source. Drop mode must still discard it before unwrap.
+func TestP2pRouteMismatchedWrapIsNotAuthenticated(t *testing.T) {
+	for _, mode := range []string{"count", "off", "drop"} {
+		t.Run(mode, func(t *testing.T) {
+			previous := P2PSourceBinding()
+			if err := SetP2PSourceBinding(mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = SetP2PSourceBinding(previous) })
+			fixture := newForgedSourceFixture(t, nil)
+			claimedId := NewId()
+			fixture.inbound <- forgedSourceWrappedFrame(t, claimedId, fixture.client.ClientId())
+			fixture.barrier(t)
+			if state := forgedSourcePeerStateOf(fixture.client, map[Id]bool{claimedId: true}); state.sessionCount != 0 {
+				t.Fatalf("mismatched wrap created %d sessions", state.sessionCount)
+			}
+			stats := fixture.client.ReceiveStats()
+			if mode == "drop" && stats.SourceMismatchDroppedCount != 1 {
+				t.Fatalf("drop mode dropped %d mismatches, want 1", stats.SourceMismatchDroppedCount)
+			}
+			if mode == "count" && stats.SourceMismatchRejectedCount != 1 {
+				t.Fatalf("count mode rejected %d mismatches, want 1", stats.SourceMismatchRejectedCount)
+			}
+		})
+	}
+}
+
 // A client with encryption off can neither open a wrap nor answer a handshake,
 // so an undecryptable wrap, even from the authenticated adjacent peer, opens
 // no session and starts no nack.
