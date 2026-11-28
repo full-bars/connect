@@ -16,8 +16,15 @@ import (
 // is across every transport and sequence at once. These tests therefore reset
 // it rather than constructing an instance, and must not run in parallel.
 func resetBackendDegraded() {
-	consecutiveBackendFails.Store(0)
-	lastBackendFailNano.Store(0)
+	backendFailures.Store(nil)
+}
+
+func setBackendFailureStamp(stamp int64) {
+	backendFailMu.Lock()
+	defer backendFailMu.Unlock()
+	state := loadBackendFailureState()
+	state.stamp = stamp
+	backendFailures.Store(&state)
 }
 
 func TestBackendDegraded_CleanStateIsNotDegraded(t *testing.T) {
@@ -68,7 +75,7 @@ func TestBackendDegraded_StaleFailuresAreNotDegraded(t *testing.T) {
 	}
 
 	// Age the last failure past the recency window.
-	lastBackendFailNano.Store(time.Now().Add(-backendDegradedWindow - time.Second).UnixNano())
+	setBackendFailureStamp(time.Now().Add(-backendDegradedWindow - time.Second).UnixNano())
 
 	if isBackendDegraded() {
 		t.Fatalf("still degraded with the last failure older than %s", backendDegradedWindow)
@@ -92,7 +99,7 @@ func TestBackendDegraded_SuccessClearsImmediately(t *testing.T) {
 	if isBackendDegraded() {
 		t.Fatal("a successful round-trip must clear the degraded state immediately")
 	}
-	if got := consecutiveBackendFails.Load(); got != 0 {
+	if got := loadBackendFailureState().count; got != 0 {
 		t.Fatalf("consecutive failures = %d after success, want 0", got)
 	}
 }
@@ -127,7 +134,7 @@ func TestBackendDegraded_StaleStreakIsNotResumedByANewFailure(t *testing.T) {
 	}
 	// Age the whole streak out of the window, as an idle provider that simply
 	// stopped retrying would.
-	lastBackendFailNano.Store(time.Now().Add(-backendDegradedWindow - time.Minute).UnixNano())
+	setBackendFailureStamp(time.Now().Add(-backendDegradedWindow - time.Minute).UnixNano())
 	if isBackendDegraded() {
 		t.Fatal("precondition: an aged-out streak must not read as degraded")
 	}
@@ -136,7 +143,7 @@ func TestBackendDegraded_StaleStreakIsNotResumedByANewFailure(t *testing.T) {
 	// fourth of the old one.
 	noteBackendFailure()
 
-	if got := consecutiveBackendFails.Load(); got != 1 {
+	if got := loadBackendFailureState().count; got != 1 {
 		t.Fatalf("consecutive failures = %d after a stale streak plus one failure, want 1", got)
 	}
 	if isBackendDegraded() {
@@ -153,11 +160,11 @@ func TestBackendDegraded_StreakSurvivesGapInsideWindow(t *testing.T) {
 	noteBackendFailure()
 	noteBackendFailure()
 	// A gap well inside the window: still the same outage.
-	lastBackendFailNano.Store(time.Now().Add(-backendDegradedWindow / 2).UnixNano())
+	setBackendFailureStamp(time.Now().Add(-backendDegradedWindow / 2).UnixNano())
 
 	noteBackendFailure()
 
-	if got := consecutiveBackendFails.Load(); got != backendDegradedFailThreshold {
+	if got := loadBackendFailureState().count; got != backendDegradedFailThreshold {
 		t.Fatalf("consecutive failures = %d, want %d (streak reset inside the window)", got, backendDegradedFailThreshold)
 	}
 	if !isBackendDegraded() {
@@ -187,7 +194,7 @@ func TestBackendDegraded_FailuresStampedAfterNowAreNotDegraded(t *testing.T) {
 		}
 	})
 
-	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+	setBackendFailureStamp(time.Now().Add(time.Minute).UnixNano())
 	if isBackendDegraded() {
 		t.Error("degraded on failures stamped a minute after now")
 	}
@@ -203,11 +210,11 @@ func TestBackendDegraded_StreakStampedAfterNowIsNotResumedByANewFailure(t *testi
 	for i := 0; i < backendDegradedFailThreshold; i++ {
 		noteBackendFailure()
 	}
-	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+	setBackendFailureStamp(time.Now().Add(time.Minute).UnixNano())
 
 	noteBackendFailure()
 
-	if got := consecutiveBackendFails.Load(); got != 1 {
+	if got := loadBackendFailureState().count; got != 1 {
 		t.Fatalf("consecutive failures = %d after a streak stamped after now plus one failure, want 1", got)
 	}
 	if isBackendDegraded() {
@@ -245,14 +252,14 @@ func TestBackendDegraded_ConcurrentSuccessAndFailureNeverLeaveInvalidState(t *te
 	wg.Wait()
 
 	// A positive count always implies a real failure timestamp.
-	if got := consecutiveBackendFails.Load(); 0 < got {
-		if lastBackendFailNano.Load() == 0 {
+	if got := loadBackendFailureState().count; 0 < got {
+		if loadBackendFailureState().stamp == 0 {
 			t.Fatalf("invalid state: %d consecutive failures recorded with a zero timestamp", got)
 		}
 	}
 	// And a zeroed timestamp always implies no outstanding failures.
-	if lastBackendFailNano.Load() == 0 {
-		if got := consecutiveBackendFails.Load(); got != 0 {
+	if loadBackendFailureState().stamp == 0 {
+		if got := loadBackendFailureState().count; got != 0 {
 			t.Fatalf("invalid state: zero timestamp with %d consecutive failures", got)
 		}
 	}
@@ -278,7 +285,7 @@ func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
 		}
 		wg.Wait()
 
-		if got := consecutiveBackendFails.Load(); got != 32 {
+		if got := loadBackendFailureState().count; got != 32 {
 			t.Fatalf("round %d: consecutive failures = %d after 32 concurrent failures, want 32", round, got)
 		}
 		if !isBackendDegraded() {

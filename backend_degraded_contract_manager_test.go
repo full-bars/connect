@@ -90,7 +90,7 @@ func TestContractManagerCreateContract_OobSuccessClearsDegraded(t *testing.T) {
 	if isBackendDegraded() {
 		t.Fatal("a successful CreateContract OOB round-trip must clear the degraded state")
 	}
-	if got := consecutiveBackendFails.Load(); got != 0 {
+	if got := loadBackendFailureState().count; got != 0 {
 		t.Fatalf("consecutive failures = %d after a successful CreateContract, want 0", got)
 	}
 }
@@ -115,7 +115,7 @@ func TestContractManagerCreateContract_ClientDoneDoesNotNoteFailure(t *testing.T
 	contractManager := client.ContractManager()
 	contractManager.CreateContract(contractKey, 0, ByteCount(1024))
 
-	if got := consecutiveBackendFails.Load(); got != 0 {
+	if got := loadBackendFailureState().count; got != 0 {
 		t.Fatalf("consecutive failures = %d after a post-shutdown CreateContract error, want 0 (shutdown is not a backend signal)", got)
 	}
 	if isBackendDegraded() {
