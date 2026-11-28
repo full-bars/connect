@@ -396,6 +396,13 @@ type Node struct {
 	// takes the status lock.
 	dialCount atomic.Int64
 
+	// the failure class last reported for a peer, so a failure of a class is
+	// logged when it first happens and repeats of it are not
+	// (node_dial_class.go). Cleared when a connection to the peer succeeds and
+	// bounded at 1024 peers.
+	dialFailureLock    sync.Mutex
+	dialFailureClasses map[peer.ID]string
+
 	stateLock     sync.Mutex
 	operatorAddrs []ma.Multiaddr
 	// the addresses the current peering round chose, per peer: the only ones
@@ -528,6 +535,11 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 
 	// a peer that goes away should be replaced without waiting out the round
 	self.host.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, conn network.Conn) {
+			// a connection that came up settles the peer, so its next failure
+			// is news once more
+			self.noteDialClass(conn.RemotePeer(), "")
+		},
 		DisconnectedF: func(network.Network, network.Conn) {
 			self.wakeMonitor.NotifyAll()
 		},
@@ -1012,13 +1024,45 @@ func (self *Node) peer() {
 	wg.Wait()
 }
 
+// Records the failure class last reported for a peer and reports whether this
+// is the first failure of that class since the peer last connected. A class of
+// "" means the peer connected and forgets its class, so the next failure after
+// a recovery is news again. The map is bounded: past 1024 peers one entry is
+// dropped to make room, and a peer whose entry was dropped reports its next
+// failure once more.
+func (self *Node) noteDialClass(id peer.ID, class string) bool {
+	self.dialFailureLock.Lock()
+	defer self.dialFailureLock.Unlock()
+	if class == "" {
+		delete(self.dialFailureClasses, id)
+		return false
+	}
+	if self.dialFailureClasses == nil {
+		self.dialFailureClasses = make(map[peer.ID]string)
+	}
+	if self.dialFailureClasses[id] == class {
+		return false
+	}
+	if 1024 <= len(self.dialFailureClasses) {
+		for old := range self.dialFailureClasses {
+			delete(self.dialFailureClasses, old)
+			break
+		}
+	}
+	self.dialFailureClasses[id] = class
+	return true
+}
+
 func (self *Node) connectPeer(addrInfo peer.AddrInfo) {
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.DialTimeout)
 	defer cancel()
-	if err := self.host.Connect(ctx, addrInfo); err != nil {
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[gossip]connect %s err = %s\n", addrInfo.ID, err)
-		}
+	err := self.host.Connect(ctx, addrInfo)
+	class := dialFailureClass(err)
+	first := self.noteDialClass(addrInfo.ID, class)
+	// the first failure of a class is the news a round produces; the repeats
+	// are for a reader of the verbose log
+	if err != nil && (first || self.log.V(1).Enabled()) {
+		self.log.Infof("[gossip]connect %s class=%s err = %s\n", addrInfo.ID, class, err)
 	}
 }
 
