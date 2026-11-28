@@ -215,3 +215,17 @@ func TestSmartDialerWebSocketDialFeedsConnectSamples(t *testing.T) {
 		t.Fatalf("no connect sample after a fresh websocket connection")
 	}
 }
+
+func TestSmartDialerWeightsDampSlowRouteWithDeliveryScores(t *testing.T) {
+	var carried atomic.Int32
+	fast := wiredDialer("fast", 0, 200*time.Millisecond, &carried)
+	slow := wiredDialer("slow", 25, 20*time.Second, &carried)
+	strategy := wiredStrategy(t, fast, slow)
+	withSmartDialer(t, false)
+	off := strategy.dialerWeights(false)
+	withSmartDialer(t, true)
+	on := strategy.dialerWeights(false)
+	if on[slow] <= 0 || on[slow] >= off[slow] || on[slow] >= on[fast] {
+		t.Fatalf("slow route weights: off=%v on=%v fast=%v", off[slow], on[slow], on[fast])
+	}
+}

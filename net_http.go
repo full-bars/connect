@@ -1228,6 +1228,7 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 // temporary limits are still read outside the strategy lock.
 func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clientDialer]float32, time.Time, uint64) {
 	var networkId string
+	smartEligible := false
 	weights, generation := func() (map[*clientDialer]float32, uint64) {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1240,6 +1241,7 @@ func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clie
 		}
 
 		if len(self.extenderIpSecrets) == 0 {
+			smartEligible = true
 			for dialer, _ := range self.dialers {
 				if webSocketOnly && !dialer.supportsWebSocket() {
 					continue
@@ -1249,9 +1251,6 @@ func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clie
 					w = dialer.Weight()
 				}
 				weights[dialer] = w
-			}
-			if SmartDialerEnabled() {
-				applySmartDialerWeights(weights)
 			}
 		} else {
 			for dialer, _ := range self.dialers {
@@ -1273,6 +1272,9 @@ func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clie
 		for dialer := range weights {
 			weights[dialer] *= self.scores.weight(networkId, dialer.dialerKey())
 		}
+	}
+	if smartEligible && SmartDialerEnabled() {
+		applySmartDialerWeights(weights)
 	}
 
 	// the directory is an external object, so the limits are read with no

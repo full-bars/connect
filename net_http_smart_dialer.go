@@ -195,8 +195,8 @@ func orderDialersByMeasuredCost(dialers []*clientDialer) []*clientDialer {
 
 // applySmartDialerWeights scales parallel-eval weights by measured cost. Only
 // dialers with measured successes are scaled, the scale is relative to the
-// fastest dialer that works here, and no weight drops below its dialer's
-// minimum, which keeps every transport reachable. A cost inside the switching
+// fastest dialer that works here. The positive factor keeps every transport
+// reachable. A cost inside the switching
 // margin of the fastest is treated as equal to it.
 func applySmartDialerWeights(weights map[*clientDialer]float32) {
 	dialers := make([]*clientDialer, 0, len(weights))
@@ -230,14 +230,7 @@ func applySmartDialerWeights(weights map[*clientDialer]float32) {
 		if 1 < factor {
 			factor = 1
 		}
-		scaled := weights[snapshot.dialer] * factor
-		snapshot.dialer.mutex.Lock()
-		floor := snapshot.dialer.minimumWeight
-		snapshot.dialer.mutex.Unlock()
-		if scaled < floor {
-			scaled = floor
-		}
-		weights[snapshot.dialer] = scaled
+		weights[snapshot.dialer] *= factor
 	}
 }
 
