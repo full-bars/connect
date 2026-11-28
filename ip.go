@@ -808,6 +808,12 @@ type LocalUserNat struct {
 
 	// receive callback
 	receiveCallbacks *CallbackList[ReceivePacketFunction]
+
+	// per-shard buffers register a source canceller so one client's flows can be
+	// released from outside the shard goroutines, see ip_dead_client.go
+	sourceCancelMutex  sync.Mutex
+	sourceCancels      map[uint64]func(sourceId Id) int
+	nextSourceCancelId uint64
 	// provider callback that retains the transfer lane
 	receiveTransferCallbacks *CallbackList[receiveTransferPacketFunction]
 	// batch receive callback (see receiveTransferPackets)
@@ -980,6 +986,39 @@ func (self *LocalUserNat) newSourceRetirementOwner() uint64 {
 }
 
 // Publishes one exact-source tombstone for an owner. Protocol callbacks run
+// addSourceCancel registers a per-shard canceller and returns its unregister.
+func (self *LocalUserNat) addSourceCancel(cancel func(sourceId Id) int) func() {
+	self.sourceCancelMutex.Lock()
+	defer self.sourceCancelMutex.Unlock()
+	if self.sourceCancels == nil {
+		self.sourceCancels = map[uint64]func(sourceId Id) int{}
+	}
+	self.nextSourceCancelId += 1
+	id := self.nextSourceCancelId
+	self.sourceCancels[id] = cancel
+	return func() {
+		self.sourceCancelMutex.Lock()
+		defer self.sourceCancelMutex.Unlock()
+		delete(self.sourceCancels, id)
+	}
+}
+
+// CancelSource cancels every UDP and TCP flow of one source client across all
+// shards and returns how many flows were cancelled.
+func (self *LocalUserNat) CancelSource(sourceId Id) int {
+	self.sourceCancelMutex.Lock()
+	cancels := make([]func(sourceId Id) int, 0, len(self.sourceCancels))
+	for _, cancel := range self.sourceCancels {
+		cancels = append(cancels, cancel)
+	}
+	self.sourceCancelMutex.Unlock()
+	count := 0
+	for _, cancel := range cancels {
+		count += cancel(sourceId)
+	}
+	return count
+}
+
 // under the retirement lock to serialize registration, retirement, and final
 // release; callbacks only take their leaf buffer mutexes and never reenter the
 // LocalUserNat.
@@ -1724,6 +1763,11 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 		return doneChannels
 	})
 	defer sourceRetirementUnsub()
+	sourceCancelUnsub := self.addSourceCancel(func(sourceId Id) int {
+		return udp4Buffer.CancelSource(sourceId) + udp6Buffer.CancelSource(sourceId) +
+			tcp4Buffer.CancelSource(sourceId) + tcp6Buffer.CancelSource(sourceId)
+	})
+	defer sourceCancelUnsub()
 	defer func() {
 		// Dispatch has stopped and its context is terminal. Join every flow
 		// owner before this shard can publish completion to LocalUserNat.Run.
@@ -3247,6 +3291,25 @@ func (self *UdpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 	}
 	sequence.detachMemoryIndex()
 	sequence.Close()
+}
+
+// CancelSource cancels every flow of one source client and returns how many. It
+// only cancels: each sequence's own exit path removes it from the maps, and the
+// source stays admissible, unlike setSourceRetired.
+func (self *UdpBuffer[BufferId]) CancelSource(sourceId Id) int {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	count := 0
+	for source, sequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for _, sequence := range sequences {
+			sequence.Cancel()
+			count += 1
+		}
+	}
+	return count
 }
 
 // Applies one exact provider-source tombstone and cancels every matching UDP
@@ -5076,6 +5139,25 @@ func (self *TcpBuffer[BufferId]) removeSequenceWithLock(bufferId BufferId, seque
 		delete(self.sourceSequences, sequence.source)
 	}
 	sequence.Cancel()
+}
+
+// CancelSource cancels every flow of one source client and returns how many. It
+// only cancels: each sequence's own exit path removes it from the maps, and the
+// source stays admissible, unlike setSourceRetired.
+func (self *TcpBuffer[BufferId]) CancelSource(sourceId Id) int {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	count := 0
+	for source, sequences := range self.sourceSequences {
+		if source.SourceId != sourceId {
+			continue
+		}
+		for _, sequence := range sequences {
+			sequence.Cancel()
+			count += 1
+		}
+	}
+	return count
 }
 
 // Applies one exact provider-source tombstone and cancels matching TCP flow
@@ -8301,6 +8383,7 @@ func tryNewRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat, set
 		provider.stateLock.Unlock()
 	}
 	context.AfterFunc(provider.ctx, provider.Close)
+	registerDeadClientProvider(provider)
 	return provider, unsubscribe, nil
 }
 
@@ -10764,6 +10847,7 @@ func (self *RemoteUserNatProvider) RequestClose() {
 // packet-stats callback; RequestClose is the callback-safe shutdown edge.
 func (self *RemoteUserNatProvider) Close() {
 	self.closeOnce.Do(func() {
+		unregisterDeadClientProvider(self)
 		if self.memoryOperations != nil {
 			self.memoryOperations.close()
 		}

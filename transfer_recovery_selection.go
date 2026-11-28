@@ -459,6 +459,7 @@ func (self *SendSequence) writeSelectedRecovery(item *sendItem, selection sendRe
 		// sendCount is the timeout-backoff counter and does not advance for
 		// gap or probe recovery, so count successful writes separately
 		item.recoveryWriteCount++
+		self.noteYieldSend(len(transferFrameBytes))
 		recordTransferResend(len(transferFrameBytes), item.sendCount+item.recoveryWriteCount)
 	}
 	self.client.recordSendRecovery(recoveryKind, resendErr)

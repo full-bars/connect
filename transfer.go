@@ -6389,6 +6389,8 @@ type SendBuffer struct {
 	sendSequencesBySequenceId  map[Id]*SendSequence
 	sendSequencesByDestination map[Id]map[*SendSequence]bool
 	sendSequenceDestinations   map[*SendSequence]map[Id]bool
+	// destination -> *destinationYield, see transfer_dest_yield.go
+	yields sync.Map
 	// activeSendSequences retains every lifecycle worker through its final
 	// queue drain, including workers already removed from the lookup indexes.
 	activeSendSequences map[*SendSequence]bool
@@ -13161,6 +13163,12 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 		}
 	}
 	if err == nil {
+		// A write that never reached a carrier says nothing about the destination,
+		// and neither does one that asked for no acknowledgement: nothing is
+		// expected back, so its silence is not evidence the client is gone.
+		if ack {
+			self.noteYieldSend(len(item.transferFrameBytes))
+		}
 		item.transportWriteObserved = true
 		item.acks.observeTransportWrite(writeDisposition.transportType)
 		self.writeCount.Add(1)
@@ -14632,6 +14640,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
 		item.selectiveAcked = true
 		self.forgetFifoRepairItem(item)
+		self.noteYieldLive()
 		self.addResendItem(item)
 		if laneHeadAcked && !item.carrierChanged && 1 < item.sendCount {
 			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
@@ -14728,6 +14737,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 			}
 		}
 		transferResendBudget.earn(len(implicitItem.transferFrameBytes))
+		self.noteYieldAck(len(implicitItem.transferFrameBytes))
 		self.ackItem(implicitItem)
 		if self.sendBuffer != nil && self.sendBuffer.afterAckSendItemForTest != nil {
 			self.sendBuffer.afterAckSendItemForTest(self.id(), implicitSequenceNumber)
