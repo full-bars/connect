@@ -30,6 +30,7 @@ func TestDialFailureClass(t *testing.T) {
 		{"gated", swarm.ErrGaterDisallowedConnection},
 		{"backoff", swarm.ErrDialBackoff},
 		{"no_addrs", swarm.ErrNoGoodAddresses},
+		{"no_addrs", swarm.ErrNoAddresses},
 		{"timeout", context.DeadlineExceeded},
 		{"timeout", &net.OpError{Op: "dial", Err: context.DeadlineExceeded}},
 		{"timeout", &net.OpError{Op: "dial", Err: dialClassTimeoutError{}}},
@@ -50,6 +51,7 @@ func TestDialFailureClass(t *testing.T) {
 		{"gated", swarm.ErrGaterDisallowedConnection},
 		{"backoff", swarm.ErrDialBackoff},
 		{"no_addrs", swarm.ErrNoGoodAddresses},
+		{"no_addrs", swarm.ErrNoAddresses},
 	} {
 		for _, err := range []error{
 			fmt.Errorf("dial: %w", tc.err),
