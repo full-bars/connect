@@ -401,7 +401,7 @@ type Node struct {
 	// (node_dial_class.go). Cleared when a connection to the peer succeeds and
 	// bounded at 1024 peers.
 	dialFailureLock    sync.Mutex
-	dialFailureClasses map[peer.ID]string
+	dialFailureClasses map[peer.ID]map[string]bool
 
 	stateLock     sync.Mutex
 	operatorAddrs []ma.Multiaddr
@@ -1063,9 +1063,9 @@ func (self *Node) peer() {
 	wg.Wait()
 }
 
-// Records the failure class last reported for a peer and reports whether this
-// is the first failure of that class since the peer last connected. A class of
-// "" means the peer connected and forgets its class, so the next failure after
+// Records each failure class reported for a peer and reports whether this is
+// the first failure of that class since the peer last connected. A class of
+// "" means the peer connected and forgets its classes, so the next failure after
 // a recovery is news again. The map is bounded: past 1024 peers one entry is
 // dropped to make room, and a peer whose entry was dropped reports its next
 // failure once more.
@@ -1077,18 +1077,23 @@ func (self *Node) noteDialClass(id peer.ID, class string) bool {
 		return false
 	}
 	if self.dialFailureClasses == nil {
-		self.dialFailureClasses = make(map[peer.ID]string)
+		self.dialFailureClasses = make(map[peer.ID]map[string]bool)
 	}
-	if self.dialFailureClasses[id] == class {
+	classes, ok := self.dialFailureClasses[id]
+	if !ok {
+		if 1024 <= len(self.dialFailureClasses) {
+			for old := range self.dialFailureClasses {
+				delete(self.dialFailureClasses, old)
+				break
+			}
+		}
+		classes = map[string]bool{}
+		self.dialFailureClasses[id] = classes
+	}
+	if classes[class] {
 		return false
 	}
-	if 1024 <= len(self.dialFailureClasses) {
-		for old := range self.dialFailureClasses {
-			delete(self.dialFailureClasses, old)
-			break
-		}
-	}
-	self.dialFailureClasses[id] = class
+	classes[class] = true
 	return true
 }
 
