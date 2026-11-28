@@ -10649,7 +10649,7 @@ sendSequenceLoop:
 						continue
 					}
 				}
-				// Pay for a timeout resend out of what first sends earned. A
+				// Pay for a timeout resend out of what acknowledgements earned. A
 				// resend the budget refuses is rescheduled, not sent and not
 				// counted as a send, so a slow far end cannot make us send many
 				// times what we deliver. Only timeout resends are gated;
@@ -13188,10 +13188,7 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	if ack {
 		if err == nil {
 			self.observeCarrierWrite(item, writeDisposition)
-			// A frame that actually went out earns the right to be resent
-			// later; the retry budget is paid out of what first sends earned.
 			recordTransferFirstSend(len(item.transferFrameBytes))
-			transferResendBudget.earn(len(item.transferFrameBytes))
 			recoveryStart := sendTime
 			if item.pacingByteCount > 0 && item.rttH1 && item.pacingSentAtNanos != 0 {
 				// Local pacing precedes the first physical attempt. It cannot
@@ -14730,6 +14727,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 				}
 			}
 		}
+		transferResendBudget.earn(len(implicitItem.transferFrameBytes))
 		self.ackItem(implicitItem)
 		if self.sendBuffer != nil && self.sendBuffer.afterAckSendItemForTest != nil {
 			self.sendBuffer.afterAckSendItemForTest(self.id(), implicitSequenceNumber)

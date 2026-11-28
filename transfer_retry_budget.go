@@ -16,8 +16,8 @@ import (
 // bytes as first-send bytes (90% of everything it transmitted) for a billable
 // payload that was a fraction of the first sends.
 //
-// A retry budget bounds that. Resends are paid for out of tokens earned by first
-// sends: every first-sent byte earns retryBudgetRatio of a token, so resends can
+// A retry budget bounds that. Resends are paid for out of tokens earned by
+// acknowledgements: every acknowledged byte earns retryBudgetRatio of a token, so resends can
 // never exceed that share of fresh traffic, plus a small floor refill so a quiet
 // flow can still recover a lost frame. A resend that cannot pay is rescheduled
 // without being sent, the same way the resend-cap park works.
@@ -26,10 +26,10 @@ import (
 // when the resend share explodes.
 
 const (
-	// retryBudgetRatio is the share of first-sent bytes that may be resent.
+	// retryBudgetRatio is the share of acknowledged bytes that may be resent.
 	retryBudgetRatio = 0.25
 	// retryBudgetFloorBytesPerSecond refills regardless of traffic, so a flow with
-	// almost no first sends can still resend a lost frame.
+	// almost no acknowledgements can still resend a lost frame.
 	retryBudgetFloorBytesPerSecond = 64 << 10
 	// retryBudgetBurstBytes caps what can be saved up.
 	retryBudgetBurstBytes = 8 << 20
@@ -71,7 +71,7 @@ func (self *transferRetryBudget) refillLocked() {
 	self.last = now
 }
 
-// earn credits a first send of byteCount bytes.
+// earn credits byteCount bytes acknowledged by the far end.
 func (self *transferRetryBudget) earn(byteCount int) {
 	self.mu.Lock()
 	defer self.mu.Unlock()

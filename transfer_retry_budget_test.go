@@ -15,6 +15,56 @@ func newTestRetryBudget() (*transferRetryBudget, *time.Time) {
 	return b, &now
 }
 
+func TestRetryBudget_SilentPeerFirstSendEarnsNothing(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	frozen := time.Now()
+	previousNow := transferResendBudget.now
+	transferResendBudget.now = func() time.Time { return frozen }
+	defer func() { transferResendBudget.now = previousNow }()
+	savedTokens, savedLast := transferResendBudget.snapshotForTest()
+	defer transferResendBudget.restoreForTest(savedTokens, savedLast)
+	transferResendBudget.reset(0)
+	synctest.Test(t, func(t *testing.T) {
+		fixture, _, _ := newAckRetirementFixture(t, TransportTypeH1, 2, NewNoopLogger())
+		frame := RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: strings.Repeat("x", 800)})
+		admitted, err := fixture.sender.SendWithTimeoutDetailed(frame, fixture.receiver.ClientId(), func(error) {}, time.Second, sendPackRecoveryOption{})
+		if !admitted || err != nil {
+			MessagePoolReturn(frame.MessageBytes)
+			t.Fatalf("admission = %t, %v", admitted, err)
+		}
+		synctest.Wait()
+		select {
+		case sent := <-fixture.senderOut:
+			MessagePoolReturn(sent)
+		default:
+			t.Fatal("no first-send frame reached the transport")
+		}
+		if tokens, _ := transferResendBudget.snapshotForTest(); tokens != 0 {
+			t.Fatalf("silent peer earned %v resend tokens, want zero", tokens)
+		}
+	})
+}
+
+func TestRetryBudget_WireAckEarnsCredit(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	frozen := time.Now()
+	previousNow := transferResendBudget.now
+	transferResendBudget.now = func() time.Time { return frozen }
+	defer func() { transferResendBudget.now = previousNow }()
+	savedTokens, savedLast := transferResendBudget.snapshotForTest()
+	defer transferResendBudget.restoreForTest(savedTokens, savedLast)
+	transferResendBudget.reset(0)
+	synctest.Test(t, func(t *testing.T) {
+		fixture, _, _ := newAckRetirementFixture(t, TransportTypeH1, 2, NewNoopLogger())
+		original := fixture.write(800)
+		fixture.forward(fixture.receive(original), fixture.senderIn)
+		synctest.Wait()
+		if tokens, _ := transferResendBudget.snapshotForTest(); tokens <= 0 {
+			t.Fatalf("acknowledged frame earned %v resend tokens, want positive credit", tokens)
+		}
+	})
+}
+
 func TestRetryBudget_StartsWithAGrantSoAFreshProcessCanRecover(t *testing.T) {
 	b, _ := newTestRetryBudget()
 	if ok, _ := b.allow(1000); !ok {
