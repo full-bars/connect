@@ -40,6 +40,10 @@ func TestShouldLogOobErr_PersistsThrottleAcrossCalls(t *testing.T) {
 	assertAtMostOneAllowed(t, "shouldLogOobErr", shouldLogOobErr)
 }
 
+func TestShouldLogContractErr_PersistsThrottleAcrossCalls(t *testing.T) {
+	assertAtMostOneAllowed(t, "shouldLogContractErr", shouldLogContractErr)
+}
+
 func TestShouldLogOobRateLimit_PersistsThrottleAcrossCalls(t *testing.T) {
 	assertAtMostOneAllowed(t, "shouldLogOobRateLimit", shouldLogOobRateLimit)
 }
@@ -79,6 +83,7 @@ func TestPackageLogThrottles_ConfiguredForOneMinute(t *testing.T) {
 	throttles := map[string]*logThrottle{
 		"dropErrThrottle":      dropErrThrottle,
 		"oobErrThrottle":       oobErrThrottle,
+		"contractErrThrottle":  contractErrThrottle,
 		"oobRateLimitThrottle": oobRateLimitThrottle,
 		"authErrThrottle":      authErrThrottle,
 		"writeErrThrottle":     writeErrThrottle,
@@ -99,7 +104,7 @@ func TestPackageLogThrottles_ConfiguredForOneMinute(t *testing.T) {
 // out-of-band failure, silently losing signal on a fault the throttle was
 // never meant to touch.
 func TestPackageLogThrottles_AreDistinctInstances(t *testing.T) {
-	all := []*logThrottle{dropErrThrottle, oobErrThrottle, oobRateLimitThrottle, authErrThrottle, writeErrThrottle}
+	all := []*logThrottle{dropErrThrottle, oobErrThrottle, contractErrThrottle, oobRateLimitThrottle, authErrThrottle, writeErrThrottle}
 	for i := range all {
 		for j := range all {
 			if i == j {

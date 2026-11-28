@@ -33,6 +33,10 @@ import (
 // log_throttle.go.
 var oobErrThrottle = newLogThrottle(time.Minute)
 
+var contractErrThrottle = newLogThrottle(time.Minute)
+
+func shouldLogContractErr() (bool, int64) { return contractErrThrottle.Allow(time.Now()) }
+
 // shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
 func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
 
@@ -1367,7 +1371,13 @@ func (self *ContractManager) handleControlFrameForQueue(
 		}
 		for _, contractError := range contractErrors {
 			if self.client.log.V(1).Enabled() {
-				self.client.log.Infof("[contract]error = %s\n", contractError)
+				if ok, suppressed := shouldLogContractErr(); ok {
+					if suppressed > 0 {
+						self.client.log.Infof("[contract]error = %s (%d suppressed)\n", contractError, suppressed)
+					} else {
+						self.client.log.Infof("[contract]error = %s\n", contractError)
+					}
+				}
 			}
 			c := func() {
 				contractStatus := &ContractStatus{
