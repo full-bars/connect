@@ -4,7 +4,8 @@
 // The swarm holds a backoff per peer address and refuses a dial to an address
 // inside it at once, so a round that dials such a peer spends one of its slots
 // on a dial that cannot succeed. The tests read the backoff through a fixed
-// clock, so a window is exact and nothing waits.
+// clock, so a window is exact and nothing waits, and one test holds the node's
+// host to the swarm the round reads the backoff from.
 
 package gossip
 
@@ -14,9 +15,20 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+// The round reaches the backoff through the host's network, which is the
+// swarm only if the host was built on one. Any other network would leave every
+// peer dialable and the skip silently off.
+func TestNodeHostNetworkIsSwarm(t *testing.T) {
+	node := newTestLocalNode(t, nil)
+	if _, ok := node.host.Network().(*swarm.Swarm); !ok {
+		t.Fatalf("node network is %T, not *swarm.Swarm", node.host.Network())
+	}
+}
 
 // A peer's addresses inside the backoff window are skipped and the free slot
 // goes to the next candidate; once the window passes, or is cleared, the peer
