@@ -392,9 +392,8 @@ func TestNoAckFastPathSealsOnlyWithVerifiedEpoch(t *testing.T) {
 // Restore the backend failure state after the fixture client is cancelled.
 func restoreCertEpochBackendFailures(t *testing.T) {
 	t.Helper()
-	count, last := consecutiveBackendFails.Load(), lastBackendFailNano.Load()
+	state := backendFailures.Load()
 	t.Cleanup(func() {
-		consecutiveBackendFails.Store(count)
-		lastBackendFailNano.Store(last)
+		backendFailures.Store(state)
 	})
 }
